@@ -274,10 +274,33 @@ Two consequences worth knowing about:
   overhead does not shrink when you prune — it scales with hidden size (5120, unchanged) and
   the 16 preserved attention layers.
 
-`marlowe doctor` itemises the disk budget against actual free space, derived from the
-configs rather than transcribed. The whole ladder is ~217 GB peak if temps are deleted as each
-stage finishes, ~491 GB if nothing is. Note that the merged rung-1 checkpoint is *not* a
-temp — it is rung 2's parent, which is the item a flat "~187 GB" estimate misses.
+### llama.cpp must have a GPU backend
+
+Stages 0, 2 and 7 are decode-bound: the repetition harness generates 200 x 2048 tokens per
+variant, and CPU decode on a ~10 GB model is memory-bandwidth bound. That is ~28 h per
+variant on CPU against ~2.8 h on the 4080 Super — an eight-recipe Stage 0 sweep is 9.5 days
+versus one day. So those three stages **refuse** a CPU-only build and print the projected
+wall-clock; `marlowe doctor` reports the backend and exits nonzero. `--allow-cpu-llamacpp`
+accepts the cost.
+
+The harness runs `repetition.parallel` completions concurrently (default 4). llama-server
+batches concurrent sequences and each completion is independently seeded, so this is pure
+throughput.
+
+### Disk
+
+`marlowe doctor` itemises the budget against actual free space, derived from the configs
+rather than transcribed:
+
+```
+persistent (never deletable)                    ~137 GB
+peak, deleting temps as each stage finishes     ~217 GB
+peak, keeping everything                        ~519 GB
+```
+
+**Deleting temps as each stage finishes is the default**; `--keep-intermediates` opts back
+in. The merged rung-1 checkpoint is *not* a temp — it is rung 2's parent, which is the item
+a flat "~187 GB" estimate misses.
 
 ---
 
@@ -298,7 +321,7 @@ for the same reason.
 
 | metric | what it catches | tool |
 |---|---|---|
-| KL to bf16 parent | general fidelity loss | `llama-perplexity --kl-divergence` |
+| KL to the parent | general fidelity loss | `llama-perplexity --kl-divergence` |
 | top-1 agreement | same, interpretable | same |
 | **repetition rate (n=8, 32)** | **circling** | `eval/repetition.py` |
 | cap-hit rate | non-termination | same |
@@ -314,6 +337,17 @@ over easy prompts hides a regression on the hard ones.
 `loop_rate` requires both a cap hit and a periodic tail. Either alone is too loose: long
 answers hit the cap legitimately, and a cycle inside an otherwise-terminating answer is not
 the failure being chased.
+
+### The KL reference is Q8_0, not bf16
+
+bf16 is 56 GB against 32 GB of RAM, so llama.cpp would mmap and page from disk for the entire
+reference pass. Q8_0 is ~28.6 GB and near-lossless — its own KL to bf16 is far below the
+deltas this project measures — and since every number here is a *relative* comparison against
+the same fixed reference file, the substitution costs nothing. `--reference-outtype bf16`
+overrides it on a machine with the RAM.
+
+This does not touch the **bf16 repetition baseline**, which comes from a hosted endpoint and
+is one of the two ship criteria.
 
 ### On AAII
 
