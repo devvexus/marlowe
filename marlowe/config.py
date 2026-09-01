@@ -136,9 +136,21 @@ class HealConfig:
     grad_accum: int = 16
     micro_batch: int = 1
     gradient_checkpointing: bool = True
-    #: 8-bit Adam moments. ~1 GB saved on a 176M-parameter LoRA state; on a 16 GB card that
-    #: is the difference between fitting at seq_len 2048 and not.
+
+    # -- memory/quality trade-offs, ordered by quality cost ------------------
+    #: Quantise lm_head to NF4. bitsandbytes skips it by default for a reason: the loss here
+    #: is top-K KL against teacher *logits*, so quantising the head injects noise into
+    #: exactly the quantity being matched. Worse, the adapter learns to compensate for that
+    #: noise, and merge_adapters loads the base in bf16 -- so the compensation is for an
+    #: error that no longer exists. Saves 2.5 GB. Last resort, and it brings
+    #: :data:`LM_HEAD_MITIGATION` with it.
+    quantize_lm_head: bool = False
+    #: 8-bit Adam moments. ~1 GB on a 176M-parameter adapter set. A much smaller quality
+    #: concern than the head: optimizer state is not in the forward pass.
     optimizer_8bit: bool = True
+    #: Modules trained in full (not through LoRA). Must be exact paths -- a bare "norm"
+    #: matches every layernorm in the stack, which is 3 per layer.
+    modules_to_save: list[str] = field(default_factory=list)
     #: Sequence chunk for the logit/loss computation. 2048 x 248320 would be 1.0 GB in bf16
     #: before any softmax intermediate, so the loss is always chunked; 256 halves the peak
     #: relative to 512 at a small throughput cost.

@@ -273,16 +273,45 @@ def cmd_probe(args: argparse.Namespace) -> int:
 def cmd_fitcheck(args: argparse.Namespace) -> int:
     """Measure Stage 6 throughput and peak VRAM without committing to the run."""
     from marlowe.config import HealConfig, load_run_config
-    from marlowe.heal import probe_training
+    from marlowe.heal import probe_training, search_memory_plan
 
     cfg = load_run_config(args.config).heal if args.config else HealConfig()
     if args.seq_len:
         cfg.seq_len = args.seq_len
     if args.lora_rank:
         cfg.lora_rank = args.lora_rank
-    result = probe_training(args.model, cfg, n_steps=args.steps, max_gpu_gb=args.max_gpu_gb)
-    print(result.render(cfg.tokens))
-    return 0 if result.headroom_gb() >= 0.3 else 1
+
+    if args.no_search:
+        result = probe_training(args.model, cfg, n_steps=args.steps, max_gpu_gb=args.max_gpu_gb)
+        print(result.render(cfg.tokens))
+        return 0 if result.headroom_gb() >= args.margin else 1
+
+    search = search_memory_plan(
+        args.model,
+        cfg,
+        margin_gb=args.margin,
+        n_steps=args.steps,
+        max_gpu_gb=args.max_gpu_gb,
+    )
+    print(search.render(cfg.tokens))
+    if search.config is not None and args.write_config and args.config:
+        _write_heal_overrides(args.config, search)
+        print(f"\nwrote the selected trade-offs into {args.config}")
+    return 0 if search.chosen is not None else 1
+
+
+def _write_heal_overrides(config_path: str, search: Any) -> None:
+    """Persist what was measured, so the run uses it rather than what was hoped for."""
+    import yaml
+
+    path = Path(config_path)
+    with path.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    heal = raw.setdefault("heal", {})
+    heal["quantize_lm_head"] = search.config.quantize_lm_head
+    heal["optimizer_8bit"] = search.config.optimizer_8bit
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -391,6 +420,11 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--seq-len", dest="seq_len", type=int)
     fc.add_argument("--lora-rank", dest="lora_rank", type=int)
     fc.add_argument("--max-gpu-gb", dest="max_gpu_gb", type=float)
+    fc.add_argument("--margin", type=float, default=0.8, help="required VRAM headroom, GB")
+    fc.add_argument("--no-search", dest="no_search", action="store_true",
+                    help="probe the config as written instead of searching candidates")
+    fc.add_argument("--write-config", dest="write_config", action="store_true",
+                    help="persist the selected trade-offs back into --config")
     fc.set_defaults(fn=cmd_fitcheck)
 
     rp = sub.add_parser("report", help="unified metrics table")

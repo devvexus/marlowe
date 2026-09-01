@@ -134,14 +134,24 @@ def read_gguf(path: str | Path, *, max_metadata: int = 100_000) -> GGUFInfo:
 
 BLK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
 
-#: llama.cpp tensor-suffix families. Attention layers carry attn_*; recurrent layers carry
-#: ssm_* or an explicit linear-attention name, depending on the converter version.
-GGUF_ATTENTION_SUFFIXES = ("attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv")
+#: Recurrent/linear-attention markers. Unambiguous: only the recurrent path emits these.
 GGUF_LINEAR_SUFFIXES = ("ssm_", "linear_attn", "time_mix", "shortconv")
+
+#: Attention markers. Deliberately excludes ``attn_qkv`` and ``attn_gate``: on this
+#: architecture llama.cpp emits BOTH for the *linear* path (the DeltaNet q/k/v are fused into
+#: one tensor and the output gate is separate), so treating them as attention markers labels
+#: every DeltaNet layer "attention+linear". Only the separate projections are conclusive.
+GGUF_ATTENTION_SUFFIXES = ("attn_q.", "attn_k.", "attn_v.", "attn_output")
 
 
 def gguf_layer_families(info: GGUFInfo) -> dict[int, set[str]]:
-    """Map block index -> {"attention", "linear"} evidenced by tensor names."""
+    """Map block index -> {"attention", "linear"} evidenced by tensor names.
+
+    A fallback. :func:`probe_converter` prefers the explicit ``recurrent_layers`` metadata,
+    which is authoritative; this reads the tensor directory for converters too old to write
+    that key. A block with any ``ssm_*`` tensor is recurrent regardless of what else it
+    carries, because the recurrent path also emits ``attn_``-prefixed names here.
+    """
     out: dict[int, set[str]] = {}
     for name in info.tensor_names:
         m = BLK_RE.match(name)
@@ -150,11 +160,24 @@ def gguf_layer_families(info: GGUFInfo) -> dict[int, set[str]]:
         i = int(m.group(1))
         tail = m.group(2)
         fams = out.setdefault(i, set())
-        if tail.startswith(GGUF_ATTENTION_SUFFIXES):
-            fams.add("attention")
         if tail.startswith(GGUF_LINEAR_SUFFIXES):
             fams.add("linear")
-    return out
+        elif tail.startswith(GGUF_ATTENTION_SUFFIXES):
+            fams.add("attention")
+    # ssm_* is conclusive; drop a co-occurring "attention" label from the shared attn_* names.
+    return {i: ({"linear"} if "linear" in f else f) for i, f in out.items()}
+
+
+def gguf_recurrent_mask(info: GGUFInfo) -> list[bool] | None:
+    """The explicit per-layer recurrent mask the converter wrote, if it wrote one.
+
+    ``<arch>.attention.recurrent_layers``. This is the authoritative record of the layout the
+    loader will build, so the probe reads it in preference to inferring from tensor names.
+    """
+    for key, val in info.metadata.items():
+        if key.endswith("attention.recurrent_layers") and isinstance(val, list):
+            return [bool(v) for v in val]
+    return None
 
 
 @dataclass
@@ -187,16 +210,25 @@ def probe_converter(hf_dir: str | Path, gguf_path: str | Path) -> ProbeResult:
     """
     layout = Layout.from_config(load_config(hf_dir))
     info = read_gguf(gguf_path)
-    fams = gguf_layer_families(info)
-
     expected = ["attention" if t != "linear_attention" else "linear" for t in layout.layer_types]
-    observed: list[str] = []
-    for i in range(len(expected)):
-        f = fams.get(i, set())
-        observed.append(sorted(f)[0] if len(f) == 1 else ("+".join(sorted(f)) or "none"))
+
+    # Prefer the explicit mask: it is what the loader will actually use, so it answers the
+    # question directly instead of inferring it from tensor naming.
+    mask = gguf_recurrent_mask(info)
+    if mask is not None:
+        observed = ["linear" if r else "attention" for r in mask]
+        n_blocks = len(mask)
+        source = "explicit recurrent_layers array"
+    else:
+        fams = gguf_layer_families(info)
+        observed = [
+            (sorted(f)[0] if len(f) == 1 else ("+".join(sorted(f)) or "none"))
+            for f in (fams.get(i, set()) for i in range(len(expected)))
+        ]
+        n_blocks = max(fams) + 1 if fams else 0
+        source = "tensor names (no recurrent_layers key)"
 
     mismatches = [i for i, (e, o) in enumerate(zip(expected, observed)) if e != o]
-    n_blocks = max(fams) + 1 if fams else 0
 
     if n_blocks != len(expected):
         detail = (
@@ -213,7 +245,7 @@ def probe_converter(hf_dir: str | Path, gguf_path: str | Path) -> ProbeResult:
             f"depends on this."
         )
     else:
-        detail = f"layout preserved across all {n_blocks} blocks"
+        detail = f"layout preserved across all {n_blocks} blocks, via {source}"
 
     result = ProbeResult(
         ok=not mismatches and n_blocks == len(expected),

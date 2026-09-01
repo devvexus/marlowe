@@ -8,6 +8,8 @@ own.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from marlowe.arch import Layout, load_config, positional_selection
@@ -692,3 +694,262 @@ class TestSurgeryIsIdempotent:
         out = tmp_path / "d"
         out.mkdir()
         assert clear_previous_shards(out) == 0
+
+
+class TestGgufProbeUsesRealNaming:
+    """The probe called a correct conversion broken.
+
+    llama.cpp emits the DeltaNet fused projection as ``blk.N.attn_qkv`` and its output gate
+    as ``blk.N.attn_gate`` -- ``attn_`` prefixes on the *recurrent* path. The first classifier
+    read those as attention markers and labelled every DeltaNet layer "attention+linear",
+    failing Stage 1 on a GGUF that was in fact correct.
+
+    The fix is twofold: prefer the explicit ``recurrent_layers`` mask, which is what the
+    loader actually uses, and make the tensor-name fallback treat ``ssm_*`` as conclusive.
+    """
+
+    #: Verbatim from the Stage 1 GGUF built from real Qwen3.8-27B weights.
+    LINEAR_TENSORS: ClassVar[list[str]] = [
+        "attn_gate", "attn_norm", "attn_qkv", "ffn_down", "ffn_gate", "ffn_up",
+        "post_attention_norm", "ssm_alpha", "ssm_beta", "ssm_conv1d", "ssm_dt",
+        "ssm_norm", "ssm_out",
+    ]
+    ATTENTION_TENSORS: ClassVar[list[str]] = [
+        "attn_k", "attn_k_norm", "attn_norm", "attn_output", "attn_q", "attn_q_norm",
+        "attn_v", "ffn_down", "ffn_gate", "ffn_up", "post_attention_norm",
+    ]
+
+    def _info(self, layer_types):
+        from marlowe.quantize import GGUFInfo
+
+        names = []
+        for i, t in enumerate(layer_types):
+            tensors = (
+                self.LINEAR_TENSORS if t == "linear_attention" else self.ATTENTION_TENSORS
+            )
+            names += [f"blk.{i}.{s}.weight" for s in tensors]
+        return GGUFInfo(path="x", version=3, tensor_names=names)
+
+    def test_deltanet_layers_are_not_called_attention(self) -> None:
+        from marlowe.quantize import gguf_layer_families
+
+        fams = gguf_layer_families(self._info(["linear_attention"] * 3 + ["full_attention"]))
+        assert fams[0] == {"linear"}, f"attn_qkv/attn_gate misread the recurrent path: {fams[0]}"
+        assert fams[1] == {"linear"}
+        assert fams[2] == {"linear"}
+        assert fams[3] == {"attention"}
+
+    def test_no_layer_is_ambiguous(self) -> None:
+        from marlowe.quantize import gguf_layer_families
+
+        types = (["linear_attention"] * 3 + ["full_attention"]) * 4
+        for i, fam in gguf_layer_families(self._info(types)).items():
+            assert len(fam) == 1, f"block {i} classified as {fam}"
+
+    def test_explicit_mask_is_preferred_over_tensor_names(self) -> None:
+        """Even if the names were ambiguous, the authoritative key wins."""
+        from marlowe.quantize import GGUFInfo, gguf_recurrent_mask
+
+        info = GGUFInfo(
+            path="x",
+            version=3,
+            metadata={"qwen35.attention.recurrent_layers": [True, True, True, False]},
+        )
+        assert gguf_recurrent_mask(info) == [True, True, True, False]
+
+    def test_absent_mask_returns_none(self) -> None:
+        from marlowe.quantize import GGUFInfo, gguf_recurrent_mask
+
+        assert gguf_recurrent_mask(GGUFInfo(path="x", version=3, metadata={})) is None
+
+    def test_mask_detects_a_genuinely_wrong_layout(self) -> None:
+        """The probe must still fail when the converter really did regenerate an interval."""
+        from marlowe.quantize import GGUFInfo, gguf_recurrent_mask
+
+        # what (i+1) % 4 != 0 produces over 6 layers, against a real 3/1/2 layout
+        info = GGUFInfo(
+            path="x",
+            version=3,
+            metadata={"qwen35.attention.recurrent_layers": [True, True, True, False, True, True]},
+        )
+        mask = gguf_recurrent_mask(info)
+        assert mask is not None
+        real = [True, True, True, False, True, False]
+        assert mask != real, "fixture must differ or the test proves nothing"
+
+
+class TestMemoryPlanSearch:
+    """Stage 6's memory config is searched by measurement, not assumed.
+
+    Sizing by arithmetic gets the order of magnitude right and the last gigabyte wrong, and
+    the last gigabyte is the whole question on a 16 GB card. The ordering is by *quality*
+    cost, not memory saved: an NF4 lm_head frees the most and costs the most, because the
+    loss is top-K KL against teacher logits and merge_adapters loads the base in bf16 -- so
+    the adapter would learn to cancel noise that does not survive the merge.
+    """
+
+    def test_candidates_are_ordered_best_quality_first(self) -> None:
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        assert MEMORY_CANDIDATES[0].quantize_lm_head is False, (
+            "the fp16 head must be tried first; it is the expensive-to-lose one"
+        )
+        # Once the head is given up, optimizer precision is bought back before being spent.
+        nf4 = [c for c in MEMORY_CANDIDATES if c.quantize_lm_head]
+        assert nf4[0].optimizer_8bit is False
+        assert nf4[-1].optimizer_8bit is True
+
+    def test_every_candidate_keeps_the_free_savings(self) -> None:
+        """CPU embeddings and loss chunking are near-free; no candidate gives them up."""
+        from marlowe.config import HealConfig
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        base = HealConfig()
+        for cand in MEMORY_CANDIDATES:
+            cfg = cand.apply(base)
+            assert cfg.loss_chunk == base.loss_chunk
+            assert cfg.seq_len == base.seq_len
+
+    def test_apply_does_not_mutate_the_original(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        base = HealConfig(quantize_lm_head=False)
+        MEMORY_CANDIDATES[-1].apply(base)
+        assert base.quantize_lm_head is False
+
+    def test_search_takes_the_first_that_fits(self, monkeypatch) -> None:
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        calls: list[bool] = []
+
+        def fake_probe(path, cfg, *, n_steps=8, max_gpu_gb=None):
+            calls.append(cfg.quantize_lm_head)
+            headroom = 0.2 if not cfg.quantize_lm_head else 2.0
+            return heal.ProbeResult(
+                tok_s=180.0, peak_vram_gb=16.0 - headroom, total_vram_gb=16.0,
+                step_s=1.0, seq_len=cfg.seq_len, n_steps=n_steps, lora_params=176_000_000,
+            )
+
+        monkeypatch.setattr(heal, "probe_training", fake_probe)
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
+
+        assert res.chosen is not None
+        assert res.chosen.name == "nf4-head-adamw32"
+        assert calls == [False, True], "must not probe further once one fits"
+
+    def test_search_prefers_fp16_head_when_it_fits(self, monkeypatch) -> None:
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        monkeypatch.setattr(
+            heal, "probe_training",
+            lambda p, c, **k: heal.ProbeResult(
+                tok_s=150.0, peak_vram_gb=13.0, total_vram_gb=16.0, step_s=1.0,
+                seq_len=c.seq_len, n_steps=4, lora_params=1,
+            ),
+        )
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
+        assert res.chosen is not None and res.chosen.name == "fp16-head"
+        assert res.config is not None and res.config.quantize_lm_head is False
+
+    def test_oom_is_treated_as_does_not_fit(self, monkeypatch) -> None:
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        def fake_probe(path, cfg, **k):
+            if not cfg.quantize_lm_head:
+                raise RuntimeError("CUDA out of memory. Tried to allocate 2.50 GiB")
+            return heal.ProbeResult(
+                tok_s=200.0, peak_vram_gb=13.0, total_vram_gb=16.0, step_s=1.0,
+                seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+            )
+
+        monkeypatch.setattr(heal, "probe_training", fake_probe)
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.5)
+        assert res.chosen is not None and res.chosen.quantize_lm_head is True
+        assert any("OOM" in outcome for _, outcome in res.attempts)
+
+    def test_non_oom_errors_propagate(self, monkeypatch) -> None:
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        def boom(path, cfg, **k):
+            raise ValueError("a real bug, not a memory problem")
+
+        monkeypatch.setattr(heal, "probe_training", boom)
+        with pytest.raises(ValueError, match="a real bug"):
+            heal.search_memory_plan("x", HealConfig())
+
+    def test_nothing_fits_is_reported_not_silently_accepted(self, monkeypatch) -> None:
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        monkeypatch.setattr(
+            heal, "probe_training",
+            lambda p, c, **k: heal.ProbeResult(
+                tok_s=1.0, peak_vram_gb=15.9, total_vram_gb=16.0, step_s=1.0,
+                seq_len=c.seq_len, n_steps=1, lora_params=1,
+            ),
+        )
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
+        assert res.chosen is None
+        assert "NOTHING FIT" in res.render(50_000_000)
+
+
+class TestLmHeadMitigation:
+    """When the head ends up NF4, put trainable capacity where the noise enters."""
+
+    def test_fp16_head_needs_no_mitigation(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import effective_lora_targets
+
+        targets, save_full = effective_lora_targets(HealConfig(quantize_lm_head=False))
+        assert "lm_head" not in targets
+        assert save_full == []
+
+    def test_nf4_head_gets_lora_and_a_trained_final_norm(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import FINAL_NORM_MODULE, effective_lora_targets
+
+        targets, save_full = effective_lora_targets(HealConfig(quantize_lm_head=True))
+        assert "lm_head" in targets
+        assert save_full == [FINAL_NORM_MODULE]
+
+    def test_final_norm_path_is_exact_not_a_suffix(self) -> None:
+        """A bare norm target also matches input_layernorm, post_attention_layernorm and
+        linear_attn.norm -- three per layer, verified against a real qwen3_5 model."""
+        from marlowe.heal import FINAL_NORM_MODULE
+
+        assert FINAL_NORM_MODULE == "model.norm"
+        for decoy in ("input_layernorm", "post_attention_layernorm", "linear_attn.norm"):
+            assert decoy.endswith("norm")
+            assert not decoy.endswith(FINAL_NORM_MODULE)
+
+    def test_bare_norm_is_refused(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import effective_lora_targets
+
+        with pytest.raises(ValueError, match="matches by suffix"):
+            effective_lora_targets(HealConfig(modules_to_save=["norm"]))
+
+    def test_mitigation_is_idempotent(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import FINAL_NORM_MODULE, effective_lora_targets
+
+        cfg = HealConfig(quantize_lm_head=True, modules_to_save=[FINAL_NORM_MODULE])
+        cfg.target_modules = [*cfg.target_modules, "lm_head"]
+        targets, save_full = effective_lora_targets(cfg)
+        assert targets.count("lm_head") == 1
+        assert save_full.count(FINAL_NORM_MODULE) == 1
+
+    def test_default_config_does_not_quantize_the_head(self) -> None:
+        """bitsandbytes skips lm_head by default and that default is correct here."""
+        from marlowe.config import HealConfig
+
+        assert HealConfig().quantize_lm_head is False

@@ -5,27 +5,31 @@ token budget, substantially more recovery: cross-entropy against a single hard t
 away everything the teacher knows about the other 248319 tokens, which is precisely the
 information a pruned student has lost.
 
-Memory shape on a 16 GB card, for the 22.3B student. This is plain peft plus bitsandbytes,
-not Unsloth, so nothing here inherits Unsloth's savings and every megabyte is accounted for::
+Memory on a 16 GB card, for the 22.3B student. This is plain peft plus bitsandbytes, not
+Unsloth, so nothing here inherits Unsloth's savings and every megabyte is accounted for.
 
-    NF4 weights incl. lm_head          10.85 GB
-    LoRA (176M) + AdamW8bit             1.06 GB
-    activations, grad ckpt @ 2048       1.34 GB
-    loss, chunked at 256                0.64 GB
-                                       -------
-                                       13.89 GB
+Two savings are near-free and are in every configuration:
 
-Four decisions get it there, and without all four it needs ~20 GB and does not fit:
+* ``embed_tokens`` on CPU -- it is not a Linear, so NF4 cannot touch it, and it is 2.5 GB.
+  An embedding lookup on CPU is cheap. :func:`assert_layers_on_gpu` checks that accelerate
+  spilled the embeddings and not a decoder layer, which would train at a fraction of speed
+  and read as a hung job.
+* A chunked loss -- ``2048 x 248320`` in bf16 is 1.02 GB before any softmax intermediate, so
+  the full logit tensor is never materialised.
 
-* ``lm_head`` is quantised -- bitsandbytes skips it by default, and it is 2.5 GB of fp16.
-* ``embed_tokens`` is offloaded to CPU -- not a Linear, so NF4 cannot touch it; another
-  2.5 GB, and a lookup on CPU is cheap.
-* 8-bit Adam moments, which is 1 GB on a 176M-parameter adapter set.
-* The loss is chunked over the sequence -- ``2048 x 248320`` in bf16 is 1.02 GB before any
-  softmax intermediate, so the full logit tensor is never materialised.
+Two cost quality, and are taken only if needed, in this order (see :data:`MEMORY_CANDIDATES`):
 
-:func:`probe_training` measures the real numbers rather than trusting this arithmetic, and
-Stage 6 runs it before spending the budget.
+* **fp32 Adam moments** (1 GB). Optimizer state never enters the forward pass, so giving it
+  up is the smaller concession.
+* **NF4 lm_head** (2.5 GB). The loss is top-K KL against teacher *logits*, so quantising the
+  head injects noise into precisely the quantity being matched -- and the adapter then learns
+  to compensate for an error that disappears when :func:`merge_adapters` loads the base in
+  bf16. bitsandbytes skips lm_head by default for this reason. Last resort, and it brings
+  :data:`LM_HEAD_MITIGATION` with it: the head gets LoRA and the final norm trains in full.
+
+:func:`search_memory_plan` measures each candidate rather than trusting arithmetic -- sizing
+by hand gets the order of magnitude right and the last gigabyte wrong, and the last gigabyte
+is the entire question. Stage 6 runs it before spending the budget.
 
 Two operational rules from the brief, both enforced here:
 
@@ -264,6 +268,44 @@ def assert_layers_on_gpu(model: Any) -> dict[str, Any]:
     return {"offloaded": sorted(offloaded)}
 
 
+#: Exact module path of the final RMSNorm on a text-only qwen3_5 stack.
+#:
+#: Exact, not a suffix: peft matches ``modules_to_save`` by name suffix, and a bare "norm"
+#: also matches ``input_layernorm``, ``post_attention_layernorm`` and ``linear_attn.norm`` --
+#: three per layer, verified against a real model.
+FINAL_NORM_MODULE = "model.norm"
+
+#: Applied whenever lm_head ends up quantised. Gives the head a trainable low-rank correction
+#: and trains the final norm in full. The norm is 5120 parameters and it rescales the residual
+#: stream entering the head, which is precisely what deleting upstream layers miscalibrates.
+LM_HEAD_MITIGATION = ("lm_head",)
+
+
+def effective_lora_targets(cfg: HealConfig) -> tuple[list[str], list[str]]:
+    """Return (LoRA target modules, modules trained in full).
+
+    When the head is quantised, it also gets LoRA and the final norm is trained fully. That
+    does not undo the quantisation noise, but it puts trainable capacity exactly where the
+    noise enters, which is the cheapest available mitigation.
+    """
+    targets = list(cfg.target_modules)
+    save_full = list(cfg.modules_to_save)
+    if cfg.quantize_lm_head:
+        targets += [m for m in LM_HEAD_MITIGATION if m not in targets]
+        if FINAL_NORM_MODULE not in save_full:
+            save_full.append(FINAL_NORM_MODULE)
+
+    bare = [m for m in save_full if m == "norm"]
+    if bare:
+        raise ValueError(
+            f"modules_to_save contains a bare {bare[0]!r}, which peft matches by suffix -- it "
+            f"would also select input_layernorm, post_attention_layernorm and "
+            f"linear_attn.norm, three per layer. Use the exact path "
+            f"{FINAL_NORM_MODULE!r}."
+        )
+    return targets, save_full
+
+
 def build_optimizer(params: list[Any], cfg: HealConfig) -> Any:
     """AdamW with 8-bit moments where available.
 
@@ -315,9 +357,10 @@ def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None =
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
-        # Quantise lm_head too. bnb's default skip list keeps it in fp16, which is 2.5 GB
-        # for a single tensor on a card with 16.
-        llm_int8_skip_modules=[],
+        # bitsandbytes skips lm_head by default and that default is right here: the loss is
+        # top-K KL against teacher logits, so quantising the head adds noise to exactly what
+        # is being matched. Only overridden when the memory search cannot fit fp16.
+        llm_int8_skip_modules=[] if cfg.quantize_lm_head else ["lm_head"],
     )
     kwargs: dict[str, Any] = {
         "quantization_config": qcfg,
@@ -335,11 +378,13 @@ def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None =
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=cfg.gradient_checkpointing
     )
+    targets, save_full = effective_lora_targets(cfg)
     lora = LoraConfig(
         r=cfg.lora_rank,
         lora_alpha=cfg.lora_alpha,
         lora_dropout=cfg.lora_dropout,
-        target_modules=cfg.target_modules,
+        target_modules=targets,
+        modules_to_save=save_full or None,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -540,6 +585,8 @@ class ProbeResult:
     lora_params: int
     offloaded: list[str] = field(default_factory=list)
     optimizer: str = ""
+    lm_head_precision: str = ""
+    modules_trained_in_full: list[str] = field(default_factory=list)
 
     def headroom_gb(self) -> float:
         return self.total_vram_gb - self.peak_vram_gb
@@ -555,9 +602,154 @@ class ProbeResult:
             f"  peak VRAM      {self.peak_vram_gb:8.2f} GB of {self.total_vram_gb:.1f} "
             f"({self.headroom_gb():.2f} GB headroom)\n"
             f"  LoRA params    {self.lora_params / 1e6:8.1f} M    optimizer {self.optimizer}\n"
+            f"  lm_head        {self.lm_head_precision:>8}    full-trained "
+            f"{', '.join(self.modules_trained_in_full) or '(none)'}\n"
             f"  offloaded      {', '.join(self.offloaded) or '(nothing)'}\n"
             f"  projection     {tokens / 1e6:.0f}M tokens = {h:.1f} h ({h / 24:.2f} d)"
         )
+
+
+@dataclass(frozen=True)
+class MemoryCandidate:
+    """One point in the memory/quality trade-off, with the reason it sits where it does."""
+
+    name: str
+    quantize_lm_head: bool
+    optimizer_8bit: bool
+    rationale: str
+
+    def apply(self, cfg: HealConfig) -> HealConfig:
+        import copy
+
+        out = copy.deepcopy(cfg)
+        out.quantize_lm_head = self.quantize_lm_head
+        out.optimizer_8bit = self.optimizer_8bit
+        return out
+
+
+#: Ordered best-quality-first. The search takes the first that fits with margin.
+#:
+#: CPU embeddings and a chunked loss are in *every* candidate: they are near-free -- an
+#: embedding lookup on CPU is cheap, and chunking the loss costs a little throughput and no
+#: quality at all -- so there is never a reason to give them up.
+#:
+#: The ordering is by quality cost, not by memory saved. An NF4 lm_head saves the most (2.5
+#: GB) and costs the most: it injects quantisation noise into the very logits the top-K KL
+#: loss is matching, and the adapter then learns to compensate for an error that vanishes
+#: when merge_adapters loads the base in bf16. fp32 Adam moments cost 1 GB and buy back
+#: optimizer precision, which never enters the forward pass.
+MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
+    MemoryCandidate(
+        name="fp16-head",
+        quantize_lm_head=False,
+        optimizer_8bit=True,
+        rationale="fp16 lm_head: no quantisation noise in the logits the loss matches",
+    ),
+    MemoryCandidate(
+        name="nf4-head-adamw32",
+        quantize_lm_head=True,
+        optimizer_8bit=False,
+        rationale="NF4 head, but fp32 optimizer moments; head gets LoRA + trained final norm",
+    ),
+    MemoryCandidate(
+        name="nf4-head-adamw8",
+        quantize_lm_head=True,
+        optimizer_8bit=True,
+        rationale="most aggressive; both savings taken",
+    ),
+)
+
+
+@dataclass
+class SearchResult:
+    chosen: MemoryCandidate | None
+    config: HealConfig | None
+    probe: ProbeResult | None
+    attempts: list[tuple[str, str]] = field(default_factory=list)
+
+    def render(self, tokens: int) -> str:
+        lines = ["memory configuration search (best quality first):"]
+        for name, outcome in self.attempts:
+            lines.append(f"  {name:<18} {outcome}")
+        if self.chosen is None or self.probe is None:
+            lines.append("\n  NOTHING FIT. Lower seq_len, lora_rank, or loss_chunk.")
+            return "\n".join(lines)
+        lines += [
+            f"\nselected: {self.chosen.name} -- {self.chosen.rationale}",
+            self.probe.render(tokens),
+        ]
+        return "\n".join(lines)
+
+
+def search_memory_plan(
+    model_path: str,
+    cfg: HealConfig,
+    *,
+    margin_gb: float = 0.8,
+    n_steps: int = 8,
+    max_gpu_gb: float | None = None,
+    candidates: tuple[MemoryCandidate, ...] = MEMORY_CANDIDATES,
+) -> SearchResult:
+    """Measure candidates in quality order and take the first that fits with margin.
+
+    Sizing by arithmetic gets the order of magnitude right and the last gigabyte wrong, and
+    the last gigabyte is the whole question here. So each candidate is actually run.
+    """
+    result = SearchResult(chosen=None, config=None, probe=None)
+    for cand in candidates:
+        trial = cand.apply(cfg)
+        try:
+            probe = probe_training(
+                model_path, trial, n_steps=n_steps, max_gpu_gb=max_gpu_gb
+            )
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            result.attempts.append((cand.name, f"OOM -- {type(exc).__name__}"))
+            logutil.event(log, "candidate OOM", candidate=cand.name)
+            _free_cuda()
+            continue
+
+        headroom = probe.headroom_gb()
+        fits = headroom >= margin_gb
+        result.attempts.append(
+            (
+                cand.name,
+                f"{'FITS' if fits else 'too tight'}: peak {probe.peak_vram_gb:.2f} GB, "
+                f"headroom {headroom:.2f} GB, {probe.tok_s:.0f} tok/s",
+            )
+        )
+        _free_cuda()
+        if fits:
+            result.chosen, result.config, result.probe = cand, trial, probe
+            logutil.event(
+                log,
+                "memory plan selected",
+                candidate=cand.name,
+                headroom_gb=round(headroom, 2),
+                tok_s=round(probe.tok_s, 1),
+            )
+            return result
+    return result
+
+
+def _is_oom(exc: BaseException) -> bool:
+    import torch
+
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text or "cuda error" in text
+
+
+def _free_cuda() -> None:
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
 
 
 def probe_training(
@@ -629,6 +821,8 @@ def probe_training(
         lora_params=n_lora,
         offloaded=sorted(k for k, v in dmap.items() if str(v) in ("cpu", "disk")),
         optimizer=type(optim).__name__,
+        lm_head_precision="nf4" if cfg.quantize_lm_head else "fp16",
+        modules_trained_in_full=effective_lora_targets(cfg)[1],
     )
     del model, optim
     torch.cuda.empty_cache()

@@ -643,7 +643,7 @@ def stage5_teacher(ctx: StageContext) -> dict[str, Any]:
     estimated_hours=72.0,
 )
 def stage6_heal(ctx: StageContext) -> dict[str, Any]:
-    from marlowe.heal import probe_training, run_healing
+    from marlowe.heal import run_healing, search_memory_plan
 
     student = ctx.declare_input("unhealed", ctx.models_dir / f"{ctx.cfg.name}-unhealed")
     cache = ctx.declare_input("cache", ctx.run_dir / "teacher-cache")
@@ -653,15 +653,17 @@ def stage6_heal(ctx: StageContext) -> dict[str, Any]:
     # savings; this stack is plain peft + bitsandbytes, so the number has to be established
     # rather than inherited. Two minutes of real steps answers both "does it fit" and
     # "how long".
-    probe = probe_training(str(student), ctx.cfg.heal, max_gpu_gb=ctx.extra.get("max_gpu_gb"))
-    for line in probe.render(ctx.cfg.heal.tokens).splitlines():
+    search = search_memory_plan(
+        str(student), ctx.cfg.heal, max_gpu_gb=ctx.extra.get("max_gpu_gb")
+    )
+    for line in search.render(ctx.cfg.heal.tokens).splitlines():
         ctx.note(line)
-    if probe.headroom_gb() < 0.3:
+    if search.config is None or search.probe is None:
         raise preflight.ResourceError(
-            f"only {probe.headroom_gb():.2f} GB VRAM headroom at seq_len "
-            f"{ctx.cfg.heal.seq_len}; this will OOM partway through a three-day run. "
-            f"Lower heal.seq_len, heal.lora_rank, or heal.loss_chunk."
+            "no memory configuration fit with margin at seq_len "
+            f"{ctx.cfg.heal.seq_len}. Lower heal.seq_len, heal.lora_rank, or heal.loss_chunk."
         )
+    heal_cfg, probe = search.config, search.probe
     scored: list[dict[str, Any]] = []
 
     def on_checkpoint(path: Path, state: Any) -> dict[str, Any]:
@@ -685,12 +687,14 @@ def stage6_heal(ctx: StageContext) -> dict[str, Any]:
         str(student),
         cache,
         out,
-        ctx.cfg.heal,
+        heal_cfg,
         max_gpu_gb=ctx.extra.get("max_gpu_gb"),
         on_checkpoint=on_checkpoint,
         resume=True,
     )
     return {
+        "memory_plan": search.chosen.name if search.chosen else None,
+        "lm_head_precision": probe.lm_head_precision,
         "probe": {
             "tok_s": round(probe.tok_s, 1),
             "peak_vram_gb": round(probe.peak_vram_gb, 2),
