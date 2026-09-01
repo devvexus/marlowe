@@ -258,24 +258,46 @@ def score_candidates(
     ref_logprobs: Sequence[Any],
     *,
     already_ablated: Sequence[int] = (),
+    checkpoint: str | Path | None = None,
 ) -> dict[int, float]:
     """Mean forward-KL( full || ablated ) per candidate, in nats.
 
     ``already_ablated`` layers are held out for the whole sweep -- used by greedy mode to
     score the next cut on top of the cuts already taken.
+
+    ``checkpoint`` makes the sweep resumable. Stage 3 is ~8 hours and wrote nothing until it
+    returned, so a crash at hour seven cost seven hours -- and this machine kernel-panicked
+    under sustained GPU load. Each candidate is independent, so scoring one is a natural
+    commit point: roughly fifteen minutes of work, written as it completes.
     """
     import gc as _gc
+    import json as _json
 
     import torch
 
     cands = list(candidates)
     scores: dict[int, float] = {}
 
+    ckpt = Path(checkpoint) if checkpoint else None
+    if ckpt is not None and ckpt.exists():
+        # Keys are layer indices; JSON stringifies them.
+        done = {int(k): float(v) for k, v in _json.loads(ckpt.read_text()).items()}
+        # Only trust scores for layers this sweep is actually asking about. A checkpoint from
+        # a different ablation prefix describes a different question.
+        scores.update({k: v for k, v in done.items() if k in set(cands)})
+        if scores:
+            logutil.event(
+                log, "resuming candidate sweep", have=len(scores), of=len(cands),
+                path=str(ckpt),
+            )
+
     saved_prefix = {i: h.layers[i] for i in already_ablated}
     for i in already_ablated:
         h.layers[i] = make_identity(h.returns_tuple)
     try:
         for n, idx in enumerate(cands):
+            if idx in scores:
+                continue
             original = h.layers[idx]
             h.layers[idx] = make_identity(h.returns_tuple)
             total, count = 0.0, 0
@@ -295,6 +317,11 @@ def score_candidates(
                 layer=idx,
                 kl=round(scores[idx], 6),
             )
+            if ckpt is not None:
+                ckpt.parent.mkdir(parents=True, exist_ok=True)
+                tmp = ckpt.with_suffix(ckpt.suffix + ".tmp")
+                tmp.write_text(_json.dumps(scores, indent=2), encoding="utf-8")
+                tmp.replace(ckpt)  # atomic: a crash mid-write must not corrupt the resume
             _gc.collect()
             torch.cuda.empty_cache()
     finally:
@@ -677,7 +704,11 @@ def run_scoring(
             h, layout, batches, positions, ref_logprobs, n_remove, cfg.rescore_every
         )
     else:
-        scores = score_candidates(h, candidates, batches, positions, ref_logprobs)
+        scores = score_candidates(
+            h, candidates, batches, positions, ref_logprobs,
+            # ~8 hours of forwards; commit each candidate as it lands.
+            checkpoint=Path(out_dir) / "candidate_scores.partial.json",
+        )
         selected = oneshot_select(scores, layout, n_remove)
 
     control = positional_selection(layout, n_remove) if cfg.run_positional_control else []
