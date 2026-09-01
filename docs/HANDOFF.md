@@ -22,10 +22,16 @@ Ordered. Do not infer priority from the rest of this document.
    candidate. If it died with the session, restart it — nothing downstream can be sized
    without it:
    ```bash
-   marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml --steps 6
+   # Do NOT pipe through a filter: grep buffers, and a long GPU job then shows nothing at
+   # all until it exits. Redirect to a file and tail that instead.
+   marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml --steps 6      2>&1 | tee fitcheck.log
    ```
    The sizing-only 22B is a throwaway built with positional cuts; shape determines the memory
    envelope, cut selection does not. Rebuild with `marlowe surgery --auto 12` if it is gone.
+
+   Progress is visible three ways while it runs: `nvidia-smi` memory (a loaded candidate sits
+   around 13-16 GB), the `base cached` / `training probe` lines in the log, and
+   `runs/<name>/logs/*.jsonl` if it was launched under a stage rather than standalone.
 
 2. **Prefer seq_len 1024 unless something changed.** 73.5 vs 44.3 tok/s is 66% faster and
    neither length trains DeltaNet state eviction, so 2048 winning the memory search does not
