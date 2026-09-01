@@ -125,3 +125,64 @@ class TestPerModelCaching:
         got = imatrix_for(src, tmp_path / "corpus.txt", cache)
         assert got.read_bytes() == b"fresh"
         assert called["ctx"] == 4096, "512 under-weights the 16 context-dependent attn layers"
+
+
+class TestSegmentedBuild:
+    """An imatrix pass must survive being interrupted.
+
+    A kernel panic killed one at 120 of ~420 chunks. Segmenting banks each finished part on
+    disk and chains it into the next with --in-file, so a crash costs one segment rather than
+    the whole pass. --chunks cannot do this: it caps chunks read from the START of the file,
+    so a rerun re-reads the same opening text instead of advancing.
+    """
+
+    def test_split_preserves_every_byte(self, tmp_path) -> None:
+        from marlowe.imatrix import split_corpus
+
+        src = tmp_path / "c.txt"
+        src.write_text("\n".join(f"line {i} " + "x" * 60 for i in range(500)), encoding="utf-8")
+        parts = split_corpus(src, tmp_path / "seg", 4)
+        assert len(parts) == 4
+        joined = "".join(p.read_text(encoding="utf-8") for p in parts)
+        assert joined == src.read_text(encoding="utf-8"), "splitting must not drop text"
+
+    def test_split_breaks_on_line_boundaries(self, tmp_path) -> None:
+        """A chunk cut mid-token would feed llama-imatrix a corrupt fragment."""
+        from marlowe.imatrix import split_corpus
+
+        src = tmp_path / "c.txt"
+        src.write_text("\n".join(f"sentence {i}" for i in range(200)) + "\n", encoding="utf-8")
+        for p in split_corpus(src, tmp_path / "seg", 3):
+            body = p.read_text(encoding="utf-8")
+            assert body.startswith("sentence") or body == ""
+            assert body.endswith("\n")
+
+    def test_segments_chain_and_resume(self, tmp_path, monkeypatch) -> None:
+        """A completed segment is skipped on rerun, and each merges the one before it."""
+        import marlowe.imatrix as im
+
+        src = tmp_path / "m.gguf"
+        src.write_bytes(b"M" * 4096)
+        corpus = tmp_path / "c.txt"
+        corpus.write_text("\n".join(f"line {i}" for i in range(400)) + "\n", encoding="utf-8")
+
+        merges: list[str | None] = []
+
+        def fake_build(src_gguf, part, out, *, merge_from=None, **kw):
+            merges.append(None if merge_from is None else str(merge_from))
+            out.write_bytes(b"seg")
+            return out
+
+        monkeypatch.setattr(im, "build_imatrix", fake_build)
+        monkeypatch.setattr(im, "describe_imatrix", lambda p: {"imatrix.chunk_count": 50})
+
+        out = tmp_path / "final.dat"
+        im.build_imatrix_segmented(src, corpus, out, segments=3)
+        assert out.exists()
+        assert merges[0] is None, "the first segment starts fresh"
+        assert all(m is not None for m in merges[1:]), "later segments must merge the previous"
+
+        # Rerun: everything is cached, nothing rebuilds.
+        merges.clear()
+        im.build_imatrix_segmented(src, corpus, out, segments=3)
+        assert merges == [], "a completed run must not redo finished segments"

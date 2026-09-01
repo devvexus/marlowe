@@ -110,8 +110,11 @@ def build_imatrix(
     ctx: int = IMATRIX_CTX,
     n_gpu_layers: int = 0,
     timeout: int = 6 * 3600,
+    merge_from: str | Path | None = None,
 ) -> Path:
     """Run llama-imatrix over ``corpus_txt``. Returns the matrix path.
+
+    ``merge_from`` folds an existing matrix in via ``--in-file``, so segments accumulate.
 
     ``corpus_txt`` is plain text, not JSONL -- llama-imatrix reads raw text and chunks it
     internally, so the 32K-token sequence packing Stage 3 needs is irrelevant here. The same
@@ -128,6 +131,8 @@ def build_imatrix(
         "-c", str(ctx),
         "-ngl", str(n_gpu_layers),
     ]
+    if merge_from is not None:
+        cmd += ["--in-file", str(merge_from)]
     # Stream to a log rather than capturing.
     #
     # capture_output holds everything until the process exits, so a pass that takes hours
@@ -150,6 +155,89 @@ def build_imatrix(
     logutil.event(
         log, "imatrix built", out=str(out_path),
         mb=round(out_path.stat().st_size / 1e6, 1), ctx=ctx,
+    )
+    return out_path
+
+
+def split_corpus(corpus_txt: str | Path, out_dir: str | Path, segments: int) -> list[Path]:
+    """Split a text corpus into ``segments`` roughly equal parts, on line boundaries.
+
+    Splitting is what makes an interrupted pass recoverable. ``--chunks`` cannot help: it
+    caps how many chunks are read *from the start of the file*, so a second run with it
+    re-reads the same opening text rather than advancing. Separate files advance.
+    """
+    corpus_txt = Path(corpus_txt)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data = corpus_txt.read_text(encoding="utf-8", errors="replace")
+    target = len(data) // max(segments, 1)
+    parts: list[Path] = []
+    start = 0
+    for i in range(segments):
+        if i == segments - 1:
+            end = len(data)
+        else:
+            end = data.find("\n", start + target)
+            end = len(data) if end == -1 else end + 1
+        p = out_dir / f"{corpus_txt.stem}.part{i:02d}.txt"
+        p.write_text(data[start:end], encoding="utf-8")
+        parts.append(p)
+        start = end
+        if start >= len(data):
+            break
+    return parts
+
+
+def build_imatrix_segmented(
+    src_gguf: str | Path,
+    corpus_txt: str | Path,
+    out_path: str | Path,
+    *,
+    segments: int = 4,
+    ctx: int = IMATRIX_CTX,
+    n_gpu_layers: int = 0,
+    timeout: int = 6 * 3600,
+) -> Path:
+    """Build an imatrix in resumable segments, merging each into the last.
+
+    A single pass over the full corpus is one long bet: this machine kernel-panicked
+    (bugcheck 0x139) partway through one, and the ~40 minutes it had done were only
+    salvageable because llama-imatrix happens to checkpoint. Segmenting makes that structural
+    -- each finished segment is banked on disk, and a rerun skips what is already done.
+
+    Statistics merge additively, so chaining ``--in-file`` across segments gives the same
+    relative importance as one pass over the concatenation.
+    """
+    src_gguf, out_path = Path(src_gguf), Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    work = out_path.parent / f"{out_path.stem}.segments"
+    parts = split_corpus(corpus_txt, work, segments)
+
+    previous: Path | None = None
+    for i, part in enumerate(parts):
+        seg_out = work / f"seg{i:02d}.gguf"
+        if seg_out.exists():
+            info = describe_imatrix(seg_out)
+            logutil.event(
+                log, "imatrix segment cached", segment=i, of=len(parts),
+                chunks=info.get("imatrix.chunk_count"),
+            )
+            previous = seg_out
+            continue
+        logutil.event(log, "imatrix segment", segment=i, of=len(parts), corpus=str(part))
+        build_imatrix(
+            src_gguf, part, seg_out, ctx=ctx, n_gpu_layers=n_gpu_layers,
+            timeout=timeout, merge_from=previous,
+        )
+        previous = seg_out
+
+    assert previous is not None
+    # The last segment carries every earlier one merged into it.
+    out_path.write_bytes(previous.read_bytes())
+    info = describe_imatrix(out_path)
+    logutil.event(
+        log, "imatrix complete", segments=len(parts),
+        chunks=info.get("imatrix.chunk_count"), tokens_seen=info.get("tokens_seen"),
     )
     return out_path
 
