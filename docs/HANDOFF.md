@@ -183,14 +183,21 @@ baseline, which comes from a hosted endpoint.
 | `range(64)` hardcoded in the surgery plan | `surgery.py` (original script) | invisible until the ladder's second rung, where the parent is 52 layers |
 | transformers 5.1 lacks `qwen3_5` | environment | Stages 3/5/6 would die in minute one of an 8-hour job |
 | `getattr(out, "x", None) or out[0]` | `teacher.py` | `or` calls `bool()` on a multi-element tensor → raises 6 h into the cache run |
-| torch accounting instead of device memory | `probe_training`, then `estimate_peak_gb` | overstated headroom by ~1 GB; would have selected a config that OOMs at hour 30 **with its own record certifying it fit** |
-| `lora_rank` not persisted in the memory plan | `save_memory_plan` | Stage 6 would reload the plan and silently revert the rank that made it fit |
+| torch accounting instead of device memory | `probe_training`, then `estimate_peak_gb` | understated the footprint by ~1 GB; would have selected a config that OOMs at hour 30 **with its own record certifying it fit** |
+| the *fix* for that then over-reported | `probe_training` | `total - free` includes the allocator's reserved pool, which under `expandable_segments` grows opportunistically and is never returned. Every candidate measured **17.17 GB, headroom 0.00** — identical, saturated, not a measurement. The search would have rejected everything. Correct metric: baseline resident (CUDA context, measured before load) **+** `max_memory_reserved()` |
+| `lora_rank` not persisted in the memory plan | `save_memory_plan` | a candidate override the plan didn't carry. Had `fp16-head-1024-rank16` been selected, Stage 6 would have restored `seq_len` and head precision correctly and **silently reverted the rank that made it fit** — OOMing on a plan whose own record said it had been measured as fitting. The cleanest instance of the pattern: self-certifying wrong answer. Field list is now derived from the dataclass |
 | quants list narrower than the gate | `configs/marlowe-18b.yaml` | gate would fail after a week on *missing data*, looking like a quality failure |
 | surgery not idempotent | `write_checkpoint` | collided with its own prior output after a full streaming pass |
 
 **The pattern: every one of these loads, runs, and produces plausible output.** None crashes.
 None OOMs. The model generates fluent text, the search reports a number, the config parses.
 That is the failure shape this codebase produces, and it is what to look for.
+
+Two of them are worth studying together: the memory metric was wrong, then its *fix* was
+wrong in the opposite direction, and the second version failed more loudly only by luck —
+saturating at exactly `total` made it obvious, where a subtler over-report would have looked
+like a plausible number. **When you correct a measurement, check the corrected one against a
+case whose answer you already know.**
 
 Corollaries that earned their place:
 
@@ -205,6 +212,9 @@ Corollaries that earned their place:
 - **A refusal that recommends a broken alternative is barely better than no refusal.** The
   long-context refusal suggested a fallback length that didn't itself fit, until the
   estimator was calibrated. A test now asserts the suggested ceiling clears the margin.
+- **Adding a field is not the same as plumbing it.** `lora_rank` became a candidate override
+  and was not added to persistence; two commits later it would have caused an OOM. Anything
+  a search can vary must be carried by whatever records the search's decision.
 
 ---
 
@@ -240,8 +250,25 @@ Corollaries that earned their place:
 
 `marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml`
 
-Known so far: `fp16-head-2048` peaks at **16.64 GB device-level of 17.17 GB** (~0.53 GB
-free), which is below the 1.0 GB `FIT_MARGIN_GB` and is rejected. The search moved on.
+**No usable peak numbers yet.** The first run's measurements were taken with the saturating
+metric (§3) and are void — every candidate reported 17.17 GB / 0.00 GB headroom. The
+16.64 GB figure quoted earlier came from `nvidia-smi` mid-run and is an upper bound on
+`fp16-head-2048`, not a probe result.
+
+Throughput from that run **is** valid (it does not depend on the memory metric):
+
+```
+fp16 head, seq 2048, rank 32, AdamW8bit    44.3 tok/s
+fp16 head, seq 1024, rank 32, AdamW8bit    73.5 tok/s
+nf4  head, seq 2048, rank 32, AdamW fp32    9.8 tok/s   <- note the collapse
+```
+
+The NF4 + fp32-Adam candidate is ~4.5x slower than the fp16 equivalent. That is a further
+argument against the gated candidates beyond the quality one, and worth confirming.
+
+The search now caches the NF4 base per head precision instead of reloading 45 GB of
+safetensors per candidate — quantisation is deterministic and the frozen base does not
+change between candidates, only sequence length, rank and optimizer do.
 
 The estimator, calibrated against that measurement, predicts:
 

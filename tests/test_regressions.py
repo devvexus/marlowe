@@ -778,6 +778,24 @@ class TestGgufProbeUsesRealNaming:
         assert mask != real, "fixture must differ or the test proves nothing"
 
 
+def _stub_model_plumbing(monkeypatch) -> None:
+    """Stub the base load and LoRA wrap for search tests.
+
+    These exercise selection logic -- ordering, gating, short-circuiting -- not the model
+    plumbing. Without this they would try to load safetensors from a fake path.
+    """
+    from marlowe import heal
+
+    monkeypatch.setattr(heal, "load_student", lambda *a, **k: object())
+    monkeypatch.setattr(heal, "attach_lora", lambda base, cfg: _StubWrapped())
+    monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+
+
+class _StubWrapped:
+    def unload(self):
+        return object()
+
+
 class TestMemoryPlanSearch:
     """Stage 6's memory config is searched by measurement, not assumed.
 
@@ -844,7 +862,7 @@ class TestMemoryPlanSearch:
 
         calls: list[bool] = []
 
-        def fake_probe(path, cfg, *, n_steps=8, max_gpu_gb=None):
+        def fake_probe(path, cfg, *, n_steps=8, max_gpu_gb=None, base=None):
             calls.append(cfg.quantize_lm_head)
             headroom = 0.2 if not cfg.quantize_lm_head else 2.0
             return heal.ProbeResult(
@@ -853,7 +871,7 @@ class TestMemoryPlanSearch:
             )
 
         monkeypatch.setattr(heal, "probe_training", fake_probe)
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
         res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
 
         # NF4 candidates need explicit approval, so without it the search stops here.
@@ -881,7 +899,7 @@ class TestMemoryPlanSearch:
                 seq_len=c.seq_len, n_steps=4, lora_params=1,
             ),
         )
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
         res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
         assert res.chosen is not None and res.chosen.name == "fp16-head-2048"
         assert res.config is not None and res.config.quantize_lm_head is False
@@ -899,7 +917,7 @@ class TestMemoryPlanSearch:
             )
 
         monkeypatch.setattr(heal, "probe_training", fake_probe)
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
         res = heal.search_memory_plan(
             "x", HealConfig(), margin_gb=0.5, allow_quantized_head=True
         )
@@ -913,6 +931,7 @@ class TestMemoryPlanSearch:
         def boom(path, cfg, **k):
             raise ValueError("a real bug, not a memory problem")
 
+        _stub_model_plumbing(monkeypatch)
         monkeypatch.setattr(heal, "probe_training", boom)
         with pytest.raises(ValueError, match="a real bug"):
             heal.search_memory_plan("x", HealConfig())
@@ -928,7 +947,7 @@ class TestMemoryPlanSearch:
                 seq_len=c.seq_len, n_steps=1, lora_params=1,
             ),
         )
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
         # With approval granted, exhausting every candidate is a plain "nothing fits" --
         # distinct from stopping at the approval gate, which has its own message.
         res = heal.search_memory_plan(
@@ -1304,7 +1323,7 @@ class TestSequenceLengthLadder:
             )
 
         monkeypatch.setattr(heal, "probe_training", fake)
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
 
         res = heal.search_memory_plan(
             "x", HealConfig(), probe_all=True, allow_quantized_head=True
@@ -1362,7 +1381,7 @@ class TestQuantizedHeadNeedsApproval:
         from marlowe.config import HealConfig
 
         monkeypatch.setattr(heal, "probe_training", self._tight(0.5))
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
         res = heal.search_memory_plan("x", HealConfig(), margin_gb=1.0)
 
         assert res.chosen is None
@@ -1387,7 +1406,7 @@ class TestQuantizedHeadNeedsApproval:
             )
 
         monkeypatch.setattr(heal, "probe_training", probe)
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
         heal.search_memory_plan("x", HealConfig(), margin_gb=1.0)
         assert not any(seen), "an approval-gated candidate was probed"
 
@@ -1403,7 +1422,7 @@ class TestQuantizedHeadNeedsApproval:
             )
 
         monkeypatch.setattr(heal, "probe_training", probe)
-        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        _stub_model_plumbing(monkeypatch)
         res = heal.search_memory_plan(
             "x", HealConfig(), margin_gb=1.0, allow_quantized_head=True
         )

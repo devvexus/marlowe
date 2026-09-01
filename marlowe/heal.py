@@ -337,6 +337,27 @@ def effective_lora_targets(cfg: HealConfig) -> tuple[list[str], list[str]]:
     return targets, save_full
 
 
+def attach_lora(base: Any, cfg: HealConfig) -> Any:
+    """Wrap a prepared NF4 base in LoRA adapters. Cheap; the base load is what is not."""
+    from peft import LoraConfig, get_peft_model
+
+    targets, save_full = effective_lora_targets(cfg)
+    lora = LoraConfig(
+        r=cfg.lora_rank,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
+        target_modules=targets,
+        modules_to_save=save_full or None,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(base, lora)
+    model.print_trainable_parameters()
+    # LoRA adapters are legitimately bf16; the ceiling accounts for them plus embeddings.
+    preflight.assert_no_bf16_resident(model, allow_params=3_200_000_000)
+    return model
+
+
 def build_optimizer(params: list[Any], cfg: HealConfig) -> Any:
     """AdamW with 8-bit moments where available.
 
@@ -359,7 +380,13 @@ def build_optimizer(params: list[Any], cfg: HealConfig) -> Any:
     return torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=0.0)
 
 
-def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None = None) -> Any:
+def load_student(
+    model_path: str,
+    cfg: HealConfig,
+    *,
+    max_gpu_gb: float | None = None,
+    base_only: bool = False,
+) -> Any:
     """NF4 base plus LoRA adapters. The base is never held in bf16.
 
     Two memory decisions matter on a 16 GB card, and both are the difference between fitting
@@ -377,7 +404,7 @@ def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None =
 
     preflight.check_bitsandbytes()
     try:
-        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        from peft import prepare_model_for_kbit_training
     except ImportError as exc:
         raise RuntimeError(
             "peft is required for Stage 6. Install with: pip install 'marlowe[heal]'"
@@ -416,24 +443,19 @@ def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None =
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     assert_layers_on_gpu(model)
+    if base_only:
+        return prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=cfg.gradient_checkpointing
+        )
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=cfg.gradient_checkpointing
     )
-    targets, save_full = effective_lora_targets(cfg)
-    lora = LoraConfig(
-        r=cfg.lora_rank,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout,
-        target_modules=targets,
-        modules_to_save=save_full or None,
-        bias="none",
-        task_type="CAUSAL_LM",
+    return attach_lora(
+        prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=cfg.gradient_checkpointing
+        ),
+        cfg,
     )
-    model = get_peft_model(model, lora)
-    model.print_trainable_parameters()
-    # The LoRA adapters are legitimately bf16; the ceiling accounts for them plus embeddings.
-    preflight.assert_no_bf16_resident(model, allow_params=3_200_000_000)
-    return model
 
 
 def run_healing(
@@ -807,6 +829,19 @@ def search_memory_plan(
     the last gigabyte is the whole question here. So each candidate is actually run.
     """
     result = SearchResult(chosen=None, config=None, probe=None)
+    # Quantisation is deterministic and the frozen base does not change between candidates --
+    # only sequence length, LoRA rank and the optimizer do. Reloading 45 GB of safetensors per
+    # candidate dominated the search's wall clock, and Stage 8 runs the whole search again on
+    # the 18B. The base is cached per head precision, which is the only thing that alters it.
+    bases: dict[bool, Any] = {}
+
+    def base_for(trial: HealConfig) -> Any:
+        key = trial.quantize_lm_head
+        if key not in bases:
+            bases[key] = load_student(model_path, trial, max_gpu_gb=max_gpu_gb, base_only=True)
+            logutil.event(log, "base cached", quantize_lm_head=key)
+        return bases[key]
+
     for cand in candidates:
         if result.chosen is not None and not probe_all:
             break
@@ -819,14 +854,20 @@ def search_memory_plan(
             continue
         trial = cand.apply(cfg)
         try:
+            wrapped = attach_lora(base_for(trial), trial)
             probe = probe_training(
-                model_path, trial, n_steps=n_steps, max_gpu_gb=max_gpu_gb
+                model_path, trial, n_steps=n_steps, max_gpu_gb=max_gpu_gb, base=wrapped
             )
+            # Strip the adapters so the next candidate wraps a clean base. The frozen NF4
+            # weights are untouched by training, so the base is reusable as-is.
+            bases[trial.quantize_lm_head] = wrapped.unload()
         except Exception as exc:
             if not _is_oom(exc):
                 raise
             result.attempts.append((cand.name, f"OOM -- {type(exc).__name__}"))
             logutil.event(log, "candidate OOM", candidate=cand.name)
+            # A candidate that OOMed may have left the base in an unknown state; drop it.
+            bases.pop(trial.quantize_lm_head, None)
             _free_cuda()
             continue
 
@@ -850,7 +891,11 @@ def search_memory_plan(
                 tok_s=round(probe.tok_s, 1),
             )
             if not probe_all:
+                bases.clear()
+                _free_cuda()
                 return result
+    bases.clear()
+    _free_cuda()
     return result
 
 
@@ -969,6 +1014,7 @@ def probe_training(
     *,
     n_steps: int = 12,
     max_gpu_gb: float | None = None,
+    base: Any = None,
 ) -> ProbeResult:
     """Run a few real training steps and measure throughput and peak VRAM.
 
@@ -984,10 +1030,18 @@ def probe_training(
 
     from marlowe.score import find_decoder
 
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    # Everything already on the device before this model loads: the CUDA context, the
+    # driver's own allocations, any other process. Measured once, with torch holding
+    # nothing, because it cannot be recovered from torch's own counters.
+    free0, total0 = torch.cuda.mem_get_info(0)
+    baseline_used = total0 - free0
 
-    model = load_student(model_path, cfg, max_gpu_gb=max_gpu_gb)
+    model = base if base is not None else load_student(
+        model_path, cfg, max_gpu_gb=max_gpu_gb
+    )
     decoder = find_decoder(model)
     lm_head = model.get_output_embeddings()
     params = [p for p in model.parameters() if p.requires_grad]
@@ -1003,7 +1057,6 @@ def probe_training(
     t_lp = torch.log_softmax(torch.randn(cfg.micro_batch, seq, k, device=device), dim=-1)
 
     timings: list[float] = []
-    peak_device_used = 0
     for i in range(n_steps):
         t0 = time.time()
         out = decoder(input_ids=ids, use_cache=False)
@@ -1016,19 +1069,22 @@ def probe_training(
         optim.step()
         optim.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
-        # Device-level truth, sampled right after the step where the footprint is highest.
-        #
-        # max_memory_allocated() counts only tensor bytes: it excludes the CUDA context
-        # (several hundred MB), the caching allocator's reserved-but-unallocated blocks, and
-        # anything allocated outside torch. Sizing on it overstates headroom by roughly a
-        # gigabyte, which is the entire margin being decided here -- so the fit decision uses
-        # what the driver reports instead.
-        free_b, total_b = torch.cuda.mem_get_info(0)
-        peak_device_used = max(peak_device_used, total_b - free_b)
         del out, hidden, loss
         # Discard the first two steps: allocator warm-up and cuBLAS autotuning.
         if i >= 2:
             timings.append(time.time() - t0)
+
+    # The footprint that actually constrains the run: what was already resident plus the
+    # allocator's high-water reservation.
+    #
+    # Neither obvious counter works alone. max_memory_allocated() counts live tensor bytes
+    # and misses the CUDA context and fragmentation -- it under-reports by ~1 GB. And
+    # (total - free) from the driver includes the caching allocator's *reserved* pool, which
+    # under expandable_segments grows opportunistically and is never handed back, so it
+    # saturates at total: every candidate measured 17.17 GB with 0.00 GB headroom, which is
+    # not a measurement at all. max_memory_reserved() is the allocator's peak claim on CUDA,
+    # which is the part that cannot be given back.
+    peak_device_used = baseline_used + torch.cuda.max_memory_reserved()
 
     step_s = sum(timings) / max(len(timings), 1)
     dmap = getattr(model, "hf_device_map", {}) or {}
@@ -1047,7 +1103,9 @@ def probe_training(
         lm_head_precision="nf4" if cfg.quantize_lm_head else "fp16",
         modules_trained_in_full=effective_lora_targets(cfg)[1],
     )
-    del model, optim
+    del optim
+    if base is None:
+        del model
     torch.cuda.empty_cache()
     logutil.event(
         log,
