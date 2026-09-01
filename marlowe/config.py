@@ -313,6 +313,29 @@ class RunConfig:
     expected_params: float | None = None
     expected_layers: int | None = None
 
+    def validate_token_budgets(self) -> None:
+        """The teacher cache is built once and consumed once.
+
+        Caching fewer tokens than healing consumes silently reuses data (a second epoch);
+        caching more spends Stage 5 time on tokens training never reads. At the measured
+        forward rate each surplus 10M tokens is roughly another day.
+        """
+        if self.teacher.tokens < self.heal.tokens:
+            raise ValueError(
+                f"teacher.tokens ({self.teacher.tokens / 1e6:.0f}M) is below heal.tokens "
+                f"({self.heal.tokens / 1e6:.0f}M); healing would loop over the cache and "
+                f"train a second epoch on the same data without saying so."
+            )
+        surplus = self.teacher.tokens - self.heal.tokens
+        if surplus > self.heal.tokens * 0.1:
+            import logging
+
+            logging.getLogger("marlowe.config").warning(
+                "teacher.tokens exceeds heal.tokens by %.0fM; Stage 5 will cache tokens "
+                "training never reads, at roughly a day per 10M.",
+                surplus / 1e6,
+            )
+
     def config_hash(self) -> str:
         return hash_obj(asdict(self))
 
@@ -397,4 +420,5 @@ def load_run_config(path: str | Path, *, vram_gb: float | None = None) -> RunCon
         vram_gb = probed if probed > 0 else None
     if vram_gb:
         cfg.heal.validate_long_context(vram_gb=vram_gb)
+    cfg.validate_token_budgets()
     return cfg

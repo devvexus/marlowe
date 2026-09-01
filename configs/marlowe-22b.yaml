@@ -33,7 +33,10 @@ score:
   run_positional_control: true
 
 teacher:
-  tokens: 50000000
+  # Must be >= heal.tokens and there is no value in exceeding it: the cache is built
+  # once and consumed once. At the measured forward rate every surplus 10M tokens is
+  # roughly another day of Stage 5 for data training never reads.
+  tokens: 35000000
   top_k: 16
   seq_len: 2048
   batch_size: 4
@@ -44,7 +47,7 @@ heal:
   # Sized to make the 18B rung reachable, not to maximise 22B on its own. 22B ships, but it
   # is the intermediate: a direct 27B -> 18B cut is outside the band where healing recovers,
   # and this rung exists to keep each step near 19%.
-  tokens: 50000000
+  tokens: 35000000
   seq_len: 2048            # what makes 3 days possible; verify at 128K before shipping
   lora_rank: 32
   lora_alpha: 64

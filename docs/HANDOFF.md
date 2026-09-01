@@ -255,8 +255,16 @@ healing wall-clock at 73.5 tok/s (93 tok/s estimated for the 18B, scaled by dept
     100M      15.7 d      12.4 d        28.2 d
 ```
 
-**The shipped configs (22B=50M, 18B=100M) are 20.3 days of healing alone.** That needs an
-explicit decision before Stage 5; the operator was choosing at the point this was written.
+**Decided: 35M tokens on both rungs** — 9.9 days healing plus ~4.5 days caching, ~15 days
+end to end. The reasoning was explicitly *finish both rungs* rather than spend eight days on
+the intermediate; 18B is the headline and a 22B healed to exhaustion is worth less than both
+rungs completed. The configs previously read 50M/100M, which was 20.3 days of healing alone
+and was sized against the 3-day-per-rung assumption.
+
+`teacher.tokens` now matches `heal.tokens` on both rungs. They were left at 50M/100M when the
+heal budgets came down, which would have spent Stage 5 caching tokens training never reads —
+roughly a day per surplus 10M. `RunConfig.validate_token_budgets()` now refuses a cache
+smaller than the heal budget (silent second epoch) and warns on a surplus above 10%.
 
 Stage 5's teacher cache is a further unmeasured cost. The brief budgeted 6 hours from an
 assumed 2500 tok/s — the same source as the 200 tok/s. Scaling the measured training rate by
@@ -290,8 +298,38 @@ should replace it with its own logged rate.**
 
 4. **The memory search result is not in.** See §5.
 
-5. **The healing token budget needs re-deciding against measured throughput.** See §3b. The
-   configs still carry the 3-day-era numbers.
+5. **Unsloth evaluation — not yet run.** Worth ~an hour against a 15-day schedule: 73 → 150
+   tok/s would roughly halve it. `scripts/eval_unsloth.py` is written and its comparison
+   logic is verified against synthetic inputs.
+
+   **Isolated venv only — never the working environment.** The current stack is validated end
+   to end (`tests/test_heal_stack.py`, 12 tests) and Unsloth pins transformers/torch
+   aggressively. The benchmark claims are measured on Llama-family dense models.
+
+   ```bash
+   python -m venv .venv-unsloth
+   .venv-unsloth/Scripts/pip install unsloth
+   .venv-unsloth/Scripts/python scripts/eval_unsloth.py --model <student> --out unsloth.json
+   python scripts/eval_unsloth.py --model <student> --stack peft --out peft.json
+   python scripts/eval_unsloth.py --compare unsloth.json peft.json
+   ```
+
+   Three criteria, same data and seed, few hundred steps:
+
+   - **tok/s** — is ~2x real on *this* architecture?
+   - **peak VRAM, device-level** — savings might reopen seq 1536 or rank 32; a fallback might
+     cost more. Either changes sizing, and the entire memory ladder was measured on plain
+     peft. **If Unsloth is adopted, re-run `marlowe fitcheck` before Stage 5.**
+   - **loss curve** — *the deciding one*. Divergence beyond 0.02 means its kernels compute
+     something different on `qwen3_5`, and it is unusable at any speed.
+
+   Unsloth patches model internals and must recognise the architecture to do so correctly.
+   Gated DeltaNet, the fused `q_proj` output gate and the float32 recurrent state are all new
+   and unusual. **Silent miscompute is this project's signature failure (§3), and a
+   throughput win on wrong gradients is worse than no win.** A speedup below 1.25x is treated
+   as a rejection in its own right: that is the signature of an unrecognised architecture
+   quietly falling back to a generic path. The harness also captures any Unsloth warning
+   mentioning an unsupported architecture.
 
 ---
 

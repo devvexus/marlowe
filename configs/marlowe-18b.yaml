@@ -47,9 +47,12 @@ score:
   run_positional_control: true
 
 teacher:
+  # Must be >= heal.tokens and there is no value in exceeding it: the cache is built
+  # once and consumed once. At the measured forward rate every surplus 10M tokens is
+  # roughly another day of Stage 5 for data training never reads.
   # The teacher stays the 27B where affordable; against the healed 22B it is cheaper and
   # closer to the student. Point `parent` at whichever you intend and record it.
-  tokens: 100000000
+  tokens: 35000000
   top_k: 16
   seq_len: 2048
   batch_size: 4
@@ -61,7 +64,7 @@ heal:
   # parent's depth in total and must hold up at Q4_K_M, IQ4_XS *and* IQ3_M -- under-healed
   # weights carry larger activation outliers and quantise worse, so healing tokens buy
   # quantisation robustness, not just KL.
-  tokens: 100000000
+  tokens: 35000000
   seq_len: 2048
   lora_rank: 32
   lora_alpha: 64
