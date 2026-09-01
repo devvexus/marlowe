@@ -273,23 +273,24 @@ def cmd_probe(args: argparse.Namespace) -> int:
 def cmd_fitcheck(args: argparse.Namespace) -> int:
     """Measure Stage 6 throughput and peak VRAM without committing to the run."""
     from marlowe.config import HealConfig, load_run_config
-    from marlowe.heal import probe_training, search_memory_plan
+    from marlowe.heal import FIT_MARGIN_GB, probe_training, search_memory_plan
 
     cfg = load_run_config(args.config).heal if args.config else HealConfig()
     if args.seq_len:
         cfg.seq_len = args.seq_len
     if args.lora_rank:
         cfg.lora_rank = args.lora_rank
+    margin = args.margin if args.margin is not None else FIT_MARGIN_GB
 
     if args.no_search:
         result = probe_training(args.model, cfg, n_steps=args.steps, max_gpu_gb=args.max_gpu_gb)
         print(result.render(cfg.tokens))
-        return 0 if result.headroom_gb() >= args.margin else 1
+        return 0 if result.headroom_gb() >= margin else 1
 
     search = search_memory_plan(
         args.model,
         cfg,
-        margin_gb=args.margin,
+        margin_gb=margin,
         n_steps=args.steps,
         max_gpu_gb=args.max_gpu_gb,
     )
@@ -471,7 +472,10 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--seq-len", dest="seq_len", type=int)
     fc.add_argument("--lora-rank", dest="lora_rank", type=int)
     fc.add_argument("--max-gpu-gb", dest="max_gpu_gb", type=float)
-    fc.add_argument("--margin", type=float, default=0.8, help="required VRAM headroom, GB")
+    fc.add_argument(
+        "--margin", type=float, default=None,
+        help="required device-level VRAM headroom in GB (default: heal.FIT_MARGIN_GB)",
+    )
     fc.add_argument("--no-search", dest="no_search", action="store_true",
                     help="probe the config as written instead of searching candidates")
     fc.add_argument("--write-config", dest="write_config", action="store_true",

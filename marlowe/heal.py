@@ -56,6 +56,18 @@ from marlowe.config import HealConfig
 
 log = logutil.get("heal")
 
+#: Required device-level VRAM headroom for a configuration to count as fitting.
+#:
+#: 1.0 GB, not the 0.3 GB this started at. Half a gigabyte is not a margin to stake a three-
+#: to-five-day unattended run on: expandable_segments reduces fragmentation but does not
+#: eliminate it, and a day lost to an OOM at hour 30 costs far more than the throughput gap
+#: to the next candidate down. Rejecting a configuration that would *probably* have held is
+#: the cheap error here.
+#:
+#: Measured device-level (total minus free from the driver), not from torch accounting --
+#: see :func:`probe_training` for why that distinction is load-bearing.
+FIT_MARGIN_GB = 1.0
+
 
 # ---------------------------------------------------------------------------
 # loss
@@ -616,6 +628,10 @@ class ProbeResult:
     optimizer: str = ""
     lm_head_precision: str = ""
     modules_trained_in_full: list[str] = field(default_factory=list)
+    #: What torch itself accounted for. Lower than peak_vram_gb by the CUDA context and
+    #: allocator fragmentation; kept for diagnosis, never for the fit decision.
+    torch_allocated_gb: float = 0.0
+    torch_reserved_gb: float = 0.0
 
     def headroom_gb(self) -> float:
         return self.total_vram_gb - self.peak_vram_gb
@@ -629,7 +645,9 @@ class ProbeResult:
             f"measured over {self.n_steps} steps at seq_len {self.seq_len}:\n"
             f"  throughput     {self.tok_s:8.1f} tok/s  ({self.step_s * 1000:.0f} ms/step)\n"
             f"  peak VRAM      {self.peak_vram_gb:8.2f} GB of {self.total_vram_gb:.1f} "
-            f"({self.headroom_gb():.2f} GB headroom)\n"
+            f"({self.headroom_gb():.2f} GB headroom, device-level)\n"
+            f"  torch acct     {self.torch_allocated_gb:8.2f} GB allocated / "
+            f"{self.torch_reserved_gb:.2f} GB reserved\n"
             f"  LoRA params    {self.lora_params / 1e6:8.1f} M    optimizer {self.optimizer}\n"
             f"  lm_head        {self.lm_head_precision:>8}    full-trained "
             f"{', '.join(self.modules_trained_in_full) or '(none)'}\n"
@@ -729,7 +747,7 @@ def search_memory_plan(
     model_path: str,
     cfg: HealConfig,
     *,
-    margin_gb: float = 0.8,
+    margin_gb: float = FIT_MARGIN_GB,
     n_steps: int = 8,
     max_gpu_gb: float | None = None,
     candidates: tuple[MemoryCandidate, ...] = MEMORY_CANDIDATES,
@@ -896,6 +914,7 @@ def probe_training(
     t_lp = torch.log_softmax(torch.randn(cfg.micro_batch, seq, k, device=device), dim=-1)
 
     timings: list[float] = []
+    peak_device_used = 0
     for i in range(n_steps):
         t0 = time.time()
         out = decoder(input_ids=ids, use_cache=False)
@@ -908,6 +927,15 @@ def probe_training(
         optim.step()
         optim.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
+        # Device-level truth, sampled right after the step where the footprint is highest.
+        #
+        # max_memory_allocated() counts only tensor bytes: it excludes the CUDA context
+        # (several hundred MB), the caching allocator's reserved-but-unallocated blocks, and
+        # anything allocated outside torch. Sizing on it overstates headroom by roughly a
+        # gigabyte, which is the entire margin being decided here -- so the fit decision uses
+        # what the driver reports instead.
+        free_b, total_b = torch.cuda.mem_get_info(0)
+        peak_device_used = max(peak_device_used, total_b - free_b)
         del out, hidden, loss
         # Discard the first two steps: allocator warm-up and cuBLAS autotuning.
         if i >= 2:
@@ -917,7 +945,9 @@ def probe_training(
     dmap = getattr(model, "hf_device_map", {}) or {}
     result = ProbeResult(
         tok_s=cfg.micro_batch * seq / step_s,
-        peak_vram_gb=torch.cuda.max_memory_allocated() / 1e9,
+        peak_vram_gb=peak_device_used / 1e9,
+        torch_allocated_gb=torch.cuda.max_memory_allocated() / 1e9,
+        torch_reserved_gb=torch.cuda.max_memory_reserved() / 1e9,
         total_vram_gb=total_vram,
         step_s=step_s,
         seq_len=seq,
