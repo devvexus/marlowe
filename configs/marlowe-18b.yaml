@@ -69,6 +69,11 @@ repetition:
   max_tokens: 2048
   ngram_sizes: [8, 32]
   prompts_path: data/circling_prompts.jsonl
+  # llama-server batches concurrent sequences and each completion is independently
+  # seeded, so this is pure throughput: the harness is 410K tokens per variant and
+  # Stage 0 runs it once per quant recipe. 4 slots x 8192 ctx of Q8 KV is ~1.1 GB on
+  # top of a ~10 GB model, which fits the 16 GB card.
+  parallel: 4
   preset: thinking
   seed: 0
 

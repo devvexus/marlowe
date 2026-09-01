@@ -128,7 +128,7 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any
     req = urllib.request.Request(  # noqa: S310 - local llama-server endpoint
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # noqa: S310 - local/http endpoint
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         body: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
     return body
 
@@ -242,6 +242,7 @@ def spawn_llama_server(
     n_gpu_layers: int = 999,
     cache_type_k: str = "q8_0",
     cache_type_v: str = "q8_0",
+    parallel: int = 1,
     extra_args: Sequence[str] = (),
     wait_s: int = 600,
 ) -> subprocess.Popen[bytes]:
@@ -257,10 +258,13 @@ def spawn_llama_server(
         exe,
         "-m", str(gguf),
         "--port", str(port),
-        "-c", str(ctx),
+        "-c", str(ctx * parallel),
         "-ngl", str(n_gpu_layers),
         "-ctk", cache_type_k,
         "-ctv", cache_type_v,
+        # One slot per concurrent request. The context is divided between slots, so ask for
+        # parallel * ctx and let each slot get the requested window.
+        "-np", str(parallel),
         *extra_args,
     ]
     logutil.event(log, "spawning llama-server", port=port, ctx=ctx, model=Path(gguf).name)
@@ -393,6 +397,7 @@ def run_repetition(
     seed: int = 0,
     tokenizer_path: str | None = None,
     save_completions: str | Path | None = None,
+    parallel: int = 1,
 ) -> RepetitionReport:
     """Run the harness. Refuses any preset but thinking.
 
@@ -419,8 +424,22 @@ def run_repetition(
     raw: list[dict[str, Any]] = []
     errors = 0
 
-    for n, (p, s) in enumerate(plan):
-        c = backend.generate(p.text, max_tokens, sampling, s)
+    # Concurrency is a pure throughput win here: llama-server batches concurrent sequences,
+    # and each completion is independent and separately seeded, so results are unchanged.
+    # It matters -- the harness is 410K tokens per variant and Stage 0 runs it eight times.
+    def _run_one(item: tuple[Prompt, int]) -> tuple[Prompt, int, Completion]:
+        p, s = item
+        return p, s, backend.generate(p.text, max_tokens, sampling, s)
+
+    if parallel > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            produced = list(pool.map(_run_one, plan))
+    else:
+        produced = [_run_one(item) for item in plan]
+
+    for n, (p, s, c) in enumerate(produced):
         c.prompt_id = p.id
         if c.stop_reason == "error":
             errors += 1
@@ -446,7 +465,7 @@ def run_repetition(
         if (n + 1) % 20 == 0 or n + 1 == len(plan):
             logutil.event(
                 log,
-                "progress",
+                "scored",
                 done=n + 1,
                 of=len(plan),
                 label=label,

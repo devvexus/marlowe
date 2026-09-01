@@ -70,7 +70,7 @@ def _measure_pair(
 
     cfgr = ctx.cfg.repetition
     prompts = rep.load_prompts(cfgr.prompts_path)
-    proc = rep.spawn_llama_server(gguf, ctx=8192)
+    proc = rep.spawn_llama_server(gguf, ctx=8192, parallel=cfgr.parallel)
     try:
         report = rep.run_repetition(
             rep.LlamaServerBackend(),
@@ -83,6 +83,7 @@ def _measure_pair(
             seed=cfgr.seed,
             tokenizer_path=tokenizer_path,
             save_completions=ctx.metrics_dir / f"completions-{label}.jsonl",
+            parallel=cfgr.parallel,
         )
         out["repetition"] = report.as_dict()
     finally:

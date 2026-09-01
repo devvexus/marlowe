@@ -26,3 +26,6 @@ data/*.csv
 
 # Local llama.cpp checkout + build. Reproducibility lives in vendor/*.patch, not here.
 .tools/
+
+# transient config probes
+scratch-config/
