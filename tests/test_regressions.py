@@ -1459,11 +1459,37 @@ class TestNoTorchAccountingInFitDecisions:
     def test_probe_decides_on_device_level_memory(self) -> None:
         import inspect
 
+        from marlowe.heal import cuda_context_bytes, probe_training
+
+        src = inspect.getsource(probe_training)
+        assert "peak_vram_gb=peak_device_used" in src
+        assert "cuda_context_bytes()" in src, "the baseline must come from the shared measure"
+        assert "mem_get_info" in inspect.getsource(cuda_context_bytes)
+
+    def test_context_is_measured_once_not_per_probe(self) -> None:
+        """Per-probe baselines double-counted the model once the base was cached.
+
+        With a model already resident, (total - free) includes it and max_memory_reserved()
+        includes it too; summed, it is counted twice -- 41 GB reported on a 17 GB card.
+        """
+        import inspect
+
         from marlowe.heal import probe_training
 
         src = inspect.getsource(probe_training)
-        assert "mem_get_info" in src
-        assert "peak_vram_gb=peak_device_used" in src
+        assert "mem_get_info" not in src, (
+            "probe_training must not re-measure the baseline; a cached base model would be "
+            "counted twice"
+        )
+
+    def test_context_subtracts_what_torch_already_holds(self) -> None:
+        """So it stays correct even when first called after a model is resident."""
+        import inspect
+
+        from marlowe.heal import cuda_context_bytes
+
+        src = inspect.getsource(cuda_context_bytes)
+        assert "memory_reserved" in src
 
     def test_torch_accounting_is_recorded_but_not_decisive(self) -> None:
         from marlowe.heal import ProbeResult
