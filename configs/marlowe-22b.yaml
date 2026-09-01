@@ -24,6 +24,10 @@ expected_layers: 52
 score:
   mode: oneshot            # ~172 forward passes vs ~2200 for greedy-with-rescoring
   seq_len: 32768           # rule 3.2: short calibration nominates the layers you must not cut
+  # 4 is the compute budget, not a placeholder, and it is the term the run time scales on:
+  # (42 eligible candidates + 1 reference) x n_seqs = 172 forward passes = ~8 h. Raising it
+  # is linear -- 8 seqs is 16 h, and using all 34 sequences the corpus holds would be 68 h.
+  # 4 x n_positions = 2048 scored positions per candidate, which is the sample that matters.
   n_seqs: 4
   n_positions: 512
   position_start_frac: 0.25   # sample only the last three quarters

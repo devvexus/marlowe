@@ -186,3 +186,67 @@ class TestSegmentedBuild:
         merges.clear()
         im.build_imatrix_segmented(src, corpus, out, segments=3)
         assert merges == [], "a completed run must not redo finished segments"
+
+
+class TestSegmentCompletionIsExplicit:
+    """A segment counts as done only when it finished, not when its file first appears.
+
+    llama-imatrix writes its output every few chunks, so the destination exists long before
+    the pass ends. Treating existence as completion would let a crash-truncated segment be
+    skipped on rerun -- reintroducing, inside the recovery mechanism, the exact failure the
+    recovery mechanism exists to prevent.
+    """
+
+    def test_an_interrupted_segment_is_rebuilt(self, tmp_path, monkeypatch) -> None:
+        import marlowe.imatrix as im
+
+        src = tmp_path / "m.gguf"
+        src.write_bytes(b"M" * 4096)
+        corpus = tmp_path / "c.txt"
+        corpus.write_text("\n".join(f"line {i}" for i in range(400)) + "\n", encoding="utf-8")
+        out = tmp_path / "final.dat"
+
+        work = out.parent / f"{out.stem}.segments"
+        work.mkdir(parents=True, exist_ok=True)
+        # What a crash mid-segment leaves behind: the periodic output, never renamed.
+        (work / "seg00.building.gguf").write_bytes(b"truncated")
+
+        built: list[str] = []
+
+        def fake_build(src_gguf, part, out_p, *, merge_from=None, **kw):
+            built.append(out_p.name)
+            out_p.write_bytes(b"complete")
+            return out_p
+
+        monkeypatch.setattr(im, "build_imatrix", fake_build)
+        monkeypatch.setattr(im, "describe_imatrix", lambda p: {"imatrix.chunk_count": 50})
+        im.build_imatrix_segmented(src, corpus, out, segments=2)
+
+        assert "seg00.building.gguf" in built, "the interrupted segment must be rebuilt"
+        assert (work / "seg00.gguf").read_bytes() == b"complete"
+        assert not (work / "seg00.building.gguf").exists(), "the temp name is renamed away"
+
+    def test_a_finished_segment_is_not_rebuilt(self, tmp_path, monkeypatch) -> None:
+        import marlowe.imatrix as im
+
+        src = tmp_path / "m.gguf"
+        src.write_bytes(b"M" * 4096)
+        corpus = tmp_path / "c.txt"
+        corpus.write_text("\n".join(f"line {i}" for i in range(400)) + "\n", encoding="utf-8")
+        out = tmp_path / "final.dat"
+        work = out.parent / f"{out.stem}.segments"
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "seg00.gguf").write_bytes(b"already done")
+
+        built: list[str] = []
+
+        def fake_build(src_gguf, part, out_p, *, merge_from=None, **kw):
+            built.append(out_p.name)
+            out_p.write_bytes(b"complete")
+            return out_p
+
+        monkeypatch.setattr(im, "build_imatrix", fake_build)
+        monkeypatch.setattr(im, "describe_imatrix", lambda p: {"imatrix.chunk_count": 50})
+        im.build_imatrix_segmented(src, corpus, out, segments=2)
+
+        assert "seg00.building.gguf" not in built, "a completed segment must be reused"

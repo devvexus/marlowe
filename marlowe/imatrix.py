@@ -215,7 +215,13 @@ def build_imatrix_segmented(
 
     previous: Path | None = None
     for i, part in enumerate(parts):
+        # Two names on purpose. llama-imatrix writes its output every few chunks, so the
+        # destination file exists long before the segment is finished -- and a crash would
+        # leave a partial one that a rerun skips as if it were done. That is precisely the
+        # failure this whole function exists to prevent, so completion is signalled by the
+        # rename, which only happens after the process exits successfully.
         seg_out = work / f"seg{i:02d}.gguf"
+        building = work / f"seg{i:02d}.building.gguf"
         if seg_out.exists():
             info = describe_imatrix(seg_out)
             logutil.event(
@@ -225,10 +231,12 @@ def build_imatrix_segmented(
             previous = seg_out
             continue
         logutil.event(log, "imatrix segment", segment=i, of=len(parts), corpus=str(part))
+        building.unlink(missing_ok=True)  # never resume into a half-written segment
         build_imatrix(
-            src_gguf, part, seg_out, ctx=ctx, n_gpu_layers=n_gpu_layers,
+            src_gguf, part, building, ctx=ctx, n_gpu_layers=n_gpu_layers,
             timeout=timeout, merge_from=previous,
         )
+        building.replace(seg_out)
         previous = seg_out
 
     assert previous is not None
