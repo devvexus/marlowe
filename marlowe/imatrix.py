@@ -130,6 +130,40 @@ def build_imatrix(
     return out_path
 
 
+def describe_imatrix(path: str | Path) -> dict[str, Any]:
+    """Read an imatrix's own provenance: how many chunks it actually saw, and of what.
+
+    Derived from the file, not from a sidecar. llama-imatrix writes a complete, valid GGUF at
+    every periodic save, so an interrupted run leaves a usable matrix that is indistinguishable
+    from a finished one by size or structure -- only ``imatrix.chunk_count`` says how much of
+    the corpus it covers. A sidecar written after the fact cannot describe a run that never
+    reached its own last line: this project's first imatrix was interrupted by a kernel panic
+    at 120 of ~420 chunks and left no sidecar at all.
+    """
+    import sys as _sys
+
+    _sys.path.insert(0, ".tools/llama.cpp/gguf-py")
+    try:
+        from gguf import GGUFReader
+
+        r = GGUFReader(str(path))
+    except Exception as exc:  # noqa: BLE001 - unreadable provenance is a fact to record
+        # Say so rather than raise. Provenance we cannot read is not the same as provenance
+        # that is fine, and it is also not a reason to abort a quantisation -- but it must
+        # never be reported as a clean matrix.
+        return {"path": str(path), "unreadable": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    out: dict[str, Any] = {"path": str(path), "tensors": len(r.tensors)}
+    for f in r.fields.values():
+        if f.name.startswith("imatrix."):
+            v = f.contents()
+            out[f.name] = list(v) if hasattr(v, "__len__") and not isinstance(v, str) else v
+    chunks = out.get("imatrix.chunk_count")
+    size = out.get("imatrix.chunk_size")
+    if isinstance(chunks, int) and isinstance(size, int):
+        out["tokens_seen"] = chunks * size
+    return out
+
+
 def imatrix_for(
     src_gguf: str | Path,
     corpus_txt: str | Path,
@@ -146,19 +180,35 @@ def imatrix_for(
     out = cache_dir / f"imatrix-{fp}.dat"
     meta = cache_dir / f"imatrix-{fp}.json"
     if out.exists():
-        logutil.event(log, "imatrix cache hit", path=str(out), fingerprint=fp)
+        # Report what it actually covers, not merely that it exists. An interrupted run
+        # leaves a complete, valid, PARTIAL matrix, and nothing about the file's size or
+        # structure distinguishes it from a finished one.
+        info = describe_imatrix(out)
+        logutil.event(
+            log, "imatrix cache hit", path=str(out), fingerprint=fp,
+            chunks=info.get("imatrix.chunk_count"), tokens_seen=info.get("tokens_seen"),
+        )
+        _write_meta(meta, src_gguf, fp, corpus_txt, kw, info)
         return out
     build_imatrix(src_gguf, corpus_txt, out, **kw)
+    _write_meta(meta, src_gguf, fp, corpus_txt, kw, describe_imatrix(out))
+    return out
+
+
+def _write_meta(
+    meta: Path, src_gguf: str | Path, fp: str, corpus: str | Path,
+    kw: dict[str, Any], info: dict[str, Any],
+) -> None:
     meta.write_text(
         json.dumps(
             {
                 "source_gguf": str(src_gguf),
                 "fingerprint": fp,
-                "corpus": str(corpus_txt),
+                "corpus": str(corpus),
                 "ctx": kw.get("ctx", IMATRIX_CTX),
+                "measured": info,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    return out
