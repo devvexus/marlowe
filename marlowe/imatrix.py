@@ -72,13 +72,31 @@ def gguf_fingerprint(path: str | Path, *, chunk: int = 1 << 20) -> str:
     return h.hexdigest()[:16]
 
 
+def fitting_gpu_layers(src_gguf: str | Path, n_blocks: int, *, headroom_gb: float = 2.0) -> int:
+    """How many layers of ``src_gguf`` fit in free VRAM.
+
+    ``-ngl 999`` is the usual incantation and it is wrong here. The imatrix source is a Q8_0
+    of the 27B parent -- ~28.6 GB against 16 GB of VRAM -- so asking for every layer fails.
+    Offloading what fits and leaving the rest on CPU is the difference between a pass that
+    takes an hour and one that does not run.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0
+    free, _ = torch.cuda.mem_get_info(0)
+    budget = free / 1e9 - headroom_gb
+    per_layer = (Path(src_gguf).stat().st_size / 1e9) / max(n_blocks, 1)
+    return max(0, min(n_blocks, int(budget / per_layer)))
+
+
 def build_imatrix(
     src_gguf: str | Path,
     corpus_txt: str | Path,
     out_path: str | Path,
     *,
     ctx: int = IMATRIX_CTX,
-    n_gpu_layers: int = 999,
+    n_gpu_layers: int = 0,
     timeout: int = 6 * 3600,
 ) -> Path:
     """Run llama-imatrix over ``corpus_txt``. Returns the matrix path.

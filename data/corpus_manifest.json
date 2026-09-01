@@ -1,0 +1,35 @@
+{
+  "seed": 0,
+  "tokenizer": "runs/marlowe-22b/models/parent",
+  "licenses": {
+    "arxiv": "ODC-By",
+    "open-web-math": "ODC-By",
+    "algebraic-stack": "ODC-By (the-stack, permissive-licensed subset)",
+    "fineweb-edu": "ODC-By",
+    "pg19": "public domain (Project Gutenberg, pre-1919)"
+  },
+  "commercial_use": "proof-pile-2 and fineweb-edu are ODC-By; attribution travels with the shipped model. AlgebraicStack derives from the-stack -- keep the permissive-license filter on if extending with more code.",
+  "heal_corpus": {
+    "target_tokens": 35000000,
+    "tokens": 35008654,
+    "documents": 16138,
+    "requested_mix": {
+      "arxiv": 0.35,
+      "open-web-math": 0.15,
+      "algebraic-stack": 0.15,
+      "fineweb-edu": 0.35
+    },
+    "actual_mix": {
+      "arxiv": 0.35,
+      "open-web-math": 0.1501,
+      "algebraic-stack": 0.15,
+      "fineweb-edu": 0.3499
+    },
+    "composition": {
+      "arxiv": 12253600,
+      "open-web-math": 5254153,
+      "algebraic-stack": 5250467,
+      "fineweb-edu": 12250434
+    }
+  }
+}

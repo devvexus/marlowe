@@ -7,7 +7,9 @@ knowledge of the conversation that produced it.
 pruning plus distillation. **Marlowe-18B is the headline artifact**; Marlowe-22B is the
 ladder's intermediate rung, not a lesser goal. The thesis is that the open-weight landscape
 has a hole between Qwen3.5-9B (~22 AAII) and Qwen3.8-27B (~52), and an 18B that stays
-intelligent at Q4_K_M lands in a tier nobody occupies.
+intelligent at 4-bit lands in a tier nobody occupies. It ships at **IQ4_XS**; the 22B rung
+ships at **IQ3_M**. See "Deployment width is not gate width" in §2 — the ship gate measures
+three widths, only two of which anyone deploys.
 
 The deliverable is **a base that quantises well**, not a checkpoint that fits one card.
 
@@ -283,6 +285,25 @@ it is not obvious whether `n_layer()` there is 64 or 65. Guessing the recurrent 
 block is precisely how this codebase produces a model that loads, runs, and is wrong.
 
 `convert_to_gguf(..., no_mtp=False)` is preserved and tested for exactly this.
+
+### Deployment width is not gate width
+
+These are different questions and conflating them misreads the whole ship gate.
+
+| model | deployment target | measured size | why |
+|---|---|---|---|
+| Marlowe-22B | **IQ3_M** (~3.66 bpw) | ~10.2 GB projected | the rung that runs on a 16 GB card |
+| Marlowe-18B | **IQ4_XS** (~4.25 bpw) | ~9.6 GB projected | the headline: more bits at fewer layers |
+
+**Q4_K_M is a gate width, not a deployment target for the 22B.** Measured on the sizing-22B:
+Q4_K_M is **13.75 GB**, and llama.cpp needs roughly another 6 GB for KV cache, compute buffer
+and CUDA context, so the 22B at Q4_K_M does not fit a 16 GB card and was never meant to. It is
+in the gate because under-healed weights degrade *unevenly* across schemes, so a width nobody
+ships still tells you whether the healing generalised.
+
+That is also the quantified case for the 18B being the headline: at 41 layers the same recipe
+lands near 11 GB at Q4_K_M and ~9.6 GB at IQ4_XS, which is the first configuration in the
+ladder that is comfortable on the target card with real bits.
 
 ### Ship gate: three bit-widths, all required
 

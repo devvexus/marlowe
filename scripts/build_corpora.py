@@ -62,9 +62,12 @@ SOURCES: dict[str, dict[str, Any]] = {
         "note": "proof-pile-2 AlgebraicStack",
     },
     "fineweb-edu": {
-        "urls": [
-            f"{FWE}/data/CC-MAIN-2024-10/train-{i:05d}-of-00020.parquet" for i in range(4)
-        ],
+        # Resolved from the repo, not constructed. Shard naming is not uniform across
+        # crawls -- the oldest use `train-00000-of-00014.parquet` and newer ones
+        # `000_00000.parquet` -- so a guessed URL 404s, and _stream's per-shard skip turned
+        # that into a corpus silently missing its entire general-language third.
+        "repo": "HuggingFaceFW/fineweb-edu",
+        "prefix": "data/CC-MAIN-2025-18/",
         "license": "ODC-By",
         "note": "fineweb-edu (general capability)",
         "format": "parquet",
@@ -91,7 +94,23 @@ def _stream(spec: dict[str, Any]) -> Iterator[dict[str, Any]]:
         yield from load_dataset(spec["hf"], streaming=True, split="train")
         return
     builder = spec.get("format", "json")
-    for url in spec["urls"]:
+    urls = spec.get("urls")
+    if urls is None:
+        from huggingface_hub import HfApi
+
+        repo, prefix = spec["repo"], spec["prefix"]
+        names = [
+            s.rfilename
+            for s in HfApi().dataset_info(repo).siblings
+            if s.rfilename.startswith(prefix)
+        ]
+        if not names:
+            raise RuntimeError(
+                f"no files under {prefix!r} in {repo}. The shard layout changed; listing the "
+                f"repo is the fix, guessing the names is what broke."
+            )
+        urls = [f"https://huggingface.co/datasets/{repo}/resolve/main/{n}" for n in sorted(names)]
+    for url in urls:
         try:
             # The generic builder, pointed at the file: proof-pile-2 still ships a loading
             # script, and datasets 4.x refuses those outright.
@@ -131,6 +150,20 @@ def take_tokens(
                   f"({time.time() - t0:.0f}s)", flush=True)
     print(f"  {name}: {total / 1e6:.2f}M tokens in {len(out)} docs ({time.time() - t0:.0f}s)",
           flush=True)
+    # Fail loudly on a short source.
+    #
+    # _stream skips a shard it cannot open so one bad URL does not end a long build. That is
+    # right for one shard and wrong for all of them: the first run of this script produced a
+    # corpus with 0.00M of its 12.25M fineweb-edu tokens -- a third of the mix missing -- and
+    # reported success. A corpus quietly missing its general-language component would have
+    # trained a model that only ever saw equations, and nothing downstream would have said so.
+    if total < budget * 0.9:
+        raise RuntimeError(
+            f"{name} yielded {total / 1e6:.2f}M tokens against a {budget / 1e6:.2f}M budget. "
+            f"Shards were skipped or the source is exhausted -- check the 'shard failed' "
+            f"lines above. Refusing to write a corpus whose composition does not match its "
+            f"manifest."
+        )
     return out, total
 
 
@@ -262,6 +295,9 @@ def main() -> int:
                     help="cap per book; 0 means 2x --seq-len")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-dir", default="data")
+    ap.add_argument("--run-dir", default="runs/marlowe-22b",
+                    help="also write the manifest here, so each artifact carries "
+                         "its provenance rather than pointing at a shared file")
     args = ap.parse_args()
 
     tok = _tokenizer(args.model)
@@ -285,9 +321,18 @@ def main() -> int:
             out_dir / "heal_corpus.jsonl", tok,
             target_tokens=args.heal_tokens, seed=args.seed,
         )
+    payload = json.dumps(manifest, indent=2)
     mpath = out_dir / "corpus_manifest.json"
-    mpath.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    mpath.write_text(payload, encoding="utf-8")
     print(f"manifest: {mpath}", flush=True)
+    # A copy travels with the run. The corpus in data/ is mutable and shared; a model built
+    # six weeks from now must be able to say which corpus produced it without trusting that
+    # data/ still holds the same bytes.
+    if args.run_dir:
+        rpath = Path(args.run_dir) / "manifests" / "corpus_manifest.json"
+        rpath.parent.mkdir(parents=True, exist_ok=True)
+        rpath.write_text(payload, encoding="utf-8")
+        print(f"manifest: {rpath}", flush=True)
     return 0
 
 

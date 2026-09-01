@@ -286,7 +286,7 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
     # The parent's own importance matrix. Per-model, not per-project: this one describes the
     # unpruned 27B and is for this control curve only -- each healed child builds its own for
     # Stage 7, because pruning changes which weights carry activation.
-    from marlowe.imatrix import imatrix_for, recipe_needs_imatrix
+    from marlowe.imatrix import fitting_gpu_layers, imatrix_for, recipe_needs_imatrix
 
     imat = None
     if any(
@@ -295,8 +295,21 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
         for r in recipes
     ):
         corpus_txt = ctx.declare_input("calibration", Path(ctx.cfg.score.calib_path))
+        # Q8_0, not the bf16, for the same reason the KL reference is Q8_0: bf16 is 53.8 GB
+        # against 16 GB of VRAM and 32 GB of RAM, so llama.cpp would mmap and page from disk
+        # for the entire pass. Q8_0 is ~28.6 GB and near-lossless, and an importance matrix
+        # records activation *magnitudes* -- a near-lossless source moves them far less than
+        # the differences the matrix exists to capture. Stage 2 reuses this file.
+        imat_src = ctx.gguf_dir / "parent-q8_0.gguf"
+        if not imat_src.exists():
+            q.quantize(base, imat_src, QuantConfig(name="q8_0", base_type="q8_0"))
+        ngl = fitting_gpu_layers(imat_src, len(layout.layer_types) + 1)
+        logutil.event(log, "imatrix source", src=str(imat_src), n_gpu_layers=ngl)
         imat = imatrix_for(
-            base, _calib_as_text(corpus_txt, ctx.gguf_dir / "stage0"), ctx.gguf_dir / "imatrix"
+            imat_src,
+            _calib_as_text(corpus_txt, ctx.gguf_dir / "stage0"),
+            ctx.gguf_dir / "imatrix",
+            n_gpu_layers=ngl,
         )
         ctx.declare_output("parent_imatrix", imat)
 
