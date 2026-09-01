@@ -41,7 +41,10 @@ teacher:
   shard_tokens: 5000000
 
 heal:
-  tokens: 50000000         # ~3 days at ~200 tok/s
+  # Sized to make the 18B rung reachable, not to maximise 22B on its own. 22B ships, but it
+  # is the intermediate: a direct 27B -> 18B cut is outside the band where healing recovers,
+  # and this rung exists to keep each step near 19%.
+  tokens: 50000000
   seq_len: 2048            # what makes 3 days possible; verify at 128K before shipping
   lora_rank: 32
   lora_alpha: 64
@@ -72,5 +75,6 @@ ship:
   max_kl_vs_baseline: iq3_xxs   # must be strictly below the user's current build
   max_repetition_vs: bf16       # must be at or below bf16
 
-# Empty = use quantize.ship_recipes() (IQ3_M plus the gate/recurrent-protected mix).
+# Empty = quantize.ship_recipes(): every gated bit-width (Q4_K_M, IQ4_XS, IQ3_M) plus the
+# gate/recurrent-protected mix. The ship gate requires ALL THREE to pass.
 quants: []

@@ -19,7 +19,13 @@ from marlowe.eval import bench
 from marlowe.eval import kl as kleval
 from marlowe.eval import repetition as rep
 from marlowe.pipeline import MissingBaseline, StageContext, register
-from marlowe.report import CheckpointRecord, bpw_curve, collect, ship_gate, write_report
+from marlowe.report import (
+    CheckpointRecord,
+    bpw_curve,
+    collect,
+    ship_gate_multi,
+    write_report,
+)
 
 log = logutil.get("stages")
 
@@ -70,6 +76,7 @@ def _measure_pair(
 
     cfgr = ctx.cfg.repetition
     prompts = rep.load_prompts(cfgr.prompts_path)
+    pset = rep.fingerprint_prompts(cfgr.prompts_path, prompts)
     proc = rep.spawn_llama_server(gguf, ctx=8192, parallel=cfgr.parallel)
     try:
         report = rep.run_repetition(
@@ -84,6 +91,7 @@ def _measure_pair(
             tokenizer_path=tokenizer_path,
             save_completions=ctx.metrics_dir / f"completions-{label}.jsonl",
             parallel=cfgr.parallel,
+            prompt_set=pset,
         )
         out["repetition"] = report.as_dict()
     finally:
@@ -203,21 +211,24 @@ def stage1_smoke(ctx: StageContext) -> dict[str, Any]:
 
 @register(
     "stage0-bitwidth",
-    "Where does circling stop? bpw-vs-repetition on the UNPRUNED 27B.",
+    "CONTROL CURVE: bpw-vs-repetition on the UNPRUNED 27B. Not a go/no-go.",
     requires=("stage1-smoke",),
     config_sections=("repetition", "quants"),
     estimated_hours=4.0,
 )
 def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
-    """Decision-critical, and it gates the pruning targets.
+    """A control curve. NOT a go/no-go gate.
 
-    Circling occurs at 2.97 bpw and not at bf16. Nobody knows where in between it stops, and
-    that threshold decides whether 22B at IQ3_M (3.66 bpw) is sufficient or whether only 18B
-    at IQ4_XS (4.25 bpw) solves the actual problem.
+    The question this originally posed -- "is there a ~10 GB quant of the 27B that fixes
+    circling?" -- has already been answered no, outside this pipeline. That is *why* the
+    pruning is happening, and no result here changes that decision.
 
-    If a ~10 GB custom mix of the *unpruned* 27B already eliminates circling, that is the
-    headline result and it is reported plainly: the user's problem would be solved without
-    pruning, and this project becomes a speed and headroom play rather than a rescue.
+    What it is for now: the parent's own bpw-vs-repetition curve, so that when the healed 22B
+    and 18B are quantised down, repetition caused by **quantisation** can be told apart from
+    repetition caused by **insufficient healing**. Without the parent curve those two are
+    confounded and a bad number at IQ3_M is uninterpretable.
+
+    Read the output as a baseline to subtract, not as a verdict.
     """
     from marlowe import quantize as q
 
@@ -294,26 +305,30 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
     clean = [r for r in results if r["repetition"]["loop_rate"] <= 0.01]
     threshold = min((r["bpw"] for r in clean), default=None)
     ctx.note(
-        f"circling threshold: {threshold} bpw"
+        f"parent control curve: repetition falls to baseline at {threshold} bpw"
         if threshold
-        else "no tested build eliminated circling; the threshold is above every recipe tried"
+        else "parent control curve: no tested bit-width reached baseline repetition"
     )
-    if threshold is not None and threshold <= 3.66:
-        ctx.note("IQ3_M (3.66 bpw) is at or above the threshold, so Marlowe-22B is viable.")
-    elif threshold is not None:
+    ctx.note(
+        "This is the PARENT's quantisation response, to be subtracted when reading the "
+        "healed models' numbers. It is not a go/no-go on pruning."
+    )
+    pset = results[0]["repetition"].get("prompt_set", {}) if results else {}
+    if not pset.get("validated_triggers", False):
         ctx.note(
-            f"threshold {threshold} bpw is above IQ3_M. Documented fallback: skip 22B and go "
-            f"direct to 18B at IQ4_XS (4.25 bpw)."
-        )
-    custom_clean = [r for r in clean if r["tensor_types"]]
-    if custom_clean:
-        ctx.note(
-            f"A ~10 GB custom mix of the UNPRUNED 27B ({custom_clean[0]['recipe']}) eliminates "
-            f"circling. The user's actual problem is solved without pruning; the compression "
-            f"project is now a speed and headroom play, not a rescue."
+            "SYNTHETIC PROMPT SET (sha " + str(pset.get("sha256")) + ", "
+            + str(pset.get("n_known_triggers", 0)) + " validated triggers): this curve is a "
+            "RELATIVE bpw-vs-repetition measurement, not a workload-representative one. "
+            "trigger_subset is empty by construction. Do not read absolute rates as "
+            "predicting behaviour on real work."
         )
 
-    return {"checkpoints": results, "threshold_bpw": threshold}
+    return {
+        "checkpoints": results,
+        "threshold_bpw": threshold,
+        "role": "control-curve",
+        "prompt_set": pset,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -602,17 +617,48 @@ def stage4_surgery(ctx: StageContext) -> dict[str, Any]:
     estimated_hours=6.0,
 )
 def stage5_teacher(ctx: StageContext) -> dict[str, Any]:
+    from marlowe.heal import MEMORY_PLAN_FILE, save_memory_plan, search_memory_plan
     from marlowe.teacher import build_cache, estimate_size
 
     src = ctx.declare_input("parent", _parent_dir(ctx))
     ctx.declare_input("corpus", ctx.cfg.teacher.corpus_path, deep=True)
     out = ctx.declare_output("cache", ctx.run_dir / "teacher-cache")
 
-    need = estimate_size(ctx.cfg.teacher.tokens, ctx.cfg.teacher.top_k)
+    # The memory plan is decided HERE, not in Stage 6, because it can select a shorter
+    # sequence length and the cache is built at a fixed length whose distributions are
+    # position-aligned. Deciding it later would mean discovering after six hours of caching
+    # that the cache cannot be used.
+    student = ctx.models_dir / f"{ctx.cfg.name}-unhealed"
+    plan_path = ctx.declare_output("memory_plan", ctx.metrics_dir / MEMORY_PLAN_FILE)
+    search = search_memory_plan(
+        str(student), ctx.cfg.heal, max_gpu_gb=ctx.extra.get("max_gpu_gb")
+    )
+    for line in search.render(ctx.cfg.heal.tokens).splitlines():
+        ctx.note(line)
+    if search.config is None:
+        raise preflight.ResourceError(
+            "no Stage 6 memory configuration fit with margin, so the teacher cache would be "
+            "built at a sequence length training cannot use. Lower heal.lora_rank or "
+            "heal.loss_chunk and re-run."
+        )
+    save_memory_plan(plan_path, search)
+
+    teacher_cfg = ctx.cfg.teacher
+    if teacher_cfg.seq_len != search.config.seq_len:
+        import copy
+
+        ctx.note(
+            f"memory plan selected seq_len {search.config.seq_len}; building the teacher "
+            f"cache at that length instead of {teacher_cfg.seq_len} so Stage 6 can consume it"
+        )
+        teacher_cfg = copy.deepcopy(teacher_cfg)
+        teacher_cfg.seq_len = search.config.seq_len
+
+    need = estimate_size(teacher_cfg.tokens, teacher_cfg.top_k)
     ctx.note(f"teacher cache will be about {need / 1e9:.1f} GB on disk")
 
     idx = build_cache(
-        str(src), out, ctx.cfg.teacher, max_gpu_gb=ctx.extra.get("max_gpu_gb"), resume=True
+        str(src), out, teacher_cfg, max_gpu_gb=ctx.extra.get("max_gpu_gb"), resume=True
     )
     masses = [float(s["mean_captured_mass"]) for s in idx.shards]
     mean_mass = sum(masses) / max(len(masses), 1)
@@ -626,6 +672,8 @@ def stage5_teacher(ctx: StageContext) -> dict[str, Any]:
         "tokens": idx.n_tokens,
         "shards": len(idx.shards),
         "top_k": idx.top_k,
+        "seq_len": teacher_cfg.seq_len,
+        "memory_plan": search.chosen.name if search.chosen else None,
         "mean_captured_mass": round(mean_mass, 4),
     }
 
@@ -643,7 +691,13 @@ def stage5_teacher(ctx: StageContext) -> dict[str, Any]:
     estimated_hours=72.0,
 )
 def stage6_heal(ctx: StageContext) -> dict[str, Any]:
-    from marlowe.heal import run_healing, search_memory_plan
+    from marlowe.heal import (
+        MEMORY_PLAN_FILE,
+        load_memory_plan,
+        probe_training,
+        run_healing,
+        search_memory_plan,
+    )
 
     student = ctx.declare_input("unhealed", ctx.models_dir / f"{ctx.cfg.name}-unhealed")
     cache = ctx.declare_input("cache", ctx.run_dir / "teacher-cache")
@@ -653,17 +707,31 @@ def stage6_heal(ctx: StageContext) -> dict[str, Any]:
     # savings; this stack is plain peft + bitsandbytes, so the number has to be established
     # rather than inherited. Two minutes of real steps answers both "does it fit" and
     # "how long".
-    search = search_memory_plan(
-        str(student), ctx.cfg.heal, max_gpu_gb=ctx.extra.get("max_gpu_gb")
-    )
-    for line in search.render(ctx.cfg.heal.tokens).splitlines():
-        ctx.note(line)
-    if search.config is None or search.probe is None:
-        raise preflight.ResourceError(
-            "no memory configuration fit with margin at seq_len "
-            f"{ctx.cfg.heal.seq_len}. Lower heal.seq_len, heal.lora_rank, or heal.loss_chunk."
+    # Stage 5 already decided this, because the cache length depends on it. Reuse rather
+    # than re-deciding: a different answer here would invalidate the cache.
+    loaded = load_memory_plan(ctx.metrics_dir / MEMORY_PLAN_FILE, ctx.cfg.heal)
+    if loaded is not None:
+        heal_cfg, payload = loaded
+        ctx.note(f"using the Stage 5 memory plan: {payload['candidate']} -- {payload['rationale']}")
+        ctx.note(f"  measured then: {payload.get('measured')}")
+        probe = probe_training(
+            str(student), heal_cfg, n_steps=6, max_gpu_gb=ctx.extra.get("max_gpu_gb")
         )
-    heal_cfg, probe = search.config, search.probe
+        plan_name = payload["candidate"]
+    else:
+        search = search_memory_plan(
+            str(student), ctx.cfg.heal, max_gpu_gb=ctx.extra.get("max_gpu_gb")
+        )
+        for line in search.render(ctx.cfg.heal.tokens).splitlines():
+            ctx.note(line)
+        if search.config is None or search.probe is None:
+            raise preflight.ResourceError(
+                "no memory configuration fit with margin at seq_len "
+                f"{ctx.cfg.heal.seq_len}. Lower heal.seq_len, heal.lora_rank, or "
+                f"heal.loss_chunk."
+            )
+        heal_cfg, probe = search.config, search.probe
+        plan_name = search.chosen.name if search.chosen else None
     scored: list[dict[str, Any]] = []
 
     def on_checkpoint(path: Path, state: Any) -> dict[str, Any]:
@@ -693,7 +761,8 @@ def stage6_heal(ctx: StageContext) -> dict[str, Any]:
         resume=True,
     )
     return {
-        "memory_plan": search.chosen.name if search.chosen else None,
+        "memory_plan": plan_name,
+        "seq_len": heal_cfg.seq_len,
         "lm_head_precision": probe.lm_head_precision,
         "probe": {
             "tok_s": round(probe.tok_s, 1),
@@ -849,31 +918,39 @@ def stage7_ship(ctx: StageContext) -> dict[str, Any]:
     ctx.note(f"winner on measured KL/repetition: {winner['label']} ({winner['recipe']})")
 
     baselines = {r.label: r for r in collect(ctx.run_dir)}
-    cand_rec = CheckpointRecord(
-        label=winner["label"],
-        quant=winner["recipe"],
-        params_b=round(n_params / 1e9, 4),
-        layers=layout.n_layers,
-        size_gb=winner["size_gb"],
-        bpw=winner["bpw"],
-        kl_mean=(winner.get("kl") or {}).get("kl_mean"),
-        top1_agreement=(winner.get("kl") or {}).get("top1_agreement"),
-        rep8=winner["repetition"]["repetition"].get("rep8"),
-        rep32=winner["repetition"]["repetition"].get("rep32"),
-        cap_hit_rate=winner["repetition"]["cap_hit_rate"],
-        loop_rate=winner["repetition"]["loop_rate"],
-        needle_128k=winner.get("needle", {}).get("recall"),
-        tok_s=winner.get("throughput", {}).get("tg_tok_s"),
-    )
-    gate = ship_gate(
-        cand_rec,
+    by_width = {
+        r["recipe"]: CheckpointRecord(
+            label=r["label"],
+            quant=r["recipe"],
+            params_b=round(n_params / 1e9, 4),
+            layers=layout.n_layers,
+            size_gb=r["size_gb"],
+            bpw=r["bpw"],
+            kl_mean=(r.get("kl") or {}).get("kl_mean"),
+            top1_agreement=(r.get("kl") or {}).get("top1_agreement"),
+            rep8=r["repetition"]["repetition"].get("rep8"),
+            rep32=r["repetition"]["repetition"].get("rep32"),
+            cap_hit_rate=r["repetition"]["cap_hit_rate"],
+            loop_rate=r["repetition"]["loop_rate"],
+            needle_128k=r.get("needle", {}).get("recall"),
+            tok_s=r.get("throughput", {}).get("tg_tok_s"),
+        )
+        for r in candidates
+    }
+    gate = ship_gate_multi(
+        by_width,
+        required_widths=q.SHIP_BIT_WIDTHS,
         iq3_xxs_baseline=baselines.get("27b-iq3_xxs-baseline", CheckpointRecord("iq3_xxs")),
         bf16_baseline=baselines.get("27b-bf16-hosted", CheckpointRecord("bf16")),
     )
-    for line in gate.reasons:
+    for line in gate.render().splitlines():
         ctx.note(line)
 
     if gate.passed:
+        ctx.note(
+            f"gate passed at all of {list(q.SHIP_BIT_WIDTHS)} -- the base survives "
+            f"quantisation downward, which is the actual deliverable"
+        )
         modelfile = ctx.declare_output("modelfile", ctx.run_dir / f"Modelfile.{ctx.cfg.name}")
         q.write_modelfile(
             ctx.gguf_dir / ctx.cfg.name / f"{winner['recipe']}.gguf", modelfile, name=ctx.cfg.name
@@ -881,7 +958,7 @@ def stage7_ship(ctx: StageContext) -> dict[str, Any]:
     else:
         ctx.note("Ship gate failed. Not writing a Modelfile.")
 
-    records = [*collect(ctx.run_dir), cand_rec]
+    records = [*collect(ctx.run_dir), *by_width.values()]
     write_report(ctx.run_dir, records, gate=gate, title=f"Marlowe: {ctx.cfg.name}")
 
     return {

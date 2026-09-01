@@ -523,20 +523,34 @@ def stage0_recipes(target_gb: float = 10.2) -> list[QuantConfig]:
     ]
 
 
-def ship_recipes(target_gb: float = 10.2) -> list[QuantConfig]:
-    """Stage 7 candidates: the nominal type plus the best custom mix from Stage 0.
+#: The bit-widths the ship gate is evaluated at, coarsest last.
+#:
+#: The deliverable is a base that *quantises well*, not a checkpoint that happens to fit one
+#: card. Under-healed weights carry larger activation outliers and quantise worse, so a model
+#: can pass a gate at bf16 or at one convenient bit-width and fall apart at another. Holding
+#: at a single width is not evidence of a stable base; holding across the range is.
+SHIP_BIT_WIDTHS: tuple[str, ...] = ("q4_K_M", "iq4_xs", "iq3_m")
 
-    Which one ships is decided empirically on measured KL and repetition, not by bpw.
+
+def ship_recipes(target_gb: float = 10.2) -> list[QuantConfig]:
+    """Stage 7 candidates: every gated bit-width, plus the custom mix from Stage 0.
+
+    Which one is *recommended* is decided empirically on measured KL and repetition. Whether
+    any of them ships is decided by the gate, which requires all of :data:`SHIP_BIT_WIDTHS`
+    to pass -- see :func:`marlowe.report.ship_gate_multi`.
     """
-    return [
-        QuantConfig(name="iq3_m", base_type="iq3_m", target_gb=target_gb),
+    recipes = [
+        QuantConfig(name=w, base_type=w, target_gb=target_gb) for w in SHIP_BIT_WIDTHS
+    ]
+    recipes.append(
         QuantConfig(
             name="mix_gate_q5",
             base_type="iq3_xxs",
             tensor_types={"q_proj": "q5_K", "linear_attn.*": "q5_K", "ffn_.*": "iq3_xxs"},
             target_gb=target_gb,
-        ),
-    ]
+        )
+    )
+    return recipes
 
 
 def iter_recipe_outputs(out_dir: str | Path, recipes: list[QuantConfig]) -> Iterator[

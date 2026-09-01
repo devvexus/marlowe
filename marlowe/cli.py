@@ -314,6 +314,57 @@ def _write_heal_overrides(config_path: str, search: Any) -> None:
         yaml.safe_dump(raw, f, sort_keys=False)
 
 
+def cmd_repetition(args: argparse.Namespace) -> int:
+    """Run the repetition harness against one GGUF, without re-running its stage.
+
+    Exists so a better prompt set can be applied to already-built quants. Stage 0's eight
+    quantisations are hours of work; re-scoring them against new triggers is minutes, and
+    should not require redoing the sweep.
+    """
+    import json as _json
+
+    from marlowe.config import RepetitionConfig, load_run_config
+    from marlowe.eval import repetition as rep
+
+    cfgr = load_run_config(args.config).repetition if args.config else RepetitionConfig()
+    if args.prompts:
+        cfgr.prompts_path = args.prompts
+    if args.n:
+        cfgr.n_completions = args.n
+
+    prompts = rep.load_prompts(cfgr.prompts_path)
+    pset = rep.fingerprint_prompts(cfgr.prompts_path, prompts)
+    print(f"prompt set: {pset.sha256}  {pset.n_prompts} prompts, "
+          f"{pset.n_known_triggers} validated triggers")
+
+    proc = rep.spawn_llama_server(args.gguf, ctx=8192, parallel=cfgr.parallel)
+    try:
+        report = rep.run_repetition(
+            rep.LlamaServerBackend(),
+            prompts,
+            label=args.label or Path(args.gguf).stem,
+            n_completions=cfgr.n_completions,
+            max_tokens=cfgr.max_tokens,
+            ngram_sizes=cfgr.ngram_sizes,
+            sampling_preset=cfgr.preset,
+            seed=cfgr.seed,
+            tokenizer_path=args.tokenizer,
+            prompt_set=pset,
+        )
+    finally:
+        proc.terminate()
+
+    print(report.headline())
+    if report.caveat:
+        print("\n" + report.caveat)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        with Path(args.out).open("w", encoding="utf-8") as f:
+            _json.dump(report.as_dict(), f, indent=2)
+        print(f"wrote {args.out}")
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     from marlowe.report import collect, render_table, write_report
 
@@ -426,6 +477,16 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--write-config", dest="write_config", action="store_true",
                     help="persist the selected trade-offs back into --config")
     fc.set_defaults(fn=cmd_fitcheck)
+
+    rr = sub.add_parser("repetition", help="run the repetition harness on one GGUF")
+    rr.add_argument("--gguf", required=True)
+    rr.add_argument("--label")
+    rr.add_argument("--config", help="run config, for repetition.* settings")
+    rr.add_argument("--prompts", help="override repetition.prompts_path")
+    rr.add_argument("--tokenizer", help="model dir, for model-token n-grams")
+    rr.add_argument("-n", type=int, help="override n_completions")
+    rr.add_argument("--out", help="write the full report JSON here")
+    rr.set_defaults(fn=cmd_repetition)
 
     rp = sub.add_parser("report", help="unified metrics table")
     rp.add_argument("--run-dir", required=True)

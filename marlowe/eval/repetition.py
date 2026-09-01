@@ -302,6 +302,47 @@ class Prompt:
     tags: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PromptSet:
+    """A prompt file plus its identity.
+
+    Stage 0's curve and Stage 7's gate are only comparable if they were measured on the same
+    prompts, and "the same file path" is not the same claim as "the same contents". The hash
+    travels in every report so a changed set shows up as a mismatch rather than as a
+    surprising number.
+    """
+
+    path: str
+    sha256: str
+    n_prompts: int
+    n_known_triggers: int
+
+    @property
+    def validated(self) -> bool:
+        """False when no prompt is a confirmed circling trigger.
+
+        A set with no validated triggers still measures a real relative curve across
+        bit-widths. It does not measure workload-representative absolute rates, and reports
+        say so rather than leaving a later reader to assume otherwise.
+        """
+        return self.n_known_triggers > 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "validated_triggers": self.validated}
+
+
+def fingerprint_prompts(path: str | Path, prompts: Sequence[Prompt]) -> PromptSet:
+    import hashlib
+
+    raw = Path(path).read_bytes()
+    return PromptSet(
+        path=str(path),
+        sha256=hashlib.sha256(raw).hexdigest()[:16],
+        n_prompts=len(prompts),
+        n_known_triggers=sum(1 for p in prompts if p.known_trigger),
+    )
+
+
 def load_prompts(path: str | Path) -> list[Prompt]:
     rows: list[Prompt] = []
     with Path(path).open(encoding="utf-8") as f:
@@ -372,6 +413,10 @@ class RepetitionReport:
     by_prompt: list[dict[str, Any]] = field(default_factory=list)
     trigger_subset: dict[str, float] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
+    #: Identity of the prompt file, so two reports can be compared honestly.
+    prompt_set: dict[str, Any] = field(default_factory=dict)
+    #: Set when the prompt set contains no confirmed circling triggers.
+    caveat: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -379,10 +424,16 @@ class RepetitionReport:
     def headline(self) -> str:
         r8 = self.repetition.get("rep8", float("nan"))
         r32 = self.repetition.get("rep32", float("nan"))
+        tail = "  [synthetic prompts]" if self.caveat else ""
         return (
             f"rep8={r8:.4f} rep32={r32:.4f} cap_hit={self.cap_hit_rate:.3f} "
-            f"loop={self.loop_rate:.3f}"
+            f"loop={self.loop_rate:.3f}{tail}"
         )
+
+    def comparable_with(self, other: RepetitionReport) -> bool:
+        """Were both measured on the same prompt file contents?"""
+        a, b = self.prompt_set.get("sha256"), other.prompt_set.get("sha256")
+        return bool(a) and a == b
 
 
 def run_repetition(
@@ -398,6 +449,7 @@ def run_repetition(
     tokenizer_path: str | None = None,
     save_completions: str | Path | None = None,
     parallel: int = 1,
+    prompt_set: PromptSet | None = None,
 ) -> RepetitionReport:
     """Run the harness. Refuses any preset but thinking.
 
@@ -501,7 +553,15 @@ def run_repetition(
         mean_tokens=agg("n_tokens", statistics.fmean),
         errors=errors,
         extra_body=dict(getattr(backend, "extra_body", {})),
+        prompt_set=prompt_set.as_dict() if prompt_set else {},
     )
+    if prompt_set is not None and not prompt_set.validated:
+        report.caveat = (
+            "SYNTHETIC PROMPT SET: none of these prompts is a confirmed circling trigger. "
+            "The relative curve across bit-widths is real; the absolute rates are not "
+            "workload-representative, and trigger_subset is empty by construction."
+        )
+        log.warning("%s", report.caveat)
     report.by_prompt = [
         {
             "prompt_id": pid,

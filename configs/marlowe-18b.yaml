@@ -1,3 +1,10 @@
+# Marlowe-18B -- THE HEADLINE ARTEFACT.
+#
+# The thesis: the open-weight landscape has a hole between Qwen3.5-9B (~22 AAII) and
+# Qwen3.8-27B (~52). An 18B that stays intelligent at Q4_K_M lands in a tier nobody
+# occupies. Marlowe-22B is the intermediate rung that makes this reachable via the ladder,
+# not a lesser version of the goal -- the token budget below is sized for 18B first.
+#
 # Marlowe-18B: 11 further cuts from the HEALED Marlowe-22B.
 #
 #   22.2968 B - 11 x 383.279 M = 18.0807 B, 41 layers (25 linear + 16 attention)
@@ -50,6 +57,10 @@ teacher:
   shard_tokens: 5000000
 
 heal:
+  # Sized for the headline artefact, not as leftover capacity. 18B has lost 36% of the
+  # parent's depth in total and must hold up at Q4_K_M, IQ4_XS *and* IQ3_M -- under-healed
+  # weights carry larger activation outliers and quantise worse, so healing tokens buy
+  # quantisation robustness, not just KL.
   tokens: 100000000
   seq_len: 2048
   lora_rank: 32
@@ -81,15 +92,7 @@ ship:
   max_kl_vs_baseline: iq3_xxs
   max_repetition_vs: bf16
 
-# 18B ships at IQ4_XS (~4.25 bpw, ~10.2 GB) -- the extra headroom is the point of this rung.
-quants:
-  - name: iq4_xs
-    base_type: iq4_xs
-    target_gb: 10.2
-  - name: mix_gate_q6
-    base_type: iq3_s
-    target_gb: 10.2
-    tensor_types:
-      q_proj: q6_K
-      "linear_attn.*": q6_K
-      "ffn_.*": iq3_xxs
+# Empty = quantize.ship_recipes(): every gated bit-width (Q4_K_M, IQ4_XS, IQ3_M) plus the
+# gate/recurrent-protected mix. The ship gate requires ALL THREE to pass -- holding at one
+# width is not evidence of a base that quantises well.
+quants: []

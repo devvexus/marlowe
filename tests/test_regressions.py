@@ -808,7 +808,23 @@ class TestMemoryPlanSearch:
         for cand in MEMORY_CANDIDATES:
             cfg = cand.apply(base)
             assert cfg.loss_chunk == base.loss_chunk
-            assert cfg.seq_len == base.seq_len
+
+    def test_only_the_designated_candidate_shortens_the_sequence(self) -> None:
+        """Sequence length is a real cost, so exactly one candidate spends it."""
+        from marlowe.config import HealConfig
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        base = HealConfig()
+        shortened = [c for c in MEMORY_CANDIDATES if c.apply(base).seq_len != base.seq_len]
+        assert [c.name for c in shortened] == ["fp16-head-1024"]
+        assert shortened[0].apply(base).seq_len == 1024
+
+    def test_shortening_the_sequence_is_preferred_over_quantising_the_head(self) -> None:
+        """Halving context is a real cost; corrupting the loss target is a worse one."""
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        names = [c.name for c in MEMORY_CANDIDATES]
+        assert names.index("fp16-head-1024") < names.index("nf4-head-adamw32")
 
     def test_apply_does_not_mutate_the_original(self) -> None:
         from marlowe.config import HealConfig
@@ -838,7 +854,8 @@ class TestMemoryPlanSearch:
 
         assert res.chosen is not None
         assert res.chosen.name == "nf4-head-adamw32"
-        assert calls == [False, True], "must not probe further once one fits"
+        # both fp16 candidates tried and rejected, then the first NF4 one fits
+        assert calls == [False, False, True], "must not probe further once one fits"
 
     def test_search_prefers_fp16_head_when_it_fits(self, monkeypatch) -> None:
         from marlowe import heal
@@ -853,7 +870,7 @@ class TestMemoryPlanSearch:
         )
         monkeypatch.setattr(heal, "_free_cuda", lambda: None)
         res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
-        assert res.chosen is not None and res.chosen.name == "fp16-head"
+        assert res.chosen is not None and res.chosen.name == "fp16-head-2048"
         assert res.config is not None and res.config.quantize_lm_head is False
 
     def test_oom_is_treated_as_does_not_fit(self, monkeypatch) -> None:
@@ -953,3 +970,190 @@ class TestLmHeadMitigation:
         from marlowe.config import HealConfig
 
         assert HealConfig().quantize_lm_head is False
+
+
+class TestMultiWidthShipGate:
+    """The deliverable is a base that quantises well, not one that fits a card.
+
+    Under-healed weights carry larger activation outliers and degrade unevenly across
+    quantisation schemes, so passing at one bit-width proves nothing about the others. The
+    gate requires every width in SHIP_BIT_WIDTHS.
+    """
+
+    def _baselines(self):
+        from marlowe.report import CheckpointRecord
+
+        return (
+            CheckpointRecord("iq3_xxs", kl_mean=0.080, rep32=0.30),
+            CheckpointRecord("bf16", kl_mean=0.0, rep32=0.05),
+        )
+
+    def _good(self, name):
+        from marlowe.report import CheckpointRecord
+
+        return CheckpointRecord(name, quant=name, kl_mean=0.05, rep32=0.04)
+
+    def test_all_three_widths_are_required(self) -> None:
+        from marlowe.quantize import SHIP_BIT_WIDTHS
+
+        assert set(SHIP_BIT_WIDTHS) == {"q4_K_M", "iq4_xs", "iq3_m"}
+
+    def test_passes_when_every_width_passes(self) -> None:
+        from marlowe.quantize import SHIP_BIT_WIDTHS
+        from marlowe.report import ship_gate_multi
+
+        iq3, bf16 = self._baselines()
+        cands = {w: self._good(w) for w in SHIP_BIT_WIDTHS}
+        res = ship_gate_multi(
+            cands, required_widths=SHIP_BIT_WIDTHS,
+            iq3_xxs_baseline=iq3, bf16_baseline=bf16,
+        )
+        assert res.passed
+
+    def test_one_failing_width_fails_the_whole_gate(self) -> None:
+        """The specific thing this catches: fine at Q4, falls apart at IQ3."""
+        from marlowe.quantize import SHIP_BIT_WIDTHS
+        from marlowe.report import CheckpointRecord, ship_gate_multi
+
+        iq3, bf16 = self._baselines()
+        cands = {w: self._good(w) for w in SHIP_BIT_WIDTHS}
+        cands["iq3_m"] = CheckpointRecord("iq3_m", quant="iq3_m", kl_mean=0.05, rep32=0.40)
+        res = ship_gate_multi(
+            cands, required_widths=SHIP_BIT_WIDTHS,
+            iq3_xxs_baseline=iq3, bf16_baseline=bf16,
+        )
+        assert not res.passed
+        assert res.per_width["q4_K_M"].passed
+        assert not res.per_width["iq3_m"].passed
+        assert "DO NOT SHIP" in res.render()
+
+    def test_a_width_that_was_never_built_is_a_failure(self) -> None:
+        """Absence is not a pass. A missing width means an unproven claim."""
+        from marlowe.quantize import SHIP_BIT_WIDTHS
+        from marlowe.report import ship_gate_multi
+
+        iq3, bf16 = self._baselines()
+        cands = {w: self._good(w) for w in SHIP_BIT_WIDTHS if w != "q4_K_M"}
+        res = ship_gate_multi(
+            cands, required_widths=SHIP_BIT_WIDTHS,
+            iq3_xxs_baseline=iq3, bf16_baseline=bf16,
+        )
+        assert not res.passed
+        assert "q4_K_M" in res.missing
+        assert "never built" in res.render()
+
+    def test_ship_recipes_cover_every_gated_width(self) -> None:
+        from marlowe.quantize import SHIP_BIT_WIDTHS, ship_recipes
+
+        names = {r.name for r in ship_recipes()}
+        assert set(SHIP_BIT_WIDTHS) <= names, (
+            "the gate requires widths the recipes do not build; Stage 7 would fail on "
+            "missing measurements rather than on quality"
+        )
+
+    def test_configs_do_not_pin_a_narrower_quant_list(self) -> None:
+        """An explicit quants list would override ship_recipes and starve the gate."""
+        from marlowe.config import load_run_config
+        from marlowe.quantize import SHIP_BIT_WIDTHS, ship_recipes
+
+        for name in ("marlowe-22b", "marlowe-18b"):
+            cfg = load_run_config(f"configs/{name}.yaml")
+            built = {r.name for r in (cfg.quants or ship_recipes())}
+            missing = set(SHIP_BIT_WIDTHS) - built
+            assert not missing, f"{name} would never build {sorted(missing)}"
+
+
+class TestPromptSetProvenance:
+    """Stage 0's curve and Stage 7's gate are comparable only on identical prompts."""
+
+    def test_fingerprint_records_identity_and_trigger_count(self) -> None:
+        from marlowe.eval.repetition import fingerprint_prompts, load_prompts
+
+        prompts = load_prompts("data/circling_prompts.jsonl")
+        ps = fingerprint_prompts("data/circling_prompts.jsonl", prompts)
+        assert len(ps.sha256) == 16
+        assert ps.n_prompts == len(prompts)
+        assert ps.n_known_triggers == sum(1 for p in prompts if p.known_trigger)
+
+    def test_synthetic_set_is_flagged_as_unvalidated(self) -> None:
+        from marlowe.eval.repetition import PromptSet
+
+        assert not PromptSet("p", "abc", 9, 0).validated
+        assert PromptSet("p", "abc", 9, 3).validated
+
+    def test_reports_carry_the_hash_and_a_caveat(self) -> None:
+        from marlowe.eval.repetition import (
+            Completion,
+            Prompt,
+            PromptSet,
+            run_repetition,
+        )
+
+        class Fake:
+            name = "fake"
+            extra_body: ClassVar[dict] = {}
+
+            def generate(self, prompt, max_tokens, sampling, seed):
+                return Completion("", " ".join(f"w{i}" for i in range(200)), 200, "stop")
+
+        ps = PromptSet("data/x.jsonl", "deadbeefdeadbeef", 2, 0)
+        report = run_repetition(
+            Fake(), [Prompt("a", "hi"), Prompt("b", "yo")],
+            label="t", n_completions=4, prompt_set=ps,
+        )
+        assert report.prompt_set["sha256"] == "deadbeefdeadbeef"
+        assert "SYNTHETIC PROMPT SET" in report.caveat
+        assert "[synthetic prompts]" in report.headline()
+
+    def test_validated_set_gets_no_caveat(self) -> None:
+        from marlowe.eval.repetition import (
+            Completion,
+            Prompt,
+            PromptSet,
+            run_repetition,
+        )
+
+        class Fake:
+            name = "fake"
+            extra_body: ClassVar[dict] = {}
+
+            def generate(self, prompt, max_tokens, sampling, seed):
+                return Completion("", " ".join(f"w{i}" for i in range(200)), 200, "stop")
+
+        ps = PromptSet("data/x.jsonl", "cafebabecafebabe", 2, 2)
+        report = run_repetition(
+            Fake(), [Prompt("a", "hi", known_trigger=True)],
+            label="t", n_completions=4, prompt_set=ps,
+        )
+        assert report.caveat == ""
+
+    def test_mismatched_prompt_sets_are_detectable(self) -> None:
+        from marlowe.eval.repetition import RepetitionReport
+
+        a = RepetitionReport("b", "a", 1, 1, "thinking", "tok", prompt_set={"sha256": "aaa"})
+        b = RepetitionReport("b", "b", 1, 1, "thinking", "tok", prompt_set={"sha256": "aaa"})
+        c = RepetitionReport("b", "c", 1, 1, "thinking", "tok", prompt_set={"sha256": "zzz"})
+        assert a.comparable_with(b)
+        assert not a.comparable_with(c)
+
+
+class TestStage0IsAControlCurve:
+    """Reframed: the go/no-go question was answered outside this pipeline."""
+
+    def test_description_does_not_read_as_a_gate(self) -> None:
+        import marlowe.stages  # noqa: F401
+        from marlowe.pipeline import REGISTRY
+
+        desc = REGISTRY["stage0-bitwidth"].description
+        assert "CONTROL CURVE" in desc
+        assert "go/no-go" in desc.lower()
+
+    def test_docstring_states_the_confound_it_resolves(self) -> None:
+        import inspect
+
+        import marlowe.stages  # noqa: F401
+        from marlowe.pipeline import REGISTRY
+
+        doc = inspect.getdoc(REGISTRY["stage0-bitwidth"].fn) or ""
+        assert "confounded" in doc
+        assert "NOT a go/no-go" in doc

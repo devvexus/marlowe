@@ -273,6 +273,60 @@ def ship_gate(
 # output
 # ---------------------------------------------------------------------------
 
+@dataclass
+class MultiGateResult:
+    """The ship gate across every required bit-width. All must pass."""
+
+    passed: bool
+    per_width: dict[str, GateResult] = field(default_factory=dict)
+    missing: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "missing": self.missing,
+            "per_width": {k: v.as_dict() for k, v in self.per_width.items()},
+        }
+
+    def render(self) -> str:
+        head = "SHIP" if self.passed else "DO NOT SHIP"
+        lines = [f"{head} -- gate requires every bit-width below to pass", ""]
+        for width, res in self.per_width.items():
+            lines.append(f"  [{'PASS' if res.passed else 'FAIL'}] {width}")
+            lines.extend(f"    {r}" for r in res.reasons)
+        for width in self.missing:
+            lines.append(f"  [FAIL] {width}: never built or never measured")
+        return "\n".join(lines)
+
+
+def ship_gate_multi(
+    candidates: dict[str, CheckpointRecord],
+    *,
+    required_widths: Sequence[str],
+    iq3_xxs_baseline: CheckpointRecord,
+    bf16_baseline: CheckpointRecord,
+) -> MultiGateResult:
+    """Evaluate the gate at every required bit-width.
+
+    The deliverable is a base that survives quantisation downward, so passing at one width
+    proves nothing on its own: under-healed weights carry larger activation outliers and
+    degrade unevenly across quantisation schemes. A width that was never built counts as a
+    failure, not as an absence.
+    """
+    per_width: dict[str, GateResult] = {}
+    missing: list[str] = []
+    for width in required_widths:
+        rec = candidates.get(width)
+        if rec is None:
+            missing.append(width)
+            continue
+        per_width[width] = ship_gate(
+            rec, iq3_xxs_baseline=iq3_xxs_baseline, bf16_baseline=bf16_baseline
+        )
+    passed = bool(per_width) and not missing and all(g.passed for g in per_width.values())
+    return MultiGateResult(passed=passed, per_width=per_width, missing=missing)
+
+
 AAII_DISCLAIMER = """\
 AAII is NOT reported. True AAII v4.1.1 is nine evaluations (GDPval-AA v2, tau^3-Banking,
 Terminal-Bench v2.1, SciCode, HLE, GPQA Diamond, CritPt, AA-Omniscience, AA-LCR) weighted
@@ -288,7 +342,7 @@ def write_report(
     run_dir: str | Path,
     records: Sequence[CheckpointRecord],
     *,
-    gate: GateResult | None = None,
+    gate: GateResult | MultiGateResult | None = None,
     title: str = "Marlowe metrics",
 ) -> Path:
     run_dir = Path(run_dir)

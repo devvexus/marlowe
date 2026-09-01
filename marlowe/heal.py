@@ -171,6 +171,10 @@ def iter_batches(
                 continue
             with np.load(cache_dir / shard["path"]) as z:
                 ids, tk, tlp = z["input_ids"], z["topk_idx"], z["topk_logprob"]
+            # Read the length from the shard, not from the caller's argument. They agree in
+            # a uniform cache, but tokens_seen drives checkpointing, the token budget and
+            # resume -- so it must count what was actually consumed, not what was requested.
+            shard_seq = int(shard.get("seq_len", seq_len))
             begin = pos.offset if s_i == pos.shard else 0
             for b in range(begin, len(ids), micro_batch):
                 sl = slice(b, min(b + micro_batch, len(ids)))
@@ -178,7 +182,7 @@ def iter_batches(
                 pos = Position(
                     shard=s_i,
                     offset=sl.stop,
-                    tokens_seen=pos.tokens_seen + n * seq_len,
+                    tokens_seen=pos.tokens_seen + n * shard_seq,
                     step=pos.step + 1,
                     epoch=pos.epoch,
                 )
@@ -236,6 +240,21 @@ def latest_checkpoint(out_dir: str | Path) -> Path | None:
 #: while every decoder layer stays resident -- see :func:`assert_layers_on_gpu`. An embedding
 #: lookup on CPU costs little; a decoder layer on CPU costs everything.
 DEFAULT_MAX_GPU_GB = 11.5
+
+
+def embedding_module_name(model_path: str | Path) -> str:
+    """Module path of the input embedding table, derived from the tensors present.
+
+    Derived rather than hardcoded: the wrapper namespace differs between a multimodal
+    checkpoint and the text-only one surgery produces.
+    """
+    from marlowe.surgery import load_index
+
+    weight_map, _ = load_index(model_path)
+    for name in weight_map:
+        if name.endswith("embed_tokens.weight"):
+            return name[: -len(".weight")]
+    raise ValueError(f"no embed_tokens tensor found in {model_path}")
 
 
 def assert_layers_on_gpu(model: Any) -> dict[str, Any]:
@@ -361,16 +380,26 @@ def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None =
         # top-K KL against teacher logits, so quantising the head adds noise to exactly what
         # is being matched. Only overridden when the memory search cannot fit fp16.
         llm_int8_skip_modules=[] if cfg.quantize_lm_head else ["lm_head"],
+        # Required for the CPU embedding offload. Without it bitsandbytes refuses outright:
+        # "Some modules are dispatched on the CPU or the disk." The flag name says int8 but
+        # it gates 4-bit offload too. The offloaded module is embed_tokens, which is not a
+        # Linear and was never going to be quantised anyway.
+        llm_int8_enable_fp32_cpu_offload=True,
     )
+    # Explicit placement, not `device_map="auto"` plus a max_memory cap.
+    #
+    # Letting accelerate choose what to spill picks Linear4bit modules, and attaching its
+    # execution hooks to an offloaded 4-bit module reads `quant_state.offset.item()` on a
+    # meta tensor and dies. Naming the one module to offload -- the embedding table, which is
+    # not a Linear and was never going to be quantised -- avoids that entirely and is what we
+    # wanted anyway.
+    embed = embedding_module_name(model_path)
+    device_map: dict[str, Any] = {"": 0, embed: "cpu"}
     kwargs: dict[str, Any] = {
         "quantization_config": qcfg,
-        "device_map": "auto",
+        "device_map": device_map,
         "trust_remote_code": True,
         "dtype": torch.bfloat16,
-        "max_memory": {
-            0: f"{max_gpu_gb if max_gpu_gb is not None else DEFAULT_MAX_GPU_GB:.1f}GiB",
-            "cpu": "24GiB",
-        },
     }
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
@@ -617,6 +646,8 @@ class MemoryCandidate:
     quantize_lm_head: bool
     optimizer_8bit: bool
     rationale: str
+    #: Override the configured sequence length. None keeps it.
+    seq_len: int | None = None
 
     def apply(self, cfg: HealConfig) -> HealConfig:
         import copy
@@ -624,6 +655,8 @@ class MemoryCandidate:
         out = copy.deepcopy(cfg)
         out.quantize_lm_head = self.quantize_lm_head
         out.optimizer_8bit = self.optimizer_8bit
+        if self.seq_len is not None:
+            out.seq_len = self.seq_len
         return out
 
 
@@ -636,14 +669,25 @@ class MemoryCandidate:
 #: The ordering is by quality cost, not by memory saved. An NF4 lm_head saves the most (2.5
 #: GB) and costs the most: it injects quantisation noise into the very logits the top-K KL
 #: loss is matching, and the adapter then learns to compensate for an error that vanishes
-#: when merge_adapters loads the base in bf16. fp32 Adam moments cost 1 GB and buy back
-#: optimizer precision, which never enters the forward pass.
+#: when merge_adapters loads the base in bf16 -- strictly worse than a wash, since the
+#: correction does not survive to inference.
+#:
+#: Halving the sequence sits *above* that: it changes how much long-range structure each step
+#: sees, which is a real cost, but it leaves the loss target itself intact. fp32 Adam moments
+#: come last because optimizer state never enters the forward pass at all.
 MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
     MemoryCandidate(
-        name="fp16-head",
+        name="fp16-head-2048",
         quantize_lm_head=False,
         optimizer_8bit=True,
         rationale="fp16 lm_head: no quantisation noise in the logits the loss matches",
+    ),
+    MemoryCandidate(
+        name="fp16-head-1024",
+        quantize_lm_head=False,
+        optimizer_8bit=True,
+        seq_len=1024,
+        rationale="halve the sequence rather than corrupt the loss target",
     ),
     MemoryCandidate(
         name="nf4-head-adamw32",
@@ -731,6 +775,66 @@ def search_memory_plan(
             )
             return result
     return result
+
+
+MEMORY_PLAN_FILE = "memory_plan.json"
+
+
+def save_memory_plan(path: str | Path, search: SearchResult) -> Path:
+    """Persist the selected trade-offs so later stages use what was measured.
+
+    This matters more than it looks. The teacher cache is built at a fixed sequence length
+    and its distributions are position-aligned, so :func:`iter_batches` refuses a cache whose
+    length does not match training. If the search runs inside Stage 6 and picks the 1024
+    candidate, a 2048 cache built six hours earlier is already worthless. So the plan is
+    decided before Stage 5 and both stages read it from here.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "candidate": search.chosen.name if search.chosen else None,
+        "rationale": search.chosen.rationale if search.chosen else None,
+        "attempts": search.attempts,
+        "seq_len": search.config.seq_len if search.config else None,
+        "quantize_lm_head": search.config.quantize_lm_head if search.config else None,
+        "optimizer_8bit": search.config.optimizer_8bit if search.config else None,
+        "loss_chunk": search.config.loss_chunk if search.config else None,
+        "measured": (
+            {
+                "tok_s": round(search.probe.tok_s, 1),
+                "peak_vram_gb": round(search.probe.peak_vram_gb, 2),
+                "headroom_gb": round(search.probe.headroom_gb(), 2),
+                "lm_head_precision": search.probe.lm_head_precision,
+            }
+            if search.probe
+            else None
+        ),
+    }
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return p
+
+
+def load_memory_plan(path: str | Path, cfg: HealConfig) -> tuple[HealConfig, dict[str, Any]] | None:
+    """Apply a persisted plan onto ``cfg``. Returns None when there is no plan on disk."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    with p.open(encoding="utf-8") as f:
+        payload = json.load(f)
+    if payload.get("candidate") is None:
+        return None
+
+    import copy
+
+    out = copy.deepcopy(cfg)
+    for key in ("seq_len", "quantize_lm_head", "optimizer_8bit", "loss_chunk"):
+        if payload.get(key) is not None:
+            setattr(out, key, payload[key])
+    logutil.event(
+        log, "memory plan loaded", candidate=payload["candidate"], seq_len=out.seq_len
+    )
+    return out, payload
 
 
 def _is_oom(exc: BaseException) -> bool:
