@@ -5,11 +5,27 @@ token budget, substantially more recovery: cross-entropy against a single hard t
 away everything the teacher knows about the other 248319 tokens, which is precisely the
 information a pruned student has lost.
 
-Memory shape on a 16 GB card: NF4 base around 11.6 GB, leaving room for rank-32 adapters,
-optimizer state, and activations with gradient checkpointing at 2048 tokens. The logits are
-the other pressure point -- ``2048 x 248320`` in bf16 is 1.02 GB per micro-batch before any
-softmax intermediate -- so the loss is computed in sequence chunks and the full logit tensor
-is never materialised.
+Memory shape on a 16 GB card, for the 22.3B student. This is plain peft plus bitsandbytes,
+not Unsloth, so nothing here inherits Unsloth's savings and every megabyte is accounted for::
+
+    NF4 weights incl. lm_head          10.85 GB
+    LoRA (176M) + AdamW8bit             1.06 GB
+    activations, grad ckpt @ 2048       1.34 GB
+    loss, chunked at 256                0.64 GB
+                                       -------
+                                       13.89 GB
+
+Four decisions get it there, and without all four it needs ~20 GB and does not fit:
+
+* ``lm_head`` is quantised -- bitsandbytes skips it by default, and it is 2.5 GB of fp16.
+* ``embed_tokens`` is offloaded to CPU -- not a Linear, so NF4 cannot touch it; another
+  2.5 GB, and a lookup on CPU is cheap.
+* 8-bit Adam moments, which is 1 GB on a 176M-parameter adapter set.
+* The loss is chunked over the sequence -- ``2048 x 248320`` in bf16 is 1.02 GB before any
+  softmax intermediate, so the full logit tensor is never materialised.
+
+:func:`probe_training` measures the real numbers rather than trusting this arithmetic, and
+Stage 6 runs it before spending the budget.
 
 Two operational rules from the brief, both enforced here:
 
@@ -212,8 +228,77 @@ def latest_checkpoint(out_dir: str | Path) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
+#: GPU cap for the student. Chosen so accelerate spills the bf16 embedding table to CPU
+#: while every decoder layer stays resident -- see :func:`assert_layers_on_gpu`. An embedding
+#: lookup on CPU costs little; a decoder layer on CPU costs everything.
+DEFAULT_MAX_GPU_GB = 11.5
+
+
+def assert_layers_on_gpu(model: Any) -> dict[str, Any]:
+    """Verify accelerate offloaded the embeddings and nothing else.
+
+    ``max_memory`` constrains *how much* goes to the GPU, not *what*. If it picks a decoder
+    layer to spill instead of the embedding table, training still runs and is 50x slower --
+    which reads as a hung job, not a misconfiguration. So the placement is checked rather
+    than assumed.
+    """
+    dmap = getattr(model, "hf_device_map", None)
+    if not dmap:
+        return {"device_map": None}
+
+    offloaded = {k: v for k, v in dmap.items() if str(v) in ("cpu", "disk")}
+    bad = [k for k in offloaded if ".layers." in k]
+    if bad:
+        raise preflight.ResourceError(
+            f"accelerate offloaded {len(bad)} decoder layer(s) to CPU/disk: {bad[:4]}.\n"
+            f"  Training would run at a small fraction of GPU speed and look like a hung job. "
+            f"Raise --max-gpu-gb, lower lora_rank, or reduce seq_len."
+        )
+    logutil.event(
+        log,
+        "device placement",
+        offloaded=sorted(offloaded),
+        n_offloaded=len(offloaded),
+        note="embeddings on CPU is intended; decoder layers must not be",
+    )
+    return {"offloaded": sorted(offloaded)}
+
+
+def build_optimizer(params: list[Any], cfg: HealConfig) -> Any:
+    """AdamW with 8-bit moments where available.
+
+    The LoRA state here is ~176M parameters, so fp32 Adam moments cost 1.4 GB against 0.35 GB
+    at 8 bits. On a card with ~4 GB left after weights and activations, that is the margin.
+    Falls back to torch AdamW with a warning rather than failing.
+    """
+    import torch
+
+    if cfg.optimizer_8bit:
+        try:
+            import bitsandbytes as bnb
+
+            opt = bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=0.0)
+            logutil.event(log, "optimizer", kind="bnb.AdamW8bit", n_tensors=len(params))
+            return opt
+        except (ImportError, AttributeError) as exc:
+            log.warning("AdamW8bit unavailable (%s); falling back to fp32 AdamW", exc)
+    logutil.event(log, "optimizer", kind="torch.AdamW", n_tensors=len(params))
+    return torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=0.0)
+
+
 def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None = None) -> Any:
-    """NF4 base plus LoRA adapters. The base is never held in bf16."""
+    """NF4 base plus LoRA adapters. The base is never held in bf16.
+
+    Two memory decisions matter on a 16 GB card, and both are the difference between fitting
+    and not:
+
+    * **lm_head is quantised.** bitsandbytes skips it by default, and at 248320 x 5120 that
+      is 2.5 GB of fp16 for one tensor.
+    * **embed_tokens is offloaded to CPU.** It is not a Linear, so NF4 cannot touch it, and
+      it is another 2.5 GB. A lookup on CPU is cheap.
+
+    Without both, the 22B student needs ~18 GB before optimizer state.
+    """
     import torch
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
@@ -230,17 +315,23 @@ def load_student(model_path: str, cfg: HealConfig, *, max_gpu_gb: float | None =
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
+        # Quantise lm_head too. bnb's default skip list keeps it in fp16, which is 2.5 GB
+        # for a single tensor on a card with 16.
+        llm_int8_skip_modules=[],
     )
     kwargs: dict[str, Any] = {
         "quantization_config": qcfg,
         "device_map": "auto",
         "trust_remote_code": True,
         "dtype": torch.bfloat16,
+        "max_memory": {
+            0: f"{max_gpu_gb if max_gpu_gb is not None else DEFAULT_MAX_GPU_GB:.1f}GiB",
+            "cpu": "24GiB",
+        },
     }
-    if max_gpu_gb is not None:
-        kwargs["max_memory"] = {0: f"{max_gpu_gb:.1f}GiB", "cpu": "24GiB"}
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    assert_layers_on_gpu(model)
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=cfg.gradient_checkpointing
     )
@@ -302,7 +393,7 @@ def run_healing(
     decoder = find_decoder(model)
     lm_head = model.get_output_embeddings()
     params = [p for p in model.parameters() if p.requires_grad]
-    optim = torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=0.0)
+    optim = build_optimizer(params, cfg)
 
     total_steps = max(1, cfg.tokens // (cfg.seq_len * cfg.micro_batch * cfg.grad_accum))
     sched = torch.optim.lr_scheduler.OneCycleLR(
@@ -341,7 +432,7 @@ def run_healing(
         hidden = getattr(out, "last_hidden_state", None)
         if hidden is None:
             hidden = out[0]
-        loss, diag = chunked_kl_loss(lm_head, hidden, tk, tlp)
+        loss, diag = chunked_kl_loss(lm_head, hidden, tk, tlp, chunk=cfg.loss_chunk)
         (loss / cfg.grad_accum).backward()
         window.append(float(loss.item()))
         accum += 1
@@ -434,6 +525,129 @@ def merge_adapters(base_path: str, adapter_path: str | Path, out_path: str | Pat
 def estimate_wall_clock(tokens: int, tok_s: float = 200.0) -> str:
     hours = tokens / tok_s / 3600
     return f"{tokens / 1e6:.0f}M tokens at {tok_s:.0f} tok/s = {hours:.1f} h ({hours / 24:.1f} d)"
+
+
+@dataclass
+class ProbeResult:
+    """What a short training probe actually measured. No projections in here."""
+
+    tok_s: float
+    peak_vram_gb: float
+    total_vram_gb: float
+    step_s: float
+    seq_len: int
+    n_steps: int
+    lora_params: int
+    offloaded: list[str] = field(default_factory=list)
+    optimizer: str = ""
+
+    def headroom_gb(self) -> float:
+        return self.total_vram_gb - self.peak_vram_gb
+
+    def projected_hours(self, tokens: int) -> float:
+        return tokens / self.tok_s / 3600
+
+    def render(self, tokens: int) -> str:
+        h = self.projected_hours(tokens)
+        return (
+            f"measured over {self.n_steps} steps at seq_len {self.seq_len}:\n"
+            f"  throughput     {self.tok_s:8.1f} tok/s  ({self.step_s * 1000:.0f} ms/step)\n"
+            f"  peak VRAM      {self.peak_vram_gb:8.2f} GB of {self.total_vram_gb:.1f} "
+            f"({self.headroom_gb():.2f} GB headroom)\n"
+            f"  LoRA params    {self.lora_params / 1e6:8.1f} M    optimizer {self.optimizer}\n"
+            f"  offloaded      {', '.join(self.offloaded) or '(nothing)'}\n"
+            f"  projection     {tokens / 1e6:.0f}M tokens = {h:.1f} h ({h / 24:.2f} d)"
+        )
+
+
+def probe_training(
+    model_path: str,
+    cfg: HealConfig,
+    *,
+    n_steps: int = 12,
+    max_gpu_gb: float | None = None,
+) -> ProbeResult:
+    """Run a few real training steps and measure throughput and peak VRAM.
+
+    The ~200 tok/s figure in the project brief assumed Unsloth's memory savings. This stack
+    is plain peft plus bitsandbytes, so that number is not transferable, and a three-day
+    commitment should not rest on an estimate. Two minutes of real steps settles both
+    questions -- does it fit, and how long will it take -- before the budget is spent.
+
+    Teacher data is synthetic here: the shapes and the compute are identical to training, and
+    the loss value is meaningless but never used.
+    """
+    import torch
+
+    from marlowe.score import find_decoder
+
+    torch.cuda.reset_peak_memory_stats()
+    total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+
+    model = load_student(model_path, cfg, max_gpu_gb=max_gpu_gb)
+    decoder = find_decoder(model)
+    lm_head = model.get_output_embeddings()
+    params = [p for p in model.parameters() if p.requires_grad]
+    n_lora = sum(p.numel() for p in params)
+    optim = build_optimizer(params, cfg)
+    vocab = int(model.config.vocab_size if hasattr(model.config, "vocab_size") else 0) or 248320
+
+    model.train()
+    device = next(p.device for p in params)
+    seq, k = cfg.seq_len, 16
+    ids = torch.randint(0, vocab, (cfg.micro_batch, seq), device=device)
+    t_idx = torch.randint(0, vocab, (cfg.micro_batch, seq, k), device=device)
+    t_lp = torch.log_softmax(torch.randn(cfg.micro_batch, seq, k, device=device), dim=-1)
+
+    timings: list[float] = []
+    for i in range(n_steps):
+        t0 = time.time()
+        out = decoder(input_ids=ids, use_cache=False)
+        hidden = getattr(out, "last_hidden_state", None)
+        if hidden is None:
+            hidden = out[0]
+        loss, _ = chunked_kl_loss(lm_head, hidden, t_idx, t_lp, chunk=cfg.loss_chunk)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        optim.step()
+        optim.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        del out, hidden, loss
+        # Discard the first two steps: allocator warm-up and cuBLAS autotuning.
+        if i >= 2:
+            timings.append(time.time() - t0)
+
+    step_s = sum(timings) / max(len(timings), 1)
+    dmap = getattr(model, "hf_device_map", {}) or {}
+    result = ProbeResult(
+        tok_s=cfg.micro_batch * seq / step_s,
+        peak_vram_gb=torch.cuda.max_memory_allocated() / 1e9,
+        total_vram_gb=total_vram,
+        step_s=step_s,
+        seq_len=seq,
+        n_steps=len(timings),
+        lora_params=n_lora,
+        offloaded=sorted(k for k, v in dmap.items() if str(v) in ("cpu", "disk")),
+        optimizer=type(optim).__name__,
+    )
+    del model, optim
+    torch.cuda.empty_cache()
+    logutil.event(
+        log,
+        "training probe",
+        tok_s=round(result.tok_s, 1),
+        peak_vram_gb=round(result.peak_vram_gb, 2),
+        headroom_gb=round(result.headroom_gb(), 2),
+        lora_m=round(n_lora / 1e6, 1),
+    )
+    if result.headroom_gb() < 0.5:
+        log.warning(
+            "only %.2f GB of VRAM headroom at seq_len %d. A long-context anneal or a "
+            "fragmentation spike will OOM. Lower seq_len, lora_rank, or loss_chunk.",
+            result.headroom_gb(),
+            seq,
+        )
+    return result
 
 
 def kl_plateaued(history: list[dict[str, Any]], delta: float, window: int = 2) -> bool:

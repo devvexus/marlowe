@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from marlowe import logutil
+from marlowe import logutil, preflight
 from marlowe.arch import ArchDims, Layout, load_config, positional_selection
 from marlowe.config import THINKING, QuantConfig
 from marlowe.eval import bench
@@ -643,13 +643,25 @@ def stage5_teacher(ctx: StageContext) -> dict[str, Any]:
     estimated_hours=72.0,
 )
 def stage6_heal(ctx: StageContext) -> dict[str, Any]:
-    from marlowe.heal import estimate_wall_clock, run_healing
+    from marlowe.heal import probe_training, run_healing
 
     student = ctx.declare_input("unhealed", ctx.models_dir / f"{ctx.cfg.name}-unhealed")
     cache = ctx.declare_input("cache", ctx.run_dir / "teacher-cache")
     out = ctx.declare_output("adapters", ctx.models_dir / f"{ctx.cfg.name}-adapters")
 
-    ctx.note(estimate_wall_clock(ctx.cfg.heal.tokens))
+    # Measure before committing three days. The brief's ~200 tok/s assumed Unsloth's memory
+    # savings; this stack is plain peft + bitsandbytes, so the number has to be established
+    # rather than inherited. Two minutes of real steps answers both "does it fit" and
+    # "how long".
+    probe = probe_training(str(student), ctx.cfg.heal, max_gpu_gb=ctx.extra.get("max_gpu_gb"))
+    for line in probe.render(ctx.cfg.heal.tokens).splitlines():
+        ctx.note(line)
+    if probe.headroom_gb() < 0.3:
+        raise preflight.ResourceError(
+            f"only {probe.headroom_gb():.2f} GB VRAM headroom at seq_len "
+            f"{ctx.cfg.heal.seq_len}; this will OOM partway through a three-day run. "
+            f"Lower heal.seq_len, heal.lora_rank, or heal.loss_chunk."
+        )
     scored: list[dict[str, Any]] = []
 
     def on_checkpoint(path: Path, state: Any) -> dict[str, Any]:
@@ -679,6 +691,11 @@ def stage6_heal(ctx: StageContext) -> dict[str, Any]:
         resume=True,
     )
     return {
+        "probe": {
+            "tok_s": round(probe.tok_s, 1),
+            "peak_vram_gb": round(probe.peak_vram_gb, 2),
+            "projected_hours": round(probe.projected_hours(ctx.cfg.heal.tokens), 1),
+        },
         "stopped_reason": state.stopped_reason,
         "tokens_seen": state.position["tokens_seen"],
         "wall_seconds": state.wall_seconds,

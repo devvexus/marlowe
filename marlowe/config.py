@@ -136,6 +136,13 @@ class HealConfig:
     grad_accum: int = 16
     micro_batch: int = 1
     gradient_checkpointing: bool = True
+    #: 8-bit Adam moments. ~1 GB saved on a 176M-parameter LoRA state; on a 16 GB card that
+    #: is the difference between fitting at seq_len 2048 and not.
+    optimizer_8bit: bool = True
+    #: Sequence chunk for the logit/loss computation. 2048 x 248320 would be 1.0 GB in bf16
+    #: before any softmax intermediate, so the loss is always chunked; 256 halves the peak
+    #: relative to 512 at a small throughput cost.
+    loss_chunk: int = 256
     checkpoint_every_tokens: int = 10_000_000
     #: Stop when KL improvement over a checkpoint window falls below this. Banks the compute.
     kl_plateau_delta: float = 0.002

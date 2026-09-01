@@ -270,6 +270,21 @@ def cmd_probe(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_fitcheck(args: argparse.Namespace) -> int:
+    """Measure Stage 6 throughput and peak VRAM without committing to the run."""
+    from marlowe.config import HealConfig, load_run_config
+    from marlowe.heal import probe_training
+
+    cfg = load_run_config(args.config).heal if args.config else HealConfig()
+    if args.seq_len:
+        cfg.seq_len = args.seq_len
+    if args.lora_rank:
+        cfg.lora_rank = args.lora_rank
+    result = probe_training(args.model, cfg, n_steps=args.steps, max_gpu_gb=args.max_gpu_gb)
+    print(result.render(cfg.tokens))
+    return 0 if result.headroom_gb() >= 0.3 else 1
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     from marlowe.report import collect, render_table, write_report
 
@@ -368,6 +383,15 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--model", required=True, help="source HF directory")
     pr.add_argument("--gguf", required=True)
     pr.set_defaults(fn=cmd_probe)
+
+    fc = sub.add_parser("fitcheck", help="measure Stage 6 throughput and peak VRAM")
+    fc.add_argument("--model", required=True, help="the unhealed student checkpoint")
+    fc.add_argument("--config", help="run config, for heal.* settings")
+    fc.add_argument("--steps", type=int, default=12)
+    fc.add_argument("--seq-len", dest="seq_len", type=int)
+    fc.add_argument("--lora-rank", dest="lora_rank", type=int)
+    fc.add_argument("--max-gpu-gb", dest="max_gpu_gb", type=float)
+    fc.set_defaults(fn=cmd_fitcheck)
 
     rp = sub.add_parser("report", help="unified metrics table")
     rp.add_argument("--run-dir", required=True)

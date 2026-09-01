@@ -24,6 +24,7 @@ Two things here are load-bearing and easy to get wrong:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from collections import defaultdict
 from collections.abc import Iterator
@@ -102,7 +103,7 @@ def load_index(src: str | Path) -> tuple[dict[str, str], bool]:
         )
     from safetensors import safe_open
 
-    with safe_open(str(single), framework="pt") as f:  # type: ignore[no-untyped-call]
+    with safe_open(str(single), framework="pt") as f:
         keys = list(f.keys())
     return dict.fromkeys(keys, "model.safetensors"), False
 
@@ -295,9 +296,37 @@ def _iter_source(src: Path, plan: SurgeryPlan, by_shard: dict[str, list[str]]) -
     from safetensors import safe_open
 
     for shard in sorted(by_shard):
-        with safe_open(str(src / shard), framework="pt") as f:  # type: ignore[no-untyped-call]
+        with safe_open(str(src / shard), framework="pt") as f:
             for old in by_shard[shard]:
                 yield plan.mapping[old], f.get_tensor(old)
+
+
+#: Shards this module writes. Matches both the in-progress name and the final N-of-M form.
+_OUR_SHARD_RE = re.compile(r"^model-\d{5}(-of-\d{5})?\.safetensors$")
+
+
+def clear_previous_shards(out: str | Path) -> int:
+    """Remove shards from an earlier run of this function. Returns the count removed.
+
+    Surgery must be idempotent: stages are re-runnable and ``--force`` re-runs them
+    deliberately. Without this, a second run writes ``model-00001.safetensors``, then fails
+    renaming it to ``model-00001-of-000NN.safetensors`` because the previous run's output is
+    already sitting there -- after having spent the whole streaming pass.
+
+    Deliberately narrow: only files matching the exact naming this module produces, plus its
+    index. Anything else in the directory is someone else's and is left alone.
+    """
+    out = Path(out)
+    removed = 0
+    for p in out.iterdir():
+        if not p.is_file():
+            continue
+        if _OUR_SHARD_RE.match(p.name) or p.name == "model.safetensors.index.json":
+            p.unlink()
+            removed += 1
+    if removed:
+        logutil.event(log, "cleared previous output", dir=str(out), files=removed)
+    return removed
 
 
 def write_checkpoint(
@@ -313,6 +342,7 @@ def write_checkpoint(
 
     src, out = Path(src), Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    clear_previous_shards(out)
 
     by_shard: dict[str, list[str]] = defaultdict(list)
     for old in plan.mapping:

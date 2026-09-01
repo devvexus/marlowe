@@ -134,7 +134,7 @@ def build_cache(
     import torch
 
     from marlowe.arch import Layout, load_config
-    from marlowe.score import build_harness, load_4bit
+    from marlowe.score import _hidden_from, build_harness, load_4bit
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -227,8 +227,7 @@ def build_cache(
                 continue
             ids = torch.tensor([seq], device=h.device)
             with torch.no_grad():
-                hidden = h.decoder(input_ids=ids, use_cache=False)
-                hidden = getattr(hidden, "last_hidden_state", None) or hidden[0]
+                hidden = _hidden_from(h.decoder(input_ids=ids, use_cache=False))
                 logits = h.lm_head(hidden).float()
                 lp = torch.log_softmax(logits, dim=-1)[0]
                 top = torch.topk(lp, cfg.top_k, dim=-1)

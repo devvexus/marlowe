@@ -627,3 +627,68 @@ class TestDeleteTempsDefault:
 
         t = budget_totals(disk_budget(default_rungs()))
         assert t["peak_if_cleaned"] < t["total_if_nothing_deleted"] / 2
+
+
+class TestSurgeryIsIdempotent:
+    """`write_checkpoint` collided with its own previous output on a re-run.
+
+    It writes `model-00001.safetensors` and renames to `model-00001-of-000NN.safetensors`
+    once N is known. A second run found the renamed file already there and raised
+    FileExistsError -- after the entire streaming pass had completed. Stages are re-runnable
+    by design and `--force` re-runs them deliberately, so this had to be fixed rather than
+    worked around.
+    """
+
+    def test_rerun_into_a_populated_directory(self, mini_checkpoint, tmp_path) -> None:
+        out = tmp_path / "child"
+        first = run_surgery(mini_checkpoint, out, [5], shard_size_gb=0.000001)
+        shards_before = sorted(p.name for p in out.glob("*.safetensors"))
+        assert shards_before
+
+        second = run_surgery(mini_checkpoint, out, [5], shard_size_gb=0.000001)
+        assert second["actual_params"] == first["actual_params"]
+        assert sorted(p.name for p in out.glob("*.safetensors")) == shards_before
+        verify_checkpoint(out)
+
+    def test_rerun_with_a_different_cut_leaves_no_orphans(self, tmp_path) -> None:
+        """A shorter second run must not leave the first run's extra shards behind."""
+        # 20 layers: 5 periods, three of them unprotected, so a 3-cut is admissible.
+        src = write_checkpoint(tmp_path / "p20", layer_types_for(20))
+        out = tmp_path / "child"
+        run_surgery(src, out, positional_selection(Layout.from_config(load_config(src)), 1),
+                    shard_size_gb=0.000001)
+        cuts = positional_selection(Layout.from_config(load_config(src)), 3)
+        run_surgery(src, out, cuts, shard_size_gb=0.000001)
+        result = verify_checkpoint(out)
+        assert result["n_layers"] == 17
+        # Every shard on disk must be referenced by the index; orphans would be silently
+        # loaded by some readers and ignored by others.
+        import json as _json
+
+        with (out / "model.safetensors.index.json").open(encoding="utf-8") as f:
+            referenced = set(_json.load(f)["weight_map"].values())
+        assert {p.name for p in out.glob("*.safetensors")} == referenced
+
+    def test_only_our_own_files_are_removed(self, tmp_path) -> None:
+        from marlowe.surgery import clear_previous_shards
+
+        out = tmp_path / "d"
+        out.mkdir()
+        for name in ("model-00001-of-00002.safetensors", "model-00002.safetensors",
+                     "model.safetensors.index.json"):
+            (out / name).write_bytes(b"x")
+        for name in ("config.json", "tokenizer.json", "adapter_model.safetensors",
+                     "notes.txt"):
+            (out / name).write_bytes(b"y")
+
+        assert clear_previous_shards(out) == 3
+        assert {p.name for p in out.iterdir()} == {
+            "config.json", "tokenizer.json", "adapter_model.safetensors", "notes.txt"
+        }
+
+    def test_empty_directory_is_a_noop(self, tmp_path) -> None:
+        from marlowe.surgery import clear_previous_shards
+
+        out = tmp_path / "d"
+        out.mkdir()
+        assert clear_previous_shards(out) == 0

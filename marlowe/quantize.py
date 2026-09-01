@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from marlowe import logutil, preflight
-from marlowe.arch import Layout, load_config
+from marlowe.arch import Layout, is_mtp_tensor, load_config
 from marlowe.config import QuantConfig
 from marlowe.eval.kl import find_binary
 
@@ -327,19 +327,45 @@ def converter_writes_explicit_layout(converter: Path | None = None) -> tuple[boo
     )
 
 
+def checkpoint_has_mtp(hf_dir: str | Path) -> bool:
+    """Does this checkpoint still carry an MTP draft head?
+
+    The converter needs telling, because it cannot infer it. Its Qwen mixin reads
+    ``mtp_num_hidden_layers`` and treats **0 as "unspecified, discover it from the tensor
+    names"** -- Qwen3-Next omits the field entirely -- then asserts that discovery found
+    something. A checkpoint that genuinely has zero MTP layers, which is exactly what
+    ``surgery --drop-mtp`` produces, trips that assert. ``--no-mtp`` is the intended escape,
+    and this is the condition for passing it.
+    """
+    from marlowe.surgery import load_index
+
+    try:
+        weight_map, _ = load_index(hf_dir)
+    except FileNotFoundError:
+        return True  # cannot tell; let the converter decide
+    return any(is_mtp_tensor(name) for name in weight_map)
+
+
 def convert_to_gguf(
     hf_dir: str | Path,
     out_path: str | Path,
     *,
     outtype: str = "bf16",
+    no_mtp: bool | None = None,
     timeout: int = 6 * 3600,
 ) -> Path:
-    """Run convert_hf_to_gguf.py. Returns the output path."""
+    """Run convert_hf_to_gguf.py. Returns the output path.
+
+    ``no_mtp`` defaults to auto-detection from the tensors present, so it cannot drift out
+    of sync with what surgery actually did.
+    """
     import sys
 
     conv = find_converter()
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if no_mtp is None:
+        no_mtp = not checkpoint_has_mtp(hf_dir)
     cmd = [
         sys.executable,
         str(conv),
@@ -347,6 +373,9 @@ def convert_to_gguf(
         "--outfile", str(out_path),
         "--outtype", outtype,
     ]
+    if no_mtp:
+        cmd.append("--no-mtp")
+        logutil.event(log, "no MTP tensors present; passing --no-mtp", src=str(hf_dir))
     with logutil.timed(log, "convert to gguf", src=str(hf_dir), outtype=outtype):
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0 or not out_path.exists():
