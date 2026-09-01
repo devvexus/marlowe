@@ -1472,3 +1472,138 @@ class TestNoTorchAccountingInFitDecisions:
         from marlowe.config import estimate_peak_gb
 
         assert "_EST_CUDA_CONTEXT_GB" in inspect.getsource(estimate_peak_gb)
+
+
+class TestMemoryPlanPersistence:
+    """The plan must restore every field the search varied.
+
+    lora_rank was a candidate override that save_memory_plan did not persist. Stage 6 would
+    have reloaded seq_len and head precision correctly and silently reverted the rank that
+    made the configuration fit -- OOMing on a plan whose own record said it had been measured
+    as fitting. The field list is now derived from the dataclass so it cannot drift again.
+    """
+
+    def test_persisted_fields_cover_every_override(self) -> None:
+        import dataclasses
+
+        from marlowe.heal import MemoryCandidate, _candidate_override_fields
+
+        fixed = {"name", "rationale", "requires_approval"}
+        overridable = {
+            f.name for f in dataclasses.fields(MemoryCandidate) if f.name not in fixed
+        }
+        assert set(_candidate_override_fields()) == overridable
+
+    def test_roundtrip_preserves_lora_rank(self, tmp_path) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import (
+            MEMORY_CANDIDATES,
+            ProbeResult,
+            SearchResult,
+            load_memory_plan,
+            save_memory_plan,
+        )
+
+        cand = next(c for c in MEMORY_CANDIDATES if c.name == "fp16-head-1024-rank16")
+        base = HealConfig(lora_rank=32, seq_len=2048)
+        chosen = cand.apply(base)
+        search = SearchResult(
+            chosen=cand,
+            config=chosen,
+            probe=ProbeResult(
+                tok_s=1.0, peak_vram_gb=15.0, total_vram_gb=17.17, step_s=1.0,
+                seq_len=1024, n_steps=4, lora_params=1,
+            ),
+        )
+        path = tmp_path / "memory_plan.json"
+        save_memory_plan(path, search)
+
+        restored, _ = load_memory_plan(path, base)
+        assert restored.lora_rank == 16, "the rank that made it fit must survive the plan"
+        assert restored.seq_len == 1024
+        assert restored.quantize_lm_head is False
+
+    def test_a_plan_missing_a_field_is_refused(self, tmp_path) -> None:
+        """An older plan file must not silently restore a configuration never measured."""
+        import json
+
+        from marlowe.config import HealConfig
+        from marlowe.heal import load_memory_plan
+
+        path = tmp_path / "memory_plan.json"
+        path.write_text(
+            json.dumps({"candidate": "fp16-head-1024", "seq_len": 1024}), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="predates fields"):
+            load_memory_plan(path, HealConfig())
+
+
+class TestLadderRungsProbeIndependently:
+    """The 18B must size itself, not inherit the 22B's plan.
+
+    Shape determines the envelope. At 41 layers the weights drop by roughly 2.4 GB, which
+    likely reopens rank 32 or a longer sequence -- and inheriting rank 16 would give the
+    *harder* healing job less adapter capacity than the easier one.
+    """
+
+    def test_child_runs_in_its_own_run_dir(self) -> None:
+        import inspect
+
+        import marlowe.stages  # noqa: F401
+        from marlowe.pipeline import REGISTRY
+
+        src = inspect.getsource(REGISTRY["stage8-ladder"].fn)
+        assert "run_dir=ctx.run_dir / child.name" in src, (
+            "the child must not share a run_dir with rung 1, or it inherits its memory plan"
+        )
+
+    def test_plan_paths_do_not_collide(self, tmp_path) -> None:
+        from marlowe.config import load_run_config
+        from marlowe.heal import MEMORY_PLAN_FILE
+        from marlowe.manifest import Manifest
+        from marlowe.pipeline import StageContext
+
+        parent_cfg = load_run_config("configs/marlowe-22b.yaml", vram_gb=17.17)
+        child_cfg = load_run_config("configs/marlowe-18b.yaml", vram_gb=17.17)
+
+        parent = StageContext("s", parent_cfg, tmp_path, Manifest(stage="s"))
+        child = StageContext("s", child_cfg, tmp_path / child_cfg.name, Manifest(stage="s"))
+
+        assert (parent.metrics_dir / MEMORY_PLAN_FILE) != (
+            child.metrics_dir / MEMORY_PLAN_FILE
+        )
+
+    def test_child_config_starts_at_full_capacity(self) -> None:
+        """The 18B searches down from rank 32; it does not begin where rung 1 ended."""
+        from marlowe.config import load_run_config
+
+        child = load_run_config("configs/marlowe-18b.yaml", vram_gb=17.17)
+        assert child.heal.lora_rank == 32
+        assert child.heal.quantize_lm_head is False
+        assert child.heal.seq_len == 2048
+
+    def test_stage5_searches_rather_than_loading(self) -> None:
+        """Rung 2's Stage 5 must run its own search against the 18B checkpoint."""
+        import inspect
+
+        import marlowe.stages  # noqa: F401
+        from marlowe.pipeline import REGISTRY
+
+        src = inspect.getsource(REGISTRY["stage5-teacher"].fn)
+        assert "search_memory_plan" in src
+        assert "load_memory_plan" not in src, (
+            "Stage 5 decides the plan; loading one would inherit another rung's envelope"
+        )
+
+    def test_the_18b_is_a_smaller_envelope(self) -> None:
+        """Sanity: fewer layers really does free memory, so re-probing can find more room."""
+        from marlowe.arch import ArchDims, Layout, positional_selection
+
+        d = ArchDims()
+        parent = Layout.qwen38_27b()
+        r1, _ = parent.apply(positional_selection(parent, 12))
+        r2, _ = r1.apply(positional_selection(r1, 11))
+        nf4 = 4.127 / 8
+        w1 = (d.total_params(r1.layer_types) - d.embedding_params) * nf4 / 1e9
+        w2 = (d.total_params(r2.layer_types) - d.embedding_params) * nf4 / 1e9
+        assert w1 - w2 > 1.5, f"expected the 18B to free >1.5 GB, got {w1 - w2:.2f}"

@@ -856,6 +856,21 @@ def search_memory_plan(
 
 MEMORY_PLAN_FILE = "memory_plan.json"
 
+#: HealConfig fields a MemoryCandidate is allowed to override, derived from the dataclass
+#: rather than hand-listed.
+#:
+#: Persistence must cover exactly this set. Hand-listing it is how lora_rank got left out
+#: when the rank-16 candidate was added: the plan would have restored seq_len and the head
+#: precision but silently reverted the rank that made the configuration fit, and Stage 6
+#: would have OOM'd on a plan that had been measured as fitting.
+def _candidate_override_fields() -> tuple[str, ...]:
+    import dataclasses
+
+    fixed = {"name", "rationale", "requires_approval"}
+    return tuple(
+        f.name for f in dataclasses.fields(MemoryCandidate) if f.name not in fixed
+    )
+
 
 def save_memory_plan(path: str | Path, search: SearchResult) -> Path:
     """Persist the selected trade-offs so later stages use what was measured.
@@ -868,14 +883,16 @@ def save_memory_plan(path: str | Path, search: SearchResult) -> Path:
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    cfg = search.config
+    payload: dict[str, Any] = {
         "candidate": search.chosen.name if search.chosen else None,
         "rationale": search.chosen.rationale if search.chosen else None,
         "attempts": search.attempts,
-        "seq_len": search.config.seq_len if search.config else None,
-        "quantize_lm_head": search.config.quantize_lm_head if search.config else None,
-        "optimizer_8bit": search.config.optimizer_8bit if search.config else None,
-        "loss_chunk": search.config.loss_chunk if search.config else None,
+        "blocked": search.blocked,
+        # Every field a candidate can override, plus loss_chunk which the search never
+        # varies but Stage 6 must not silently change either.
+        **{k: (getattr(cfg, k) if cfg else None) for k in _candidate_override_fields()},
+        "loss_chunk": cfg.loss_chunk if cfg else None,
         "measured": (
             {
                 "tok_s": round(search.probe.tok_s, 1),
@@ -905,11 +922,24 @@ def load_memory_plan(path: str | Path, cfg: HealConfig) -> tuple[HealConfig, dic
     import copy
 
     out = copy.deepcopy(cfg)
-    for key in ("seq_len", "quantize_lm_head", "optimizer_8bit", "loss_chunk"):
+    restored: list[str] = []
+    for key in (*_candidate_override_fields(), "loss_chunk"):
         if payload.get(key) is not None:
             setattr(out, key, payload[key])
+            restored.append(key)
+    missing = [k for k in _candidate_override_fields() if k not in payload]
+    if missing:
+        raise ValueError(
+            f"{p} predates fields {missing} and would restore a configuration that was "
+            f"never measured. Delete it and re-run the Stage 5 memory search."
+        )
     logutil.event(
-        log, "memory plan loaded", candidate=payload["candidate"], seq_len=out.seq_len
+        log,
+        "memory plan loaded",
+        candidate=payload["candidate"],
+        restored=restored,
+        seq_len=out.seq_len,
+        lora_rank=out.lora_rank,
     )
     return out, payload
 
