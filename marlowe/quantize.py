@@ -388,8 +388,25 @@ def convert_to_gguf(
 ) -> Path:
     """Run convert_hf_to_gguf.py. Returns the output path.
 
-    ``no_mtp`` defaults to auto-detection from the tensors present, so it cannot drift out
-    of sync with what surgery actually did.
+    ``no_mtp`` defaults to **dropping** the MTP head, for two independent reasons.
+
+    The first is intent: ``drop_mtp`` is true for every rung, because the draft head is
+    invalid once layers are removed, so no GGUF this pipeline builds should carry one. A
+    parent reference that keeps it is not structurally comparable to the children it is the
+    reference *for*.
+
+    The second is that keeping it does not work. llama.cpp validates
+    ``<arch>.attention.recurrent_layers`` against ``block_count``, and ``block_count``
+    counts the MTP block: the 27B parent writes ``block_count=65`` with ``blk.64.nextn.*``,
+    while the converter writes 64 recurrent flags from ``num_hidden_layers``. Quantisation
+    then fails with "wrong array length; expected 65, got 64" -- after the full 54 GB
+    conversion has been written, five minutes in. This was invisible until the first
+    MTP-bearing checkpoint was converted, because every earlier conversion was of a pruned
+    child that had already had its head removed.
+
+    Auto-detection was the previous default. It could only ever pass ``--no-mtp`` for
+    checkpoints that had *no* MTP tensors -- which is the case where the converter would
+    otherwise assert -- and so it never fired for the one checkpoint that needed it.
     """
     import sys
 
@@ -397,7 +414,7 @@ def convert_to_gguf(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if no_mtp is None:
-        no_mtp = not checkpoint_has_mtp(hf_dir)
+        no_mtp = True
     cmd = [
         sys.executable,
         str(conv),
@@ -407,7 +424,12 @@ def convert_to_gguf(
     ]
     if no_mtp:
         cmd.append("--no-mtp")
-        logutil.event(log, "no MTP tensors present; passing --no-mtp", src=str(hf_dir))
+        logutil.event(
+            log,
+            "dropping the MTP head",
+            src=str(hf_dir),
+            had_mtp=checkpoint_has_mtp(hf_dir),
+        )
     with logutil.timed(log, "convert to gguf", src=str(hf_dir), outtype=outtype):
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0 or not out_path.exists():
