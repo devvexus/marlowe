@@ -42,6 +42,36 @@ def _write_json(path: Path, obj: Any) -> Path:
     return path
 
 
+def _calib_as_text(calib_jsonl: Path, out_dir: Path) -> Path:
+    """Flatten the calibration JSONL to plain text for llama-imatrix.
+
+    One corpus, two serialisations. Stage 3 packs it into fixed 32768-token sequences because
+    short calibration nominates exactly the DeltaNet layers that must not be cut; llama-imatrix
+    reads raw text and chunks it internally, so it needs neither the packing nor the JSON.
+    Maintaining two corpora would let them drift, and then the damage profile and the
+    quantisation would be measured on different text.
+    """
+    import json as _json
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "calibration.txt"
+    if out.exists():
+        return out
+    n = 0
+    with calib_jsonl.open(encoding="utf-8") as src, out.open("w", encoding="utf-8") as dst:
+        for line in src:
+            line = line.strip()
+            if not line:
+                continue
+            text = _json.loads(line).get("text", "")
+            if text:
+                dst.write(text.rstrip() + "\n\n")
+                n += 1
+    logutil.event(log, "calibration flattened", docs=n, out=str(out),
+                  mb=round(out.stat().st_size / 1e6, 1))
+    return out
+
+
 def _parent_dir(ctx: StageContext) -> Path:
     """Resolve the parent checkpoint: a local dir, or download it into the run."""
     p = Path(ctx.cfg.parent)
@@ -253,11 +283,28 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
         q.convert_to_gguf(src, base, outtype="bf16")
     ctx.declare_output("parent_bf16_gguf", base)
 
+    # The parent's own importance matrix. Per-model, not per-project: this one describes the
+    # unpruned 27B and is for this control curve only -- each healed child builds its own for
+    # Stage 7, because pruning changes which weights carry activation.
+    from marlowe.imatrix import imatrix_for, recipe_needs_imatrix
+
+    imat = None
+    if any(
+        recipe_needs_imatrix(r.base_type)
+        or any(recipe_needs_imatrix(t) for t in r.tensor_types.values())
+        for r in recipes
+    ):
+        corpus_txt = ctx.declare_input("calibration", Path(ctx.cfg.score.calib_path))
+        imat = imatrix_for(
+            base, _calib_as_text(corpus_txt, ctx.gguf_dir / "stage0"), ctx.gguf_dir / "imatrix"
+        )
+        ctx.declare_output("parent_imatrix", imat)
+
     results: list[dict[str, Any]] = []
 
     for recipe, path in q.iter_recipe_outputs(ctx.gguf_dir / "stage0", recipes):
         if not path.exists():
-            q.quantize(base, path, recipe)
+            q.quantize(base, path, recipe, imatrix=imat)
         bpw = q.bits_per_weight(path, n_params)
         row = _measure_pair(
             ctx,

@@ -17,72 +17,79 @@ The deliverable is **a base that quantises well**, not a checkpoint that fits on
 
 Ordered. Do not infer priority from the rest of this document.
 
-1. **Read §5 and get the peaks.** A memory-configuration search was in flight when this was
-   written. If it finished, its output is the selected config and measured peak VRAM for each
-   candidate. If it died with the session, restart it — nothing downstream can be sized
-   without it:
-   ```bash
-   # Do NOT pipe through a filter: grep buffers, and a long GPU job then shows nothing at
-   # all until it exits. Redirect to a file and tail that instead.
-   marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml --steps 6      2>&1 | tee fitcheck.log
-   ```
-   The sizing-only 22B is a throwaway built with positional cuts; shape determines the memory
-   envelope, cut selection does not. Rebuild with `marlowe surgery --auto 12` if it is gone.
+1. **Everything downstream of quantisation is blocked on one file: `data/calib.jsonl`.**
 
-   Progress is visible three ways while it runs: `nvidia-smi` memory (a loaded candidate sits
-   around 13-16 GB), the `base cached` / `training probe` lines in the log, and
-   `runs/<name>/logs/*.jsonl` if it was launched under a stage rather than standalone.
+   It blocks more than it looks. Stage 3 refuses to start without 4 sequences of 32768
+   tokens. Stage 0 needs it too, transitively: `stage0_recipes()` leads with `iq3_xxs`, and
+   llama.cpp will not produce any IQ2/IQ3 quantisation without an **importance matrix**,
+   which is built from the calibration corpus. `SHIP_BIT_WIDTHS` includes `iq3_m`, so
+   Stage 7's gate needs one as well. `data/heal_corpus.jsonl` separately blocks Stages 5
+   and 6 and needs ~35M tokens.
 
-2. **Validate that 1024 is not itself paging — ten minutes, do this before trusting any
-   throughput number.**
-
-   Measured: 2048 ran at 10.4 tok/s against 1024's 114.7. **2048 should be *faster* per
-   token**, not 11x slower — longer sequences amortise per-step overhead better. An 11x
-   inversion is the signature of paging, not a workload effect. Under WDDM, exceeding VRAM
-   does not OOM: the driver pages to host memory and the job silently runs about an order of
-   magnitude slower.
-
-   If 2048 pages catastrophically, 1024 may page mildly and 114.7 would be an inflated
-   number to plan against. The test:
+   `scripts/build_corpora.py` builds both from public sources (see §4). Run it first:
 
    ```bash
-   marlowe fitcheck --model <sizing-22b> --no-search --seq-len 512  --steps 8 2>&1 | tee p512.log
-   marlowe fitcheck --model <sizing-22b> --no-search --seq-len 768  --steps 8 2>&1 | tee p768.log
-   marlowe fitcheck --model <sizing-22b> --no-search --seq-len 1024 --steps 8 2>&1 | tee p1024.log
+   python scripts/build_corpora.py --calib --heal
    ```
 
-   **Both 512 and 768 must be SLOWER per token than 1024**, because shorter sequences
-   amortise per-step overhead worse. If either comes out *faster*, 1024 is also paging and
-   the real ceiling is below it — drop to the fastest length that still increases with
-   sequence size.
+   Until those exist, the memory work below is not on the critical path — a perfect fit
+   still cannot start healing without a corpus.
 
-   If the ordering holds, 114.7 tok/s is clean and **35M at 1024 is ~3.5 days for the 22B**,
-   close to the brief's original intent without needing Unsloth.
+2. **The 22B fit is close but not settled, and the last gigabyte is not in the code.**
 
-3. **Prefer seq_len 1024 unless something changed.** Faster and neither length trains
-   DeltaNet state eviction, so 2048 winning a memory search does not make it the choice
-   (§2, §3b). If a search selects 2048, override it deliberately.
+   §3a has the full ladder. The short version: it started 8.3 GB over the card and paging
+   silently, and is now ~37 MiB short at rank 16, seq 1024. Throughput went 81 → 204 tok/s
+   along the way, which halves the healing schedule.
 
-   **On this platform, throughput is the fit signal and memory accounting is a diagnostic.**
-   `probe_training` has been wrong three times (§3); the throughput measurement has never
-   been wrong. A configuration that does not fit announces itself by running ~10x slow, not
-   by crashing.
+   The remaining gap is smaller than the VRAM held by **desktop applications on the discrete
+   GPU** — 13-16 processes (browsers, Steam, VS Code, Spotify) costing 1.38-1.52 GB and
+   drifting ~0.15 GB between runs. Moving them to the iGPU frees more than the deficit.
+   Note that Windows' per-app graphics preference only takes effect **when the app restarts**;
+   closing windows is not enough, and this was measured to change nothing on the first
+   attempt.
 
-4. **Run the Unsloth evaluation once the GPU is free** (§4 item 5). It can halve a 15-day
-   schedule, costs about an hour, and its harness is written. Isolated venv only. If it
-   passes, re-run `marlowe fitcheck` — the whole memory ladder was measured on plain peft.
-   Urgency dropped once 1024 measured 114.7 tok/s: the schedule may already be acceptable.
+   Re-measure after moving them, in this order, because the cap is derived from the context:
 
-5. **Stage 2 is blocked on the operator's OpenRouter endpoint.** Everything else is
-   unblocked. Do not work around it with `--allow-missing-bf16-baseline` unless the operator
-   asks: that baseline defines the repetition ship criterion.
+   ```bash
+   # context bare, with nothing loaded -- this is the input to every margin below
+   python -c "from marlowe.heal import cuda_context_bytes; print(cuda_context_bytes()/1e9)"
+   marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml --no-search --lora-rank 16
+   marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml --no-search --lora-rank 32
+   ```
 
-6. **Stage 0 can run whenever the GPU is free.** Control curve, not a gate. Synthetic prompt
-   set, labelled as such in every report (§2). ~8 h.
+   Rank 32 is the better model and is only 0.14 GB behind rank 16 — the gap collapsed once
+   the adapters went to bf16. Prefer it if it fits.
 
-The GPU is the scarce resource and only one of these can use it at a time. Rough order if it
-is free and nothing else is pending: finish the fitcheck, then Unsloth, then Stage 0
-overnight.
+3. **The fit gate is the driver's Shared Usage counter. Not throughput, not torch.**
+
+   This reverses the previous conclusion in this document, which said throughput was the fit
+   signal. It was falsified: a probe measured **74.5 tok/s while 6.8 GB over the card**. Under
+   WDDM the driver never refuses an allocation — it pages to host memory — so a badly
+   over-committed run can look fast for a few steps. `marlowe.gpumem` samples the adapter's
+   Shared Usage during the probe; idle is ~90 MB, and anything above 250 MB over that floor is
+   paging. `ProbeResult.fits()` uses it, with torch accounting as the fallback.
+
+4. **Before any multi-day run, soak it.** Every fit measured so far is an 8-step probe, and
+   the failure this margin exists to prevent is fragmentation accumulating into an OOM at
+   hour 30. `marlowe fitcheck --no-search --steps 500 --log-every 10` reports the slope of
+   trapped fragmentation per 1000 steps and the steps needed to exhaust the margin. A flat
+   slope after warm-up means the allocator reached a steady block pattern. A positive slope
+   is not disqualifying: it sets a restart interval, since training checkpoints every 10M
+   tokens and a fresh process resets fragmentation to zero.
+
+5. **Stage 2 is blocked on the operator's OpenRouter endpoint** (§4). Do not work around it
+   with `--allow-missing-bf16-baseline` unless asked: that baseline defines the repetition
+   ship criterion.
+
+6. **The Unsloth evaluation is now lower value than it was.** It was sized against a 15-day
+   schedule at 73.5 tok/s. The stack now runs at 204 tok/s without it, so the ceiling it was
+   chasing is largely already taken. Isolated venv only. If that venv gets built anyway, check
+   whether the current torch supports `expandable_segments` on Windows while you are there —
+   torch 2.5.1 rejects it outright (§3a), and it would reduce fragmentation at the source.
+
+The GPU is the scarce resource and only one thing can use it at a time. Note that
+`llama-quantize` from the CUDA build initialises a CUDA context even for CPU-side work, so it
+cannot run alongside a training probe that has taken the whole card.
 
 ---
 
@@ -91,9 +98,9 @@ overnight.
 | stage | status | notes |
 |---|---|---|
 | `stage1-smoke` | **complete** | converter blocker closed against real weights |
-| `stage0-bitwidth` | ready to run | ~8 h; control curve, not a gate (§2) |
+| `stage0-bitwidth` | **blocked** | needs `data/calib.jsonl`: IQ-class recipes require an importance matrix, and that is built from the calibration corpus (§4) |
 | `stage2-baselines` | **blocked** | needs a hosted bf16 endpoint (§4) |
-| `stage3-score` | ready | 8 h, needs `data/calib.jsonl` (still a placeholder) |
+| `stage3-score` | **blocked** | 8 h; needs `data/calib.jsonl`, still a placeholder (§4) |
 | `stage4`–`stage8` | not started | |
 
 **In progress:** a memory-configuration search (`marlowe fitcheck`) against a sizing-only

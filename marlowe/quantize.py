@@ -450,10 +450,34 @@ def quantize(
     imatrix: str | Path | None = None,
     timeout: int = 6 * 3600,
 ) -> Path:
-    """Run llama-quantize with a base type plus per-tensor overrides."""
+    """Run llama-quantize with a base type plus per-tensor overrides.
+
+    Refuses IQ-class recipes without an importance matrix rather than letting llama.cpp
+    discover it. ``imatrix`` was a parameter here from the beginning and nothing ever passed
+    one, so Stage 0 died on its first recipe -- after a 54 GB conversion and seven minutes --
+    with "this quantization requires an importance matrix!". Failing at the call site names
+    the missing input instead.
+    """
+    from marlowe.imatrix import recipe_needs_imatrix
+
     exe = find_binary("llama-quantize")
     out_gguf = Path(out_gguf)
     out_gguf.parent.mkdir(parents=True, exist_ok=True)
+
+    needs = recipe_needs_imatrix(recipe.base_type) or any(
+        recipe_needs_imatrix(t) for t in recipe.tensor_types.values()
+    )
+    if needs and not imatrix:
+        raise ValueError(
+            f"recipe {recipe.name!r} quantises to {recipe.base_type}, which llama.cpp will "
+            f"not produce without an importance matrix. Build one for THIS model first:\n"
+            f"  from marlowe.imatrix import imatrix_for\n"
+            f"  imatrix_for(<src gguf>, <calibration text>, <cache dir>)\n"
+            f"An imatrix is per-model: pruning changes which weights carry activation, so a "
+            f"parent's matrix does not describe a child."
+        )
+    if imatrix and not Path(imatrix).exists():
+        raise FileNotFoundError(f"imatrix {imatrix} does not exist")
 
     cmd = [exe]
     if imatrix:
