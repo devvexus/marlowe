@@ -827,26 +827,58 @@ class TestMemoryPlanSearch:
             cfg = cand.apply(base)
             assert cfg.loss_chunk == base.loss_chunk
 
-    def test_shortened_candidates_descend_in_length(self) -> None:
-        """Sequence length is a real cost, so candidates spend it monotonically."""
+    def test_unquantised_candidates_descend_in_adapter_capacity(self) -> None:
+        """The ladder spends adapter capacity monotonically, never jumping back up.
+
+        It used to spend *sequence length*. That was the wrong axis: measured peak moved
+        0.04 GB across a 2x change in seq_len, because almost none of the footprint is
+        activations. The levers that move the static footprint are the head's precision
+        (now a fix, not a rung), then LoRA rank.
+        """
         from marlowe.config import HealConfig
         from marlowe.heal import MEMORY_CANDIDATES
 
-        base = HealConfig()
-        lengths = [
-            c.apply(base).seq_len for c in MEMORY_CANDIDATES if not c.quantize_lm_head
+        base = HealConfig(seq_len=1024)
+        # Rank is the axis the full-sequence rungs spend. The final rung switches axis --
+        # it shortens the sequence and restores rank 16 -- so it is excluded here and
+        # covered by test_sequence_length_is_the_last_resort_and_never_increases.
+        ranks = [
+            c.apply(base).lora_rank
+            for c in MEMORY_CANDIDATES
+            if not c.quantize_lm_head and c.apply(base).seq_len == base.seq_len
         ]
-        assert lengths == sorted(lengths, reverse=True), (
-            "the fp16 ladder must give up context gradually, never jump back up"
+        assert ranks == sorted(ranks, reverse=True), (
+            "the fp16 ladder must give up adapter capacity gradually"
         )
-        assert lengths == [2048, 1536, 1024, 1024]  # the last pair differ by LoRA rank
+        assert ranks == [32, 16, 8]
+
+    def test_sequence_length_is_the_last_resort_and_never_increases(self) -> None:
+        """seq_len is mostly a throughput choice, and only the final rung spends it.
+
+        It was measured as no fit lever at all -- 25.31 GB at 512 against 25.33 GB at 1024 --
+        but that was with an fp32 residual stream, where the weights so dominated that
+        activations were invisible. With the stream in bf16 the backward transient that sets
+        the peak does scale with sequence, so one short rung sits at the bottom of the
+        unquantised ladder. It must never be reached before the rank rungs, and no candidate
+        may ask for a *longer* sequence than the config.
+        """
+        from marlowe.config import HealConfig
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        base = HealConfig(seq_len=1024)
+        fp16 = [c for c in MEMORY_CANDIDATES if not c.quantize_lm_head]
+        lengths = [c.apply(base).seq_len for c in fp16]
+        assert all(v <= base.seq_len for v in lengths), "no rung may lengthen the sequence"
+        assert lengths == sorted(lengths, reverse=True), "sequence is spent monotonically"
+        shortened = [c.name for c in fp16 if c.apply(base).seq_len < base.seq_len]
+        assert shortened == [fp16[-1].name], "only the final unquantised rung shortens it"
 
     def test_shortening_the_sequence_is_preferred_over_quantising_the_head(self) -> None:
         """Halving context is a real cost; corrupting the loss target is a worse one."""
         from marlowe.heal import MEMORY_CANDIDATES
 
         names = [c.name for c in MEMORY_CANDIDATES]
-        assert names.index("fp16-head-1024") < names.index("nf4-head-adamw32")
+        assert names.index("rank16-chunk256") < names.index("nf4-head-adamw32")
 
     def test_apply_does_not_mutate_the_original(self) -> None:
         from marlowe.config import HealConfig
@@ -901,7 +933,7 @@ class TestMemoryPlanSearch:
         )
         _stub_model_plumbing(monkeypatch)
         res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
-        assert res.chosen is not None and res.chosen.name == "fp16-head-2048"
+        assert res.chosen is not None and res.chosen.name == "rank32-chunk256"
         assert res.config is not None and res.config.quantize_lm_head is False
 
     def test_oom_is_treated_as_does_not_fit(self, monkeypatch) -> None:
@@ -1292,12 +1324,12 @@ class TestLongContextAnnealRefusal:
 
 
 class TestSequenceLengthLadder:
-    def test_1536_sits_between_2048_and_1024(self) -> None:
+    def test_rank_rungs_are_ordered_most_capacity_first(self) -> None:
         from marlowe.heal import MEMORY_CANDIDATES
 
         names = [c.name for c in MEMORY_CANDIDATES]
-        assert names.index("fp16-head-2048") < names.index("fp16-head-1536")
-        assert names.index("fp16-head-1536") < names.index("fp16-head-1024")
+        assert names.index("rank32-chunk256") < names.index("rank16-chunk256")
+        assert names.index("rank16-chunk256") < names.index("rank8-chunk256")
 
     def test_all_fp16_candidates_precede_every_nf4_one(self) -> None:
         """Shortening context is a real cost; corrupting the loss target is a worse one."""
@@ -1329,7 +1361,7 @@ class TestSequenceLengthLadder:
             "x", HealConfig(), probe_all=True, allow_quantized_head=True
         )
         assert len(seen) == len(heal.MEMORY_CANDIDATES)
-        assert res.chosen is not None and res.chosen.name == "fp16-head-2048"
+        assert res.chosen is not None and res.chosen.name == "rank32-chunk256"
         assert len(res.attempts) == len(heal.MEMORY_CANDIDATES)
 
         # Without approval, probe_all still walks the fp16 ladder but never measures a
@@ -1359,13 +1391,13 @@ class TestQuantizedHeadNeedsApproval:
 
         names = [c.name for c in MEMORY_CANDIDATES]
         first_nf4 = min(i for i, c in enumerate(MEMORY_CANDIDATES) if c.quantize_lm_head)
-        assert names.index("fp16-head-1024-rank16") < first_nf4
+        assert names.index("rank16-chunk256") < first_nf4
 
     def test_rank16_halves_the_adapter_not_the_target(self) -> None:
         from marlowe.config import HealConfig
         from marlowe.heal import MEMORY_CANDIDATES
 
-        cand = next(c for c in MEMORY_CANDIDATES if c.name == "fp16-head-1024-rank16")
+        cand = next(c for c in MEMORY_CANDIDATES if c.name == "rank16-chunk256")
         cfg = cand.apply(HealConfig(lora_rank=32))
         assert cfg.lora_rank == 16
         assert cfg.quantize_lm_head is False, "the loss target must stay intact"
@@ -1549,7 +1581,7 @@ class TestMemoryPlanPersistence:
             save_memory_plan,
         )
 
-        cand = next(c for c in MEMORY_CANDIDATES if c.name == "fp16-head-1024-rank16")
+        cand = next(c for c in MEMORY_CANDIDATES if c.name == "rank16-chunk256")
         base = HealConfig(lora_rank=32, seq_len=2048)
         chosen = cand.apply(base)
         search = SearchResult(
@@ -1565,7 +1597,10 @@ class TestMemoryPlanPersistence:
 
         restored, _ = load_memory_plan(path, base)
         assert restored.lora_rank == 16, "the rank that made it fit must survive the plan"
-        assert restored.seq_len == 1024
+        # seq_len is no longer a candidate override, so the plan must carry the config's own
+        # value through untouched rather than inventing one.
+        assert restored.seq_len == 2048
+        assert restored.loss_chunk == 256, "loss_chunk is an override now; it must persist"
         assert restored.quantize_lm_head is False
 
     def test_a_plan_missing_a_field_is_refused(self, tmp_path) -> None:
@@ -1652,3 +1687,298 @@ class TestLadderRungsProbeIndependently:
         w1 = (d.total_params(r1.layer_types) - d.embedding_params) * nf4 / 1e9
         w2 = (d.total_params(r2.layer_types) - d.embedding_params) * nf4 / 1e9
         assert w1 - w2 > 1.5, f"expected the 18B to free >1.5 GB, got {w1 - w2:.2f}"
+
+
+class TestChunkedLossRecompute:
+    """The chunked loss recomputes each chunk in backward instead of retaining it.
+
+    Chunking bounded the transient logit tensor but not what autograd kept: log_softmax's
+    backward retains its own output, so the retained total was seq_len x vocab x 4 however
+    the sequence was sliced. Measured 1.02 GB at seq 1024, byte-identical at chunk 256 and
+    chunk 128 -- which is why the chunk-size lever moved nothing. Recomputation is only a
+    valid trade if the value and the gradient are unchanged, so both are pinned here.
+    """
+
+    @staticmethod
+    def _reference(lm_head, hidden, idx, lp, chunk):
+        """The pre-recompute implementation, kept as the thing to agree with."""
+        import torch
+        import torch.nn.functional as F
+
+        seq_len = hidden.shape[1]
+        total, n = None, 0
+        for start in range(0, seq_len, chunk):
+            end = min(start + chunk, seq_len)
+            logits = lm_head(hidden[:, start:end, :]).float()
+            student_lp = F.log_softmax(logits, dim=-1)
+            s = torch.gather(student_lp, -1, idx[:, start:end].long())
+            t_norm = F.log_softmax(lp[:, start:end].float(), dim=-1)
+            kl = (t_norm.exp() * (t_norm - s)).sum(-1).mean()
+            w = end - start
+            total = kl * w if total is None else total + kl * w
+            n += w
+        return total / n
+
+    def _fixture(self, seq=24, vocab=64, hidden_size=8, k=5, seed=0):
+        import torch
+
+        torch.manual_seed(seed)
+        head = torch.nn.Linear(hidden_size, vocab, bias=False)
+        hidden = torch.randn(1, seq, hidden_size, requires_grad=True)
+        idx = torch.randint(0, vocab, (1, seq, k))
+        lp = torch.log_softmax(torch.randn(1, seq, k), dim=-1)
+        return head, hidden, idx, lp
+
+    def test_value_matches_the_unchunked_reference(self) -> None:
+        import torch
+
+        from marlowe.heal import chunked_kl_loss
+
+        head, hidden, idx, lp = self._fixture()
+        got, _ = chunked_kl_loss(head, hidden, idx, lp, chunk=7)
+        want = self._reference(head, hidden, idx, lp, chunk=7)
+        assert torch.allclose(got, want, atol=1e-6), f"{got.item()} != {want.item()}"
+
+    def test_gradient_matches_the_reference(self) -> None:
+        """Recomputation that changes the gradient is a silent wrong answer, not a saving."""
+        import torch
+
+        from marlowe.heal import chunked_kl_loss
+
+        head, hidden, idx, lp = self._fixture()
+        chunked_kl_loss(head, hidden, idx, lp, chunk=7)[0].backward()
+        got_h, got_w = hidden.grad.clone(), head.weight.grad.clone()
+
+        head.weight.grad = None
+        hidden.grad = None
+        self._reference(head, hidden, idx, lp, chunk=7).backward()
+
+        assert torch.allclose(got_h, hidden.grad, atol=1e-6), "hidden gradient changed"
+        assert torch.allclose(got_w, head.weight.grad, atol=1e-6), "head gradient changed"
+
+    def test_chunk_size_does_not_change_the_result(self) -> None:
+        import torch
+
+        from marlowe.heal import chunked_kl_loss
+
+        head, hidden, idx, lp = self._fixture()
+        a, _ = chunked_kl_loss(head, hidden, idx, lp, chunk=6)
+        b, _ = chunked_kl_loss(head, hidden, idx, lp, chunk=24)
+        assert torch.allclose(a, b, atol=1e-6)
+
+    def test_diagnostics_are_floats_not_tensors(self) -> None:
+        """They cross into JSON logs; a 0-d tensor there serialises as garbage."""
+        from marlowe.heal import chunked_kl_loss
+
+        head, hidden, idx, lp = self._fixture()
+        _, diag = chunked_kl_loss(head, hidden, idx, lp, chunk=7)
+        assert set(diag) == {"captured_mass", "student_mass"}
+        assert all(isinstance(v, float) for v in diag.values()), diag
+
+
+class TestPrepareDoesNotUpcast:
+    """peft's prepare_model_for_kbit_training upcasts every non-quantised parameter to fp32.
+
+    That is the single most expensive defect found in this project. 0.01 GB of fp32 norms
+    promoted the residual stream to fp32 for all 52 layers, which doubled the saved
+    checkpoint inputs (1.14 GB against 0.55) and the backward recompute that sets the peak.
+    The parameter-level residency check passed throughout, reporting fp32_gb=0.01, because
+    the cost was never in the parameters.
+    """
+
+    class _Stub:
+        def __init__(self) -> None:
+            import torch
+
+            self.p = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+            self.norm = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+            self.gc_kwargs = None
+            self.input_grads_enabled = False
+
+        def parameters(self):
+            return [self.p, self.norm]
+
+        def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+            self.gc_kwargs = gradient_checkpointing_kwargs
+
+        def enable_input_require_grads(self):
+            self.input_grads_enabled = True
+
+    def test_no_parameter_dtype_is_changed(self) -> None:
+        import torch
+
+        from marlowe.config import HealConfig
+        from marlowe.heal import prepare_for_kbit_training
+
+        m = self._Stub()
+        prepare_for_kbit_training(m, HealConfig(sublayer_checkpointing=False))
+        assert all(p.dtype is torch.bfloat16 for p in m.parameters()), (
+            "prepare_for_kbit_training must cast nothing; the upcast is the whole bug"
+        )
+
+    def test_holds_no_fp32_parameters_afterwards(self) -> None:
+        """If a future model ships fp32 params of its own, fail here and decide then."""
+        import torch
+
+        from marlowe.config import HealConfig
+        from marlowe.heal import prepare_for_kbit_training
+
+        m = self._Stub()
+        prepare_for_kbit_training(m, HealConfig(sublayer_checkpointing=False))
+        assert not [p for p in m.parameters() if p.dtype is torch.float32]
+
+    def test_base_parameters_are_frozen(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import prepare_for_kbit_training
+
+        m = self._Stub()
+        prepare_for_kbit_training(m, HealConfig(sublayer_checkpointing=False))
+        assert not any(p.requires_grad for p in m.parameters())
+
+    def test_input_require_grads_is_enabled_with_checkpointing(self) -> None:
+        """Without it a checkpointed segment yields no gradient and trains nothing.
+
+        The adapters live *inside* the checkpointed region, so if no input requires grad the
+        segment returns none -- the run proceeds at full speed and learns nothing, which is
+        this codebase's signature failure shape.
+        """
+        from marlowe.config import HealConfig
+        from marlowe.heal import prepare_for_kbit_training
+
+        m = self._Stub()
+        prepare_for_kbit_training(
+            m, HealConfig(gradient_checkpointing=True, sublayer_checkpointing=False)
+        )
+        assert m.input_grads_enabled, "enable_input_require_grads was not called"
+        assert m.gc_kwargs == {"use_reentrant": False}
+
+    def test_checkpointing_can_be_disabled(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import prepare_for_kbit_training
+
+        m = self._Stub()
+        prepare_for_kbit_training(
+            m, HealConfig(gradient_checkpointing=False, sublayer_checkpointing=False)
+        )
+        assert m.gc_kwargs is None
+        assert not m.input_grads_enabled
+
+
+class TestSublayerCheckpointing:
+    """Checkpoint mixer and FFN separately instead of the whole decoder layer.
+
+    The peak lives inside one layer's backward recompute: 13.1 GB steady-state against an
+    18.2 GB peak, with no phase boundary above 15.2 GB. Halving the largest recompute is the
+    lever. Recomputation is only a valid trade if the gradients are identical, and a wrapper
+    that silently matched nothing would look exactly like the technique not working -- both
+    are pinned here.
+    """
+
+    @staticmethod
+    def _toy(n_layers=3, d=8, linear_attn=True):
+        import torch
+        import torch.nn as nn
+
+        mixer_name = "linear_attn" if linear_attn else "self_attn"
+
+        class Layer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.input_layernorm = nn.LayerNorm(d)
+                setattr(self, mixer_name, nn.Linear(d, d))
+                self.post_attention_layernorm = nn.LayerNorm(d)
+                self.mlp = nn.Linear(d, d)
+
+            def forward(self, x):
+                x = x + getattr(self, mixer_name)(self.input_layernorm(x))
+                return x + self.mlp(self.post_attention_layernorm(x))
+
+        class Decoder(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layers = nn.ModuleList([Layer() for _ in range(n_layers)])
+
+            def forward(self, x):
+                for lyr in self.layers:
+                    x = lyr(x)
+                return x
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.model = Decoder()
+
+            def forward(self, x):
+                return self.model(x)
+
+        torch.manual_seed(0)
+        return Model()
+
+    def _grads(self, model, x):
+        model.zero_grad()
+        out = model(x)
+        out.square().sum().backward()
+        return {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    def test_gradients_are_unchanged(self) -> None:
+        """A recompute that changes gradients is a silent wrong answer, not a saving."""
+        import torch
+
+        from marlowe.heal import enable_sublayer_checkpointing
+
+        x = torch.randn(2, 5, 8, requires_grad=True)
+        plain = self._toy()
+        plain.train()
+        want = self._grads(plain, x)
+
+        wrapped = self._toy()  # same seed, same init
+        wrapped.train()
+        enable_sublayer_checkpointing(wrapped)
+        got = self._grads(wrapped, x)
+
+        assert set(got) == set(want)
+        for name in want:
+            assert torch.allclose(got[name], want[name], atol=1e-6), f"gradient changed: {name}"
+
+    def test_forward_value_is_unchanged(self) -> None:
+        import torch
+
+        from marlowe.heal import enable_sublayer_checkpointing
+
+        x = torch.randn(2, 5, 8)
+        plain, wrapped = self._toy(), self._toy()
+        plain.train()
+        wrapped.train()
+        enable_sublayer_checkpointing(wrapped)
+        assert torch.allclose(plain(x), wrapped(x), atol=1e-6)
+
+    def test_wraps_both_mixer_families(self) -> None:
+        """One stack holds both: 36 linear_attention and 16 full_attention on a 52-layer child.
+
+        Matching only one name would leave three quarters of the stack unwrapped and look
+        like the technique underperforming rather than like a bug.
+        """
+        from marlowe.heal import enable_sublayer_checkpointing
+
+        for linear in (True, False):
+            m = self._toy(n_layers=4, linear_attn=linear)
+            assert enable_sublayer_checkpointing(m) == 8, "expected mixer + mlp per layer"
+
+    def test_a_no_match_raises_instead_of_doing_nothing(self) -> None:
+        from marlowe.heal import enable_sublayer_checkpointing
+
+        m = self._toy()
+        with pytest.raises(RuntimeError, match="matched no submodules"):
+            enable_sublayer_checkpointing(m, targets=("not_a_module",))
+
+    def test_inference_path_is_not_wrapped(self) -> None:
+        """Checkpointing under no_grad only adds overhead; there is no backward to serve."""
+        import torch
+
+        from marlowe.heal import enable_sublayer_checkpointing
+
+        m = self._toy()
+        enable_sublayer_checkpointing(m)
+        m.eval()
+        with torch.no_grad():
+            m(torch.randn(2, 5, 8))  # must not raise

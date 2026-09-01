@@ -280,6 +280,8 @@ def cmd_fitcheck(args: argparse.Namespace) -> int:
         cfg.seq_len = args.seq_len
     if args.lora_rank:
         cfg.lora_rank = args.lora_rank
+    if args.loss_chunk:
+        cfg.loss_chunk = args.loss_chunk
     margin = args.margin if args.margin is not None else FIT_MARGIN_GB
 
     if args.no_search:
@@ -489,6 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--steps", type=int, default=12)
     fc.add_argument("--seq-len", dest="seq_len", type=int)
     fc.add_argument("--lora-rank", dest="lora_rank", type=int)
+    fc.add_argument("--loss-chunk", dest="loss_chunk", type=int,
+                    help="sequence chunk for the logit/loss computation (static-footprint lever)")
     fc.add_argument("--max-gpu-gb", dest="max_gpu_gb", type=float)
     fc.add_argument(
         "--margin", type=float, default=None,

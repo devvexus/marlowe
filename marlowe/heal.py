@@ -53,16 +53,20 @@ from typing import Any
 
 from marlowe import logutil, preflight
 from marlowe.config import HealConfig
+from marlowe.gpumem import PagingReport, PagingSampler, cap_process_memory
 
 log = logutil.get("heal")
 
 #: Required device-level VRAM headroom for a configuration to count as fitting.
 #:
 #: 1.0 GB, not the 0.3 GB this started at. Half a gigabyte is not a margin to stake a three-
-#: to-five-day unattended run on: expandable_segments reduces fragmentation but does not
-#: eliminate it, and a day lost to an OOM at hour 30 costs far more than the throughput gap
-#: to the next candidate down. Rejecting a configuration that would *probably* have held is
-#: the cheap error here.
+#: to-five-day unattended run on, and a day lost to an OOM at hour 30 costs far more than the
+#: throughput gap to the next candidate down. Rejecting a configuration that would *probably*
+#: have held is the cheap error here.
+#:
+#: Fragmentation is the reason the margin has to be this large. It is not hypothetical and it
+#: is not mitigated by expandable_segments, which this platform rejects outright: measured
+#: 2.95 GB of allocator growth during training at seq 1024, against a 15.62 GB live peak.
 #:
 #: Measured device-level (total minus free from the driver), not from torch accounting --
 #: see :func:`probe_training` for why that distinction is load-bearing.
@@ -113,6 +117,17 @@ def topk_kl_loss(
     Returns (loss, diagnostics). ``captured_mass`` is the teacher probability inside the
     top-K: if it drifts low, K is too small and a top-K objective is a poor proxy.
     """
+    loss, captured, student = _topk_kl_terms(logits, teacher_idx, teacher_logprob)
+    # Two syncs per call. The checkpointed path in chunked_kl_loss uses _topk_kl_terms
+    # directly and defers them, so a recomputed chunk does not pay them twice.
+    return loss, {
+        "captured_mass": float(captured.item()),
+        "student_mass": float(student.item()),
+    }
+
+
+def _topk_kl_terms(logits: Any, teacher_idx: Any, teacher_logprob: Any) -> tuple[Any, Any, Any]:
+    """The loss and its two diagnostics, all as tensors. No host syncs."""
     import torch
     import torch.nn.functional as F
 
@@ -125,11 +140,7 @@ def topk_kl_loss(
     p = t_norm.exp()
 
     kl = (p * (t_norm - s)).sum(-1)  # [B, T]
-    diag = {
-        "captured_mass": float(t_true.exp().sum(-1).mean().item()),
-        "student_mass": float(s.exp().sum(-1).mean().item()),
-    }
-    return kl.mean(), diag
+    return kl.mean(), t_true.exp().sum(-1).mean(), s.exp().sum(-1).mean()
 
 
 def chunked_kl_loss(
@@ -145,20 +156,34 @@ def chunked_kl_loss(
     still flow through every chunk; the chunks are summed, not detached.
     """
     seq_len = hidden.shape[1]
+    # prepare_model_for_kbit_training upcasts the final norm to fp32, so hidden arrives fp32
+    # while the head is bf16 (see restore_head_precision). Match the head once, outside the
+    # loop, rather than letting a dtype mismatch decide the head's precision for us.
+    w = getattr(lm_head, "weight", None)
+    if w is not None and w.dtype.is_floating_point and hidden.dtype != w.dtype:
+        hidden = hidden.to(w.dtype)
     total = None
-    diags: list[dict[str, float]] = []
+    diags: list[dict[str, Any]] = []
     n = 0
-    for start in range(0, seq_len, chunk):
-        end = min(start + chunk, seq_len)
-        logits = lm_head(hidden[:, start:end, :])
-        loss, d = topk_kl_loss(logits, teacher_idx[:, start:end], teacher_logprob[:, start:end])
-        weight = end - start
+    for start_i in range(0, seq_len, chunk):
+        end_i = min(start_i + chunk, seq_len)
+        h = hidden[:, start_i:end_i, :]
+        idx, lp = teacher_idx[:, start_i:end_i], teacher_logprob[:, start_i:end_i]
+        # Deliberately NOT checkpointed. Recomputing each chunk in backward removes 1.02 GB
+        # of retained log_softmax output, and that turned out to be worth nothing: loss
+        # backward runs before decoder backward, so those tensors are already freed when the
+        # peak occurs. Measured at rank 32 -- allocated unchanged at 18.47 GB, reserved
+        # 18.68 -> 23.76 GB, paging 4.95 -> 8.25 GB, 138.3 -> 106.7 tok/s. The peak lives in
+        # the decoder's backward, not here.
+        loss, captured, student = _topk_kl_terms(lm_head(h), idx, lp)
+        weight = end_i - start_i
         total = loss * weight if total is None else total + loss * weight
-        diags.append(d)
+        diags.append({"captured_mass": captured, "student_mass": student})
         n += weight
-        del logits
     assert total is not None
-    agg = {k: sum(d[k] for d in diags) / len(diags) for k in diags[0]}
+    # Diagnostics come back as 0-d tensors from the checkpointed chunks; reduce on device
+    # and sync once, rather than once per chunk per metric.
+    agg = {k: float((sum(d[k] for d in diags) / len(diags)).item()) for k in diags[0]}
     return total / n, agg
 
 
@@ -377,7 +402,11 @@ def attach_lora(base: Any, cfg: HealConfig) -> Any:
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(base, lora)
+    # peft's default (autocast_adapter_dtype=True) creates the adapters in fp32 regardless
+    # of the base dtype. The base compute dtype is bf16 and the loss upcasts to fp32 before
+    # the log_softmax, so fp32 adapters buy no precision where it is being used -- they cost
+    # 0.35 GB at rank 16 and 0.70 GB at rank 32, doubled again by their gradients.
+    model = get_peft_model(base, lora, autocast_adapter_dtype=False)
     model.print_trainable_parameters()
     # LoRA adapters are legitimately bf16; the ceiling accounts for them plus embeddings.
     preflight.assert_no_bf16_resident(model, allow_params=3_200_000_000)
@@ -397,13 +426,192 @@ def build_optimizer(params: list[Any], cfg: HealConfig) -> Any:
         try:
             import bitsandbytes as bnb
 
-            opt = bnb.optim.AdamW8bit(params, lr=cfg.learning_rate, weight_decay=0.0)
-            logutil.event(log, "optimizer", kind="bnb.AdamW8bit", n_tensors=len(params))
-            return opt
+            # Paged first: the moments live in unified memory and the driver migrates them
+            # to host only under pressure. Optimizer state is resident at the peak even
+            # though the step happens after the backward that sets it, so ~0.35 GB of it
+            # sits in the way of the transient that actually decides whether this fits.
+            # Unlike a blanket activation offload, nothing on the hot path crosses PCIe
+            # unless memory is genuinely short.
+            for kind in ("PagedAdamW8bit", "AdamW8bit"):
+                ctor = getattr(bnb.optim, kind, None)
+                if ctor is None:
+                    continue
+                opt = ctor(params, lr=cfg.learning_rate, weight_decay=0.0)
+                logutil.event(log, "optimizer", kind=f"bnb.{kind}", n_tensors=len(params))
+                return opt
+            raise AttributeError("no 8-bit AdamW in bitsandbytes.optim")
         except (ImportError, AttributeError) as exc:
-            log.warning("AdamW8bit unavailable (%s); falling back to fp32 AdamW", exc)
+            log.warning("8-bit AdamW unavailable (%s); falling back to fp32 AdamW", exc)
     logutil.event(log, "optimizer", kind="torch.AdamW", n_tensors=len(params))
     return torch.optim.AdamW(params, lr=cfg.learning_rate, weight_decay=0.0)
+
+
+def prepare_for_kbit_training(model: Any, cfg: HealConfig) -> Any:
+    """What ``prepare_model_for_kbit_training`` does, minus the fp32 upcast.
+
+    peft's helper does four things. Three are wanted:
+
+    1. freeze every base parameter, so only the adapters train;
+    2. enable gradient checkpointing;
+    3. ``enable_input_require_grads()`` -- without which a checkpointed segment whose only
+       trainable parameters are adapters *inside* it sees no input requiring grad, returns
+       no gradient, and trains at full speed learning nothing.
+
+    The fourth is not: it casts every non-quantised parameter to fp32. That upcast has now
+    leaked three separate times. It doubled ``lm_head`` to 5.09 GB (fixed by
+    :func:`restore_head_precision`); it made every norm fp32, so each norm emits fp32, the
+    residual add promotes, and the whole 52-layer stream runs fp32 -- doubling the saved
+    checkpoint inputs (measured +1.14 GB per forward, against 0.55 GB in bf16) and doubling
+    the backward recompute that sets the peak.
+
+    Whatever the model itself chose to hold in fp32 is left alone: the DeltaNet recurrent
+    path is fp32 upstream by design (``mamba_ssm_dtype``) because error accumulates along
+    the sequence. This function never casts, so those keep the dtype the checkpoint gave
+    them -- the carve-out is "do nothing", which is the only version that cannot be wrong
+    about names that vary between architectures.
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+    if cfg.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        # Must follow gradient_checkpointing_enable.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        if cfg.sublayer_checkpointing:
+            # Replaces the whole-layer checkpointing just enabled; see the function for why
+            # it disables it first rather than nesting.
+            enable_sublayer_checkpointing(model)
+    return model
+
+
+#: Decoder-layer children to checkpoint individually under sub-layer checkpointing.
+#:
+#: Both mixer names appear in one stack: this architecture interleaves ``linear_attention``
+#: (Gated DeltaNet, ``linear_attn``) with ``full_attention`` (``self_attn``) on a period of
+#: 4, so a 52-layer child has 36 of one and 16 of the other. Matching only one would silently
+#: leave three quarters of the stack on whole-layer checkpointing.
+SUBLAYER_TARGETS: tuple[str, ...] = ("linear_attn", "self_attn", "mlp")
+
+
+def enable_sublayer_checkpointing(model: Any, targets: Sequence[str] = SUBLAYER_TARGETS) -> int:
+    """Checkpoint each mixer and FFN separately instead of the whole decoder layer.
+
+    Whole-layer checkpointing means the backward of layer *i* recomputes all of layer *i* --
+    mixer and FFN together -- and that single recompute is the transient that sets the peak.
+    Measured: 13.1 GB steady-state against an 18.2 GB peak, with no phase boundary above
+    15.2 GB, so the peak lives entirely inside one layer's backward. Checkpointing the halves
+    separately makes the largest recompute half a layer.
+
+    Returns the number of submodules wrapped, so a silent no-match is visible. A wrapper that
+    matched nothing would leave memory unchanged and look like the technique failing.
+    """
+    import torch
+    import torch.utils.checkpoint as ckpt
+
+    from marlowe.score import find_decoder
+
+    decoder = find_decoder(model)
+    # Whole-layer checkpointing must be off first, or each half is checkpointed twice:
+    # correct, but it recomputes the recompute and buys nothing.
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+
+    def wrap(mod: Any) -> None:
+        original = mod.forward
+
+        def forward(*args: Any, **kwargs: Any) -> Any:
+            # Checkpointing is a training-time trade. Under inference there is no backward
+            # to recompute for, and wrapping would only add overhead.
+            if not torch.is_grad_enabled() or not mod.training:
+                return original(*args, **kwargs)
+            return ckpt.checkpoint(original, *args, use_reentrant=False, **kwargs)
+
+        mod.forward = forward
+
+    wrapped = 0
+    for layer in decoder.layers:
+        for name in targets:
+            sub = getattr(layer, name, None)
+            if sub is not None:
+                wrap(sub)
+                wrapped += 1
+    logutil.event(
+        log,
+        "sub-layer checkpointing",
+        wrapped=wrapped,
+        layers=len(decoder.layers),
+        per_layer=round(wrapped / max(len(decoder.layers), 1), 2),
+    )
+    if wrapped == 0:
+        raise RuntimeError(
+            f"sub-layer checkpointing matched no submodules in {len(decoder.layers)} "
+            f"layers (looked for {list(targets)}). It would silently do nothing. Inspect "
+            f"the decoder layer's children and update SUBLAYER_TARGETS."
+        )
+    return wrapped
+
+
+def head_dtype(model: Any) -> Any:
+    """The output embedding's actual storage dtype. Measured, never inferred from config."""
+    head = model.get_output_embeddings()
+    w = getattr(head, "weight", None)
+    return None if w is None else w.dtype
+
+
+def restore_head_precision(model: Any, cfg: HealConfig) -> Any:
+    """Put ``lm_head`` back in bf16 after peft upcast it to fp32.
+
+    ``prepare_model_for_kbit_training`` casts *every* non-quantised parameter to fp32. For
+    the norms that is wanted. For the head it is not: at 248320 x 5120 it is the largest
+    non-quantised tensor in the model, 2.54 GB in bf16 and 5.09 GB in fp32, and on a 17.17 GB
+    card that difference is the whole margin. The base alone reserved 18.08 GB with an fp32
+    head -- over the card before a single training tensor existed.
+
+    This survived four sessions because nothing read the tensor: the candidate is *named*
+    ``fp16-head``, and ``ProbeResult.lm_head_precision`` derived "fp16" from
+    ``cfg.quantize_lm_head``. Both asserted a precision the tensor did not have.
+
+    Numerically free: :func:`topk_kl_loss` casts logits to fp32 before the log_softmax, so
+    the KL is computed at full precision either way. Only the GEMM's precision changes, and
+    bf16 is what the fp16-head candidates always claimed to be measuring.
+
+    Not applied when the head is quantised -- there the weight is a uint8 ``Params4bit`` and
+    casting it would destroy the quantisation.
+    """
+    import torch
+
+    if cfg.quantize_lm_head:
+        return model
+    head = model.get_output_embeddings()
+    w = getattr(head, "weight", None)
+    if w is None or not w.dtype.is_floating_point or w.dtype is torch.bfloat16:
+        return model
+    before = w.dtype
+    # Release the fp32 block BEFORE allocating the bf16 one, and hand it back to the driver
+    # in between.
+    #
+    # `head.to(bfloat16)` does the opposite: it allocates the new 2.54 GB tensor while the
+    # 5.09 GB original is still live. On a card that is already full at this point, the
+    # driver satisfies that allocation out of host memory -- so the head, which the chunked
+    # loss touches once per chunk plus backward, ends up across PCIe while the freed fp32
+    # block sits in torch's pool inside VRAM. Measured: 157 s/step against 12.6 s/step, a
+    # 12x regression from a change that removes 2.54 GB.
+    staged = w.data.detach().to("cpu", torch.bfloat16)
+    w.data = torch.empty(0, dtype=torch.bfloat16, device=w.device)
+    torch.cuda.empty_cache()  # actually return the fp32 segment, not just free it into the pool
+    w.data = staged.to(w.device)
+    del staged
+    freed = w.numel() * (before.itemsize - 2) / 1e9
+    logutil.event(
+        log,
+        "lm_head precision restored",
+        was=str(before),
+        now=str(head_dtype(model)),
+        freed_gb=round(freed, 2),
+    )
+    return model
 
 
 def load_student(
@@ -430,7 +638,7 @@ def load_student(
 
     preflight.check_bitsandbytes()
     try:
-        from peft import prepare_model_for_kbit_training
+        import peft  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
             "peft is required for Stage 6. Install with: pip install 'marlowe[heal]'"
@@ -469,19 +677,18 @@ def load_student(
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     assert_layers_on_gpu(model)
+    # Once, not twice. The second call was a no-op that re-walked every parameter, and it
+    # ran only on the non-base_only path, so the two entry points did not do the same thing.
+    model = prepare_for_kbit_training(model, cfg)
+    # Read the stream, not the parameters. See preflight.assert_bf16_stream for why the
+    # parameter-level check cannot see this: 0.01 GB of fp32 norms promotes 1.14 GB of
+    # activations, and the byte check reports a contented 0.01 GB while it happens.
+    preflight.assert_bf16_stream(model)
+    # Must follow prepare_model_for_kbit_training, which is what upcast the head to fp32.
+    restore_head_precision(model, cfg)
     if base_only:
-        return prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=cfg.gradient_checkpointing
-        )
-    model = prepare_model_for_kbit_training(
-        model, use_gradient_checkpointing=cfg.gradient_checkpointing
-    )
-    return attach_lora(
-        prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=cfg.gradient_checkpointing
-        ),
-        cfg,
-    )
+        return model
+    return attach_lora(model, cfg)
 
 
 def run_healing(
@@ -523,6 +730,21 @@ def run_healing(
         if resume_ckpt is not None:
             model.load_adapter(str(resume_ckpt), adapter_name="default", is_trainable=True)
             logutil.event(log, "adapters restored", path=str(resume_ckpt))
+
+    # The load leaves dead weight behind: prepare_model_for_kbit_training materialises the
+    # head at fp32 (5.09 GB) before restore_head_precision swaps it for 2.54 GB of bf16, and
+    # the from_pretrained path churns segments for every shard. Hand that back before
+    # measuring, and reset the high-water mark so the load transient is not reported as the
+    # training peak -- the fit question is about the sustained footprint of a 5-day run.
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    cap_process_memory(cuda_context_bytes())
+    logutil.event(
+        log,
+        "post-load reservation",
+        allocated_gb=round(torch.cuda.memory_allocated() / 1e9, 2),
+        reserved_gb=round(torch.cuda.memory_reserved() / 1e9, 2),
+    )
 
     decoder = find_decoder(model)
     lm_head = model.get_output_embeddings()
@@ -676,6 +898,9 @@ class ProbeResult:
     optimizer: str = ""
     lm_head_precision: str = ""
     modules_trained_in_full: list[str] = field(default_factory=list)
+    #: What the driver did with memory during the probe. This, not headroom and not
+    #: throughput, is the fit decision -- see :meth:`fits` and marlowe.gpumem.
+    paging: PagingReport = field(default_factory=PagingReport)
     #: What torch itself accounted for. Lower than peak_vram_gb by the CUDA context and
     #: allocator fragmentation; kept for diagnosis, never for the fit decision.
     torch_allocated_gb: float = 0.0
@@ -683,6 +908,19 @@ class ProbeResult:
 
     def headroom_gb(self) -> float:
         return self.total_vram_gb - self.peak_vram_gb
+
+    def fits(self, margin_gb: float = 0.0) -> bool:
+        """Did this configuration stay on the card?
+
+        The gate is the driver's spill counter. Throughput is not a fit signal: a probe
+        measured 74.5 tok/s at seq 2048 while 6.8 GB over the card, and paging cost depends
+        on which pages get evicted, so an over-committed run can look fast for a few steps.
+        Torch accounting stays as the diagnostic and as the fallback when the counter is
+        unavailable, where the old headroom rule applies.
+        """
+        if not self.paging.available:
+            return self.headroom_gb() >= margin_gb
+        return not self.paging.paging
 
     def projected_hours(self, tokens: int) -> float:
         return tokens / self.tok_s / 3600
@@ -694,8 +932,9 @@ class ProbeResult:
             f"  throughput     {self.tok_s:8.1f} tok/s  ({self.step_s * 1000:.0f} ms/step)\n"
             f"  peak VRAM      {self.peak_vram_gb:8.2f} GB of {self.total_vram_gb:.1f} "
             f"({self.headroom_gb():.2f} GB headroom, device-level)\n"
+            f"{self.paging.render()}\n"
             f"  torch acct     {self.torch_allocated_gb:8.2f} GB allocated / "
-            f"{self.torch_reserved_gb:.2f} GB reserved\n"
+            f"{self.torch_reserved_gb:.2f} GB reserved  (diagnostic, not the gate)\n"
             f"  LoRA params    {self.lora_params / 1e6:8.1f} M    optimizer {self.optimizer}\n"
             f"  lm_head        {self.lm_head_precision:>8}    full-trained "
             f"{', '.join(self.modules_trained_in_full) or '(none)'}\n"
@@ -717,6 +956,9 @@ class MemoryCandidate:
     #: Override the LoRA rank. Halving it roughly halves adapter parameters and their
     #: optimizer moments, without touching the loss target.
     lora_rank: int | None = None
+    #: Override the loss chunk. Bounds the transient logit tensor (chunk x 248320); a
+    #: static-footprint lever, unlike seq_len.
+    loss_chunk: int | None = None
     #: Requires an explicit human decision before it may be selected. Set on every candidate
     #: that quantises the head: that is a quality cliff, not another notch on a dial.
     requires_approval: bool = False
@@ -731,6 +973,8 @@ class MemoryCandidate:
             out.seq_len = self.seq_len
         if self.lora_rank is not None:
             out.lora_rank = self.lora_rank
+        if self.loss_chunk is not None:
+            out.loss_chunk = self.loss_chunk
         return out
 
 
@@ -751,32 +995,42 @@ class MemoryCandidate:
 #: come last because optimizer state never enters the forward pass at all.
 MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
     MemoryCandidate(
-        name="fp16-head-2048",
+        name="rank32-chunk256",
         quantize_lm_head=False,
         optimizer_8bit=True,
-        rationale="fp16 lm_head: no quantisation noise in the logits the loss matches",
+        lora_rank=32,
+        loss_chunk=256,
+        rationale="full adapter capacity; nothing given up",
     ),
     MemoryCandidate(
-        name="fp16-head-1536",
+        name="rank16-chunk256",
         quantize_lm_head=False,
         optimizer_8bit=True,
-        seq_len=1536,
-        rationale="50% more long-range state exercise than 1024, at no other cost",
-    ),
-    MemoryCandidate(
-        name="fp16-head-1024",
-        quantize_lm_head=False,
-        optimizer_8bit=True,
-        seq_len=1024,
-        rationale="halve the sequence rather than corrupt the loss target",
-    ),
-    MemoryCandidate(
-        name="fp16-head-1024-rank16",
-        quantize_lm_head=False,
-        optimizer_8bit=True,
-        seq_len=1024,
         lora_rank=16,
+        loss_chunk=256,
         rationale="half the adapter capacity, but the loss target stays intact",
+    ),
+    # loss_chunk is deliberately NOT a rung. Measured at seq 1024, rank 16: chunk 128 gave
+    # 18.33 GB allocated / 20.63 GB reserved / 5.26 GB paged -- identical to chunk 256 to
+    # the last decimal -- for 127.7 tok/s against 160.9. It bounds a transient the peak does
+    # not fall on, so it buys nothing and costs 21% throughput. It stays fixed at 256, with
+    # the CPU embeddings, as a saving every candidate keeps.
+    MemoryCandidate(
+        name="rank8-chunk256",
+        quantize_lm_head=False,
+        optimizer_8bit=True,
+        lora_rank=8,
+        loss_chunk=256,
+        rationale="last rung before the loss target is touched",
+    ),
+    MemoryCandidate(
+        name="rank16-seq768",
+        quantize_lm_head=False,
+        optimizer_8bit=True,
+        lora_rank=16,
+        loss_chunk=256,
+        seq_len=768,
+        rationale="shorter sequence: the last rung before the loss target is touched",
     ),
     # --- everything below quantises the head and needs an explicit decision -------------
     MemoryCandidate(
@@ -898,12 +1152,17 @@ def search_memory_plan(
             continue
 
         headroom = probe.headroom_gb()
-        fits = headroom >= margin_gb
+        fits = probe.fits(margin_gb)
+        spill = (
+            f"paged {probe.paging.paged_bytes / 1e9:.2f} GB"
+            if probe.paging.available
+            else f"headroom {headroom:.2f} GB (no driver counter)"
+        )
         result.attempts.append(
             (
                 cand.name,
-                f"{'FITS' if fits else 'too tight'}: peak {probe.peak_vram_gb:.2f} GB, "
-                f"headroom {headroom:.2f} GB, {probe.tok_s:.0f} tok/s",
+                f"{'FITS' if fits else 'PAGES'}: {spill}, peak {probe.peak_vram_gb:.2f} GB, "
+                f"{probe.tok_s:.0f} tok/s",
             )
         )
         _free_cuda()
@@ -1015,6 +1274,15 @@ def load_memory_plan(path: str | Path, cfg: HealConfig) -> tuple[HealConfig, dic
     return out, payload
 
 
+def _measured_head_precision(model: Any) -> str:
+    """Name the head's precision from its storage, so the record cannot outrank the tensor."""
+    dt = head_dtype(model)
+    if dt is None:
+        return "unknown"
+    # bitsandbytes stores NF4 as packed uint8; any float dtype is an unquantised head.
+    return {"torch.uint8": "nf4"}.get(str(dt), str(dt).replace("torch.", ""))
+
+
 def _is_oom(exc: BaseException) -> bool:
     import torch
 
@@ -1056,6 +1324,10 @@ def probe_training(
 
     from marlowe.score import find_decoder
 
+    # Before the model loads: the sampler's earliest readings are this process holding
+    # nothing, which is the floor its paging verdict is measured against.
+    sampler = PagingSampler()
+    sampler.start()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -1066,6 +1338,32 @@ def probe_training(
 
     model = base if base is not None else load_student(
         model_path, cfg, max_gpu_gb=max_gpu_gb
+    )
+    # Return the load's dead weight before measuring: prepare_model_for_kbit_training
+    # materialises the head at fp32 (5.09 GB) before restore_head_precision swaps in 2.54 GB
+    # of bf16, and from_pretrained churns a segment per shard. Resetting the high-water mark
+    # here also stops the load transient being reported as the training peak -- the fit
+    # question is about the sustained footprint of a multi-day run.
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    # Cap AFTER the load, not before.
+    #
+    # The cap exists to stop the allocator growing during *training*, where fragmentation
+    # accumulates over tens of thousands of steps. The load is a different animal: a one-time
+    # transient that briefly needs more than the steady state -- placing the 2.37 GiB head on
+    # top of the body -- and capping through it turns a load that succeeds into an OOM before
+    # training is ever reached. In the log that is indistinguishable from the training
+    # configuration not fitting, which cost a full measurement round to tell apart.
+    #
+    # Tightening here is safe only because empty_cache() above has just returned the load's
+    # dead weight: post-load reserved is ~13.1 GB against a ~15.8 GB ceiling. Lowering a cap
+    # below current reserved would instead OOM on the next growth allocation.
+    cap_process_memory(baseline_used)
+    logutil.event(
+        log,
+        "post-load reservation",
+        allocated_gb=round(torch.cuda.memory_allocated() / 1e9, 2),
+        reserved_gb=round(torch.cuda.memory_reserved() / 1e9, 2),
     )
     decoder = find_decoder(model)
     lm_head = model.get_output_embeddings()
@@ -1088,6 +1386,19 @@ def probe_training(
         hidden = getattr(out, "last_hidden_state", None)
         if hidden is None:
             hidden = out[0]
+        if i == 0:
+            # Assert the *stream*, not the parameters. 0.01 GB of fp32 norms is enough to
+            # promote the residual stream for all 52 layers, which doubled the saved
+            # checkpoint inputs (1.14 GB against 0.55) and the backward spike that sets the
+            # peak. A parameter-byte check reported a contented "fp32_gb=0.01" throughout.
+            logutil.event(log, "hidden stream", dtype=str(hidden.dtype))
+            if hidden.dtype is not torch.bfloat16:
+                log.warning(
+                    "hidden stream is %s, not bfloat16: every saved activation and the "
+                    "backward recompute are twice the size they should be. Something "
+                    "upcast the norms -- see heal.prepare_for_kbit_training.",
+                    hidden.dtype,
+                )
         loss, _ = chunked_kl_loss(lm_head, hidden, t_idx, t_lp, chunk=cfg.loss_chunk)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -1111,6 +1422,7 @@ def probe_training(
     # not a measurement at all. max_memory_reserved() is the allocator's peak claim on CUDA,
     # which is the part that cannot be given back.
     peak_device_used = baseline_used + torch.cuda.max_memory_reserved()
+    paging = sampler.stop()
 
     step_s = sum(timings) / max(len(timings), 1)
     dmap = getattr(model, "hf_device_map", {}) or {}
@@ -1126,8 +1438,12 @@ def probe_training(
         lora_params=n_lora,
         offloaded=sorted(k for k, v in dmap.items() if str(v) in ("cpu", "disk")),
         optimizer=type(optim).__name__,
-        lm_head_precision="nf4" if cfg.quantize_lm_head else "fp16",
+        # Read off the tensor, not off cfg.quantize_lm_head. The config-derived version
+        # reported "fp16" for four sessions while the weight was fp32 and 2.5 GB larger
+        # than anything in the memory plan accounted for.
+        lm_head_precision=_measured_head_precision(model),
         modules_trained_in_full=effective_lora_targets(cfg)[1],
+        paging=paging,
     )
     del optim
     if base is None:

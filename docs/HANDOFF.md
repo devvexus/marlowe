@@ -241,6 +241,17 @@ capacity. The 22B's 50M is sized to make the ladder reachable.
 32 or a longer sequence. Inheriting rung 1's plan would give the *harder* healing job less
 adapter capacity than the easier one.
 
+**Fallback if the 22B cannot train on this card: cut 18B directly from the 27B.** This is a
+decision the operator has already reserved, not a parameter to tune. A direct 23-cut removes
+36% of depth in one step, outside the band where healing reliably recovers, so the result is
+a *worse* 18B than the two-rung ladder would produce. But the 18B's NF4 body is ~7.77 GB
+against the 22B's 9.88 GB, so it fits on this card where the 22B is marginal — and it trains
+today. The trade is **a worse 18B, not no 18B**, and the 18B is the headline artifact.
+
+Taking it means `configs/marlowe-18b.yaml` must drop `requires_healed_parent: true` and
+`stage8-ladder`'s refusal must be overridden deliberately — both exist to stop this happening
+by accident, and neither should be relaxed except as this decision.
+
 ### Ship gate: three bit-widths, all required
 
 `SHIP_BIT_WIDTHS = ("q4_K_M", "iq4_xs", "iq3_m")`. Under-healed weights carry larger
@@ -275,6 +286,10 @@ baseline, which comes from a hosted endpoint.
 | `lora_rank` not persisted in the memory plan | `save_memory_plan` | a candidate override the plan didn't carry. Had `fp16-head-1024-rank16` been selected, Stage 6 would have restored `seq_len` and head precision correctly and **silently reverted the rank that made it fit** — OOMing on a plan whose own record said it had been measured as fitting. The cleanest instance of the pattern: self-certifying wrong answer. Field list is now derived from the dataclass |
 | quants list narrower than the gate | `configs/marlowe-18b.yaml` | gate would fail after a week on *missing data*, looking like a quality failure |
 | surgery not idempotent | `write_checkpoint` | collided with its own prior output after a full streaming pass |
+| `lm_head` resident at fp32, not bf16 | peft's `prepare_model_for_kbit_training` | it upcasts every non-quantised parameter. 5.09 GB instead of 2.54. The candidate was *named* `fp16-head` and `ProbeResult.lm_head_precision` reported `"fp16"` — derived from `cfg.quantize_lm_head`, never from the tensor |
+| **parameter dtype is not stream dtype** | `assert_no_bf16_resident` | the same upcast made the norms fp32. That is **0.01 GB of parameters** — which the byte-level check waved through — but an fp32 norm emits fp32, the residual add promotes, and the stream ran fp32 for all 52 layers: 1.14 GB of saved checkpoint inputs instead of 0.55, plus a doubled backward recompute. The check measured the right property at the wrong layer, and no threshold would have caught it |
+| memory metric saturated across candidates | `search_memory_plan` base caching | the allocator's high-water reservation is not returned between candidates, so every candidate after the first inherits the first one's peak. Reported 23.99 / 23.97 / 23.95 GB across a 2× change in sequence length — identical, saturated, not a measurement |
+| `cuda_context_bytes()` returned 0 | `probe_training` via the search | it is measured lazily, and in the search path the first call happens after the cached base is resident. Its "subtract what torch reserved back out" fallback then collapses to zero, silently dropping the ~1.4 GB context term and overstating headroom by the same amount |
 
 **The pattern: every one of these loads, runs, and produces plausible output.** None crashes.
 None OOMs. The model generates fluent text, the search reports a number, the config parses.
@@ -313,6 +328,42 @@ Corollaries that earned their place:
   a search can vary must be carried by whatever records the search's decision.
 
 ---
+
+## 3a. Fitting the 22B on a 17.17 GB card
+
+The 22B did not fit at any sequence length. It was ~8 GB over and paging silently, which is
+why every throughput number before this was unstable (2048 measured 10.4, 44.3 and 74.5 tok/s
+in three sessions). Sequence length was never the lever: peak moved **0.04 GB across a 2x
+change** in seq_len, because almost none of the footprint is activations. What follows is
+what actually moved it, measured at seq 1024 on the sizing-22B.
+
+| change | effect | note |
+|---|---|---|
+| `lm_head` back to bf16 after peft's upcast | −2.54 GB | peft upcasts every non-quantised param to fp32 |
+| skip the fp32 upcast entirely (`prepare_for_kbit_training`) | −2.55 GB, **+37% tok/s** | 0.01 GB of fp32 norms was promoting the whole residual stream |
+| bf16 LoRA adapters (`autocast_adapter_dtype=False`) | fp32 residue 0.30 → 0.01 GB | collapsed the rank32/rank16 gap to 0.14 GB |
+| post-load `empty_cache()` + peak reset | fragmentation 2.30 → 0.19 GB | the load transient was being held for the whole run |
+| `max_split_size_mb:512,garbage_collection_threshold:0.8` | trapped 1.42 GiB → 327 MiB | supported on Windows; `expandable_segments` is **not** |
+| allocator cap at `(total − context)/total` | paging 2.96 → 0.21 GB | turns silent 10x-slow paging into a real OOM |
+| sub-layer checkpointing (mixer and FFN separately) | **−0.4 GB** | predicted 0.75; it is 0.4. Plan against the measured number |
+| `PagedAdamW8bit` | ~0.35 GB | optimizer state is resident at the peak even though the step comes later |
+
+Two things that did **not** work, and why, so they are not retried:
+
+- **Smaller `loss_chunk`.** Byte-identical memory at 128 and 256, for −21% throughput. It
+  bounds a transient the peak does not fall on.
+- **Recomputing the loss chunks in backward.** Removes 1.02 GB of retained `log_softmax`
+  output and buys nothing: loss backward completes *before* the decoder backward that sets
+  the peak, so those tensors are already freed. Cost +5.1 GB reserved and −23% tok/s.
+
+**The peak is one decoder layer's backward.** Steady state is 13.1 GB against an 18.2 GB
+peak, with no phase boundary above 15.2 GB. Any lever that does not shrink that transient
+does not shrink the peak.
+
+**~1 GB of VRAM is held by the desktop.** Sixteen processes (browsers, Spotify, VS Code,
+Steam) render on the discrete GPU, costing 1.38-1.52 GB and *drifting* by ~0.15 GB between
+runs. That is larger than the remaining deficit, and it is invisible to torch — one more
+reason the driver's Shared Usage counter is the gate.
 
 ## 3b. Schedule — the brief's estimate was 3-4x optimistic
 

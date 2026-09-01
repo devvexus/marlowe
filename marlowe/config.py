@@ -186,6 +186,13 @@ class HealConfig:
     grad_accum: int = 16
     micro_batch: int = 1
     gradient_checkpointing: bool = True
+    #: Checkpoint the mixer and the FFN separately rather than the whole decoder layer.
+    #:
+    #: Whole-layer checkpointing makes the backward of one layer recompute mixer and FFN
+    #: together, and that single transient is what sets the peak: measured 13.1 GB steady
+    #: against an 18.2 GB peak, with no phase boundary above 15.2 GB. Halving the largest
+    #: recompute costs one extra boundary per layer and buys ~0.75 GB.
+    sublayer_checkpointing: bool = True
 
     # -- memory/quality trade-offs, ordered by quality cost ------------------
     #: Quantise lm_head to NF4. bitsandbytes skips it by default for a reason: the loss here

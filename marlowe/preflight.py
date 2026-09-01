@@ -153,7 +153,9 @@ def require_disk_for_checkpoint(
 # ---------------------------------------------------------------------------
 
 
-def assert_no_bf16_resident(model: Any, *, allow_params: int = 200_000_000) -> None:
+def assert_no_bf16_resident(
+    model: Any, *, allow_params: int = 200_000_000, allow_fp32_gb: float = 1.0
+) -> None:
     """Assert no stage is holding full-precision weights. (Section 1, rule 1)
 
     A 4-bit load leaves the big matmul weights as ``uint8`` blocks; what stays in bf16/fp32
@@ -163,36 +165,109 @@ def assert_no_bf16_resident(model: Any, *, allow_params: int = 200_000_000) -> N
 
     Raises if a large tensor came back at 16 or 32 bits, which means the quantisation config
     was ignored and the run is about to OOM or silently thrash to disk.
+
+    **A parameter count is not a footprint.** This check counted params and compared them
+    against a param ceiling while its own name asserted a dtype it never read. It therefore
+    passed identically -- ``resident_m=2691.2`` -- whether ``lm_head`` was bf16 (2.54 GB) or
+    fp32 (5.09 GB), and the fp32 case was what put the 22B student 8 GB over a 17.17 GB card
+    for four sessions. ``allow_fp32_gb`` is the second gate: bytes actually held at fp32,
+    which is the quantity that decides whether the run fits.
     """
     import torch
 
     wide = (torch.bfloat16, torch.float16, torch.float32, torch.float64)
     resident = 0
-    worst: list[tuple[str, int, str]] = []
+    resident_bytes = 0
+    fp32_bytes = 0
+    worst: list[tuple[str, int, int, str]] = []
     for name, p in model.named_parameters():
         if p.dtype in wide:
+            nbytes = p.numel() * p.element_size()
             resident += p.numel()
-            worst.append((name, p.numel(), str(p.dtype)))
+            resident_bytes += nbytes
+            if p.dtype in (torch.float32, torch.float64) and p.is_cuda:
+                fp32_bytes += nbytes
+            worst.append((name, p.numel(), nbytes, str(p.dtype)))
+
+    def offenders(key: Any) -> str:
+        worst.sort(key=key)
+        return "\n".join(
+            f"    {n}  {c / 1e6:.1f}M  {b / GB:.2f} GB  {d}" for n, c, b, d in worst[:8]
+        )
 
     if resident > allow_params:
-        worst.sort(key=lambda t: -t[1])
-        top = "\n".join(f"    {n}  {c / 1e6:.1f}M  {d}" for n, c, d in worst[:8])
         raise ResourceError(
             f"bf16/fp32 residency violation: {resident / 1e9:.2f}B parameters are held at "
             f"full precision (ceiling {allow_params / 1e6:.0f}M). No stage in this pipeline "
             f"may hold bf16 weights resident -- the full model is "
             f"{BF16_27B_BYTES / GB:.1f} GB and neither VRAM (16 GB) nor RAM (32 GB) can "
-            f"take it.\n  largest offenders:\n{top}\n"
+            f"take it.\n  largest offenders:\n{offenders(lambda t: -t[1])}\n"
             f"  Check that the 4-bit quantization config was actually applied "
             f"(bitsandbytes installed, load_in_4bit=True honoured by this transformers "
             f"version)."
+        )
+    if fp32_bytes > allow_fp32_gb * GB:
+        raise ResourceError(
+            f"fp32 residency violation: {fp32_bytes / GB:.2f} GB of resident parameters are "
+            f"fp32 (ceiling {allow_fp32_gb:.2f} GB), which is twice what the memory plan "
+            f"budgets for them.\n  largest offenders:\n{offenders(lambda t: -t[2])}\n"
+            f"  prepare_model_for_kbit_training upcasts every non-quantised parameter to "
+            f"fp32. heal.restore_head_precision puts lm_head back to bf16; if this fires, "
+            f"it did not run or something else large was upcast."
         )
     logutil.event(
         log,
         "bf16 residency ok",
         resident_m=round(resident / 1e6, 1),
         ceiling_m=round(allow_params / 1e6, 1),
+        resident_gb=round(resident_bytes / GB, 2),
+        fp32_gb=round(fp32_bytes / GB, 2),
     )
+
+
+def assert_bf16_stream(model: Any, *, n_tokens: int = 8) -> Any:
+    """Assert the residual stream is bf16, by running one short forward and reading it.
+
+    This checks a different thing from :func:`assert_no_bf16_resident`, and the difference
+    is the most expensive lesson in this project so far. That function measures *parameter*
+    dtype; this one measures the dtype of what actually flows.
+
+    They came apart badly. ``prepare_model_for_kbit_training`` upcast the norms to fp32 --
+    0.01 GB of parameters, which the byte-level parameter check waved through as trivially
+    small. But an fp32 norm emits fp32, the residual add promotes, and the stream ran fp32
+    for all 52 layers: 1.14 GB of saved checkpoint inputs instead of 0.55, and a doubled
+    backward recompute, which together were most of what put the 22B over a 17.17 GB card.
+
+    A parameter check cannot see that, at any threshold, because the cost is not in the
+    parameters. Reading the stream catches the whole class -- any future upcast, from any
+    source -- for one 8-token forward.
+    """
+    import torch
+
+    from marlowe.score import find_decoder  # local: score imports this module
+
+    dec = find_decoder(model)
+    device = next(p.device for p in model.parameters() if p.is_cuda)
+    ids = torch.randint(0, 1000, (1, n_tokens), device=device)
+    with torch.no_grad():
+        out = dec(input_ids=ids, use_cache=False)
+    hidden = getattr(out, "last_hidden_state", None)
+    if hidden is None:
+        hidden = out[0]
+    dtype = hidden.dtype
+    if dtype is not torch.bfloat16:
+        raise ResourceError(
+            f"residual stream is {dtype}, not bfloat16. Every saved activation and the "
+            f"backward recompute are twice the size they should be -- measured at +0.6 GB "
+            f"of saved checkpoint inputs and roughly +1.5 GB of backward peak on the 22B.\n"
+            f"  Something upcast the non-quantised parameters. peft's "
+            f"prepare_model_for_kbit_training does this by design; "
+            f"heal.prepare_for_kbit_training is the replacement that does not.\n"
+            f"  Note this is NOT visible as a large fp32 parameter count: 0.01 GB of fp32 "
+            f"norms is sufficient to promote the whole stream."
+        )
+    logutil.event(log, "stream dtype ok", dtype=str(dtype))
+    return dtype
 
 
 # ---------------------------------------------------------------------------
