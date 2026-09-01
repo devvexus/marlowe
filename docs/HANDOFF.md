@@ -238,7 +238,8 @@ baseline, which comes from a hosted endpoint.
 | transformers 5.1 lacks `qwen3_5` | environment | Stages 3/5/6 would die in minute one of an 8-hour job |
 | `getattr(out, "x", None) or out[0]` | `teacher.py` | `or` calls `bool()` on a multi-element tensor → raises 6 h into the cache run |
 | torch accounting instead of device memory | `probe_training`, then `estimate_peak_gb` | understated the footprint by ~1 GB; would have selected a config that OOMs at hour 30 **with its own record certifying it fit** |
-| the *fix* for that then over-reported | `probe_training` | `total - free` includes the allocator's reserved pool, which under `expandable_segments` grows opportunistically and is never returned. Every candidate measured **17.17 GB, headroom 0.00** — identical, saturated, not a measurement. The search would have rejected everything. Correct metric: baseline resident (CUDA context, measured before load) **+** `max_memory_reserved()` |
+| the *fix* for that then over-reported | `probe_training` | `total - free` includes the allocator's reserved pool, which under `expandable_segments` grows opportunistically and is never returned. Every candidate measured **17.17 GB, headroom 0.00** — identical, saturated, not a measurement |
+| the *third* version double-counted the model | `probe_training` + base caching, same commit | measuring the baseline per-probe was correct until the search began caching the base across candidates. With a model already resident, `total - free` includes it and `max_memory_reserved()` includes it too — summed, the model is counted twice. Reported **41.16 GB on a 17.17 GB card**, headroom −23.99. Two individually-correct changes, made together. Fixed by measuring the CUDA context **once, globally**, while torch holds nothing |
 | `lora_rank` not persisted in the memory plan | `save_memory_plan` | a candidate override the plan didn't carry. Had `fp16-head-1024-rank16` been selected, Stage 6 would have restored `seq_len` and head precision correctly and **silently reverted the rank that made it fit** — OOMing on a plan whose own record said it had been measured as fitting. The cleanest instance of the pattern: self-certifying wrong answer. Field list is now derived from the dataclass |
 | quants list narrower than the gate | `configs/marlowe-18b.yaml` | gate would fail after a week on *missing data*, looking like a quality failure |
 | surgery not idempotent | `write_checkpoint` | collided with its own prior output after a full streaming pass |
@@ -247,11 +248,20 @@ baseline, which comes from a hosted endpoint.
 None OOMs. The model generates fluent text, the search reports a number, the config parses.
 That is the failure shape this codebase produces, and it is what to look for.
 
-Two of them are worth studying together: the memory metric was wrong, then its *fix* was
-wrong in the opposite direction, and the second version failed more loudly only by luck —
-saturating at exactly `total` made it obvious, where a subtler over-report would have looked
-like a plausible number. **When you correct a measurement, check the corrected one against a
-case whose answer you already know.**
+The memory metric is worth studying on its own: it was wrong **three times**, in three
+different ways, and each fix was a correct response to the previous failure.
+
+1. torch accounting — under-reported by ~1 GB (missing context and fragmentation)
+2. `total - free` — saturated at exactly `total`, so every candidate looked identical
+3. context + `max_memory_reserved()`, measured per probe — correct until the base model
+   started being cached across candidates, at which point it double-counted the model and
+   reported 41 GB on a 17 GB card
+
+**Each failure was loud only by luck.** 0.00 headroom on every candidate and −23.99 GB are
+both unmistakable; a subtler error in either direction would have been believed. Two lessons:
+**check a corrected measurement against a case whose answer you already know** (a 17 GB card
+cannot hold 41 GB), and **a change that is correct alone can break another change made in the
+same commit** — the base cache and the per-probe baseline were each right in isolation.
 
 Corollaries that earned their place:
 

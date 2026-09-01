@@ -68,6 +68,32 @@ log = logutil.get("heal")
 #: see :func:`probe_training` for why that distinction is load-bearing.
 FIT_MARGIN_GB = 1.0
 
+#: Bytes resident on the device before this process loads anything: CUDA context, driver
+#: allocations, any other process. Measured ONCE, on first use, while torch holds nothing.
+#:
+#: Measuring it per probe was wrong as soon as the search began caching the base model
+#: across candidates: with a model already resident, (total - free) includes it, and
+#: max_memory_reserved() includes it too, so the two were summed and the model counted twice.
+#: That reported 41 GB on a 17 GB card. Two individually-correct changes, made together.
+_CUDA_CONTEXT_BYTES: int | None = None
+
+
+def cuda_context_bytes() -> int:
+    """Device bytes not attributable to this process's allocator. Cached after first call."""
+    global _CUDA_CONTEXT_BYTES
+    import torch
+
+    if _CUDA_CONTEXT_BYTES is None:
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info(0)
+        # Anything torch has already reserved is ours, not context; subtract it back out so
+        # this is measurable even when called late.
+        _CUDA_CONTEXT_BYTES = max(0, (total - free) - torch.cuda.memory_reserved(0))
+        logutil.event(
+            log, "cuda context measured", gb=round(_CUDA_CONTEXT_BYTES / 1e9, 2)
+        )
+    return _CUDA_CONTEXT_BYTES
+
 
 # ---------------------------------------------------------------------------
 # loss
@@ -1036,8 +1062,7 @@ def probe_training(
     # Everything already on the device before this model loads: the CUDA context, the
     # driver's own allocations, any other process. Measured once, with torch holding
     # nothing, because it cannot be recovered from torch's own counters.
-    free0, total0 = torch.cuda.mem_get_info(0)
-    baseline_used = total0 - free0
+    baseline_used = cuda_context_bytes()
 
     model = base if base is not None else load_student(
         model_path, cfg, max_gpu_gb=max_gpu_gb
@@ -1074,8 +1099,9 @@ def probe_training(
         if i >= 2:
             timings.append(time.time() - t0)
 
-    # The footprint that actually constrains the run: what was already resident plus the
-    # allocator's high-water reservation.
+    # The footprint that actually constrains the run: the CUDA context plus the allocator's
+    # high-water reservation. The context is measured once and globally (see
+    # cuda_context_bytes) precisely so a cached base model is not counted twice.
     #
     # Neither obvious counter works alone. max_memory_allocated() counts live tensor bytes
     # and misses the CUDA context and fragmentation -- it under-reports by ~1 GB. And
