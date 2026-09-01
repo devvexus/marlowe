@@ -809,15 +809,19 @@ class TestMemoryPlanSearch:
             cfg = cand.apply(base)
             assert cfg.loss_chunk == base.loss_chunk
 
-    def test_only_the_designated_candidate_shortens_the_sequence(self) -> None:
-        """Sequence length is a real cost, so exactly one candidate spends it."""
+    def test_shortened_candidates_descend_in_length(self) -> None:
+        """Sequence length is a real cost, so candidates spend it monotonically."""
         from marlowe.config import HealConfig
         from marlowe.heal import MEMORY_CANDIDATES
 
         base = HealConfig()
-        shortened = [c for c in MEMORY_CANDIDATES if c.apply(base).seq_len != base.seq_len]
-        assert [c.name for c in shortened] == ["fp16-head-1024"]
-        assert shortened[0].apply(base).seq_len == 1024
+        lengths = [
+            c.apply(base).seq_len for c in MEMORY_CANDIDATES if not c.quantize_lm_head
+        ]
+        assert lengths == sorted(lengths, reverse=True), (
+            "the fp16 ladder must give up context gradually, never jump back up"
+        )
+        assert lengths == [2048, 1536, 1024]
 
     def test_shortening_the_sequence_is_preferred_over_quantising_the_head(self) -> None:
         """Halving context is a real cost; corrupting the loss target is a worse one."""
@@ -855,7 +859,9 @@ class TestMemoryPlanSearch:
         assert res.chosen is not None
         assert res.chosen.name == "nf4-head-adamw32"
         # both fp16 candidates tried and rejected, then the first NF4 one fits
-        assert calls == [False, False, True], "must not probe further once one fits"
+        # every fp16 candidate tried and rejected, then the first NF4 one fits
+        n_fp16 = sum(1 for c in heal.MEMORY_CANDIDATES if not c.quantize_lm_head)
+        assert calls == [False] * n_fp16 + [True], "must not probe further once one fits"
 
     def test_search_prefers_fp16_head_when_it_fits(self, monkeypatch) -> None:
         from marlowe import heal
@@ -1157,3 +1163,136 @@ class TestStage0IsAControlCurve:
         doc = inspect.getdoc(REGISTRY["stage0-bitwidth"].fn) or ""
         assert "confounded" in doc
         assert "NOT a go/no-go" in doc
+
+
+class TestLongContextAnnealRefusal:
+    """A knob documented at 16384 that needs ~23 GB on a 16 GB card must refuse, loudly.
+
+    Refusing is the point. Silently substituting a length that fits would hand back a
+    shortened anneal nobody asked for, and the operator would not know the long-range
+    exercise they were relying on had been reduced.
+    """
+
+    def test_disabled_anneal_is_never_validated(self) -> None:
+        from marlowe.config import HealConfig
+
+        HealConfig(long_context_tokens=0, long_context_seq_len=16384).validate_long_context(
+            vram_gb=17.17
+        )
+
+    def test_16384_is_refused_on_a_16gb_card(self) -> None:
+        from marlowe.config import HealConfig
+
+        cfg = HealConfig(long_context_tokens=5_000_000, long_context_seq_len=16384)
+        with pytest.raises(ValueError) as exc:
+            cfg.validate_long_context(vram_gb=17.17)
+        msg = str(exc.value)
+        assert "UNAVAILABLE" in msg
+        assert "not being silently shortened" in msg
+
+    def test_message_shows_the_arithmetic(self) -> None:
+        from marlowe.config import HealConfig
+
+        cfg = HealConfig(long_context_tokens=1, long_context_seq_len=16384)
+        with pytest.raises(ValueError) as exc:
+            cfg.validate_long_context(vram_gb=17.17)
+        msg = str(exc.value)
+        assert "weights + optimizer" in msg
+        assert "activations" in msg
+        assert "does not shrink with sequence length" in msg
+        assert "gradient accumulation does not reduce it" in msg
+
+    def test_message_names_a_ceiling_that_actually_fits(self) -> None:
+        """The suggested fallback must itself clear the margin, or it is worse than useless."""
+        import re
+
+        from marlowe.config import HealConfig, estimate_peak_gb
+
+        cfg = HealConfig(long_context_tokens=1, long_context_seq_len=16384)
+        with pytest.raises(ValueError) as exc:
+            cfg.validate_long_context(vram_gb=17.17)
+        m = re.search(r"at most ~(\d+)", str(exc.value))
+        assert m, "no ceiling suggested"
+        ceiling = int(m.group(1))
+        assert estimate_peak_gb(ceiling, cfg) <= 17.17 - 1.0
+
+    def test_a_fitting_anneal_is_allowed(self) -> None:
+        from marlowe.config import HealConfig
+
+        HealConfig(long_context_tokens=1, long_context_seq_len=512).validate_long_context(
+            vram_gb=17.17
+        )
+
+    def test_estimator_includes_the_cuda_context(self) -> None:
+        """The same torch-vs-device gap that made the probe wrong would make this wrong."""
+        from marlowe.config import _EST_CUDA_CONTEXT_GB, HealConfig, estimate_peak_gb
+
+        assert _EST_CUDA_CONTEXT_GB > 0
+        cfg = HealConfig()
+        # Calibrated against the measured 22B peak: 16.64 GB device-level at seq_len 2048.
+        assert abs(estimate_peak_gb(2048, cfg) - 16.64) < 0.35
+
+    def test_activation_memory_is_linear_in_sequence_length(self) -> None:
+        from marlowe.config import _activation_gb
+
+        a1, a2 = _activation_gb(1024), _activation_gb(2048)
+        assert abs((a2 - 0.25) / (a1 - 0.25) - 2.0) < 0.01
+
+    def test_shipped_configs_do_not_enable_an_impossible_anneal(self) -> None:
+        from marlowe.config import load_run_config
+
+        for name in ("marlowe-22b", "marlowe-18b"):
+            cfg = load_run_config(f"configs/{name}.yaml", vram_gb=17.17)
+            assert cfg.heal.long_context_tokens == 0
+
+    def test_load_refuses_an_impossible_anneal(self, tmp_path) -> None:
+        from marlowe.config import load_run_config
+
+        p = tmp_path / "bad.yaml"
+        p.write_text(
+            "name: x\nparent: y\nn_cuts: 1\n"
+            "heal:\n  long_context_tokens: 5000000\n  long_context_seq_len: 16384\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="UNAVAILABLE"):
+            load_run_config(p, vram_gb=17.17)
+
+
+class TestSequenceLengthLadder:
+    def test_1536_sits_between_2048_and_1024(self) -> None:
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        names = [c.name for c in MEMORY_CANDIDATES]
+        assert names.index("fp16-head-2048") < names.index("fp16-head-1536")
+        assert names.index("fp16-head-1536") < names.index("fp16-head-1024")
+
+    def test_all_fp16_candidates_precede_every_nf4_one(self) -> None:
+        """Shortening context is a real cost; corrupting the loss target is a worse one."""
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        first_nf4 = next(
+            i for i, c in enumerate(MEMORY_CANDIDATES) if c.quantize_lm_head
+        )
+        assert all(not c.quantize_lm_head for c in MEMORY_CANDIDATES[:first_nf4])
+
+    def test_probe_all_does_not_short_circuit(self, monkeypatch) -> None:
+        """Choosing short-circuits; reporting must not, or the table has holes."""
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        seen: list[int] = []
+
+        def fake(path, cfg, **k):
+            seen.append(cfg.seq_len)
+            return heal.ProbeResult(
+                tok_s=100.0, peak_vram_gb=10.0, total_vram_gb=17.17, step_s=1.0,
+                seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+            )
+
+        monkeypatch.setattr(heal, "probe_training", fake)
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+
+        res = heal.search_memory_plan("x", HealConfig(), probe_all=True)
+        assert len(seen) == len(heal.MEMORY_CANDIDATES)
+        assert res.chosen is not None and res.chosen.name == "fp16-head-2048"
+        assert len(res.attempts) == len(heal.MEMORY_CANDIDATES)

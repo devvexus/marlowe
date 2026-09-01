@@ -114,6 +114,56 @@ class TeacherConfig:
     shard_tokens: int = 5_000_000  # one output file per shard, for resumability
 
 
+#: Shape of the shipped 22B student, for memory estimates made before a model is loaded.
+_EST_LAYERS = 52
+_EST_HIDDEN = 5120
+_EST_VOCAB = 248320
+#: Weights + optimizer at fp16 head, embeddings on CPU, AdamW8bit. Constant in seq_len.
+_EST_FIXED_GB = 13.8
+#: CUDA context and driver overhead. Not torch-visible, but it occupies the device and is
+#: therefore part of what OOMs -- the same distinction that made probe_training's original
+#: torch-accounting measurement wrong. Without this term the estimate under-predicts the
+#: device-level peak by roughly a gigabyte and would recommend a fallback length that does
+#: not actually fit. Calibrated against the measured 22B peak.
+_EST_CUDA_CONTEXT_GB = 0.8
+
+
+def _activation_gb(seq_len: int, layers: int = _EST_LAYERS, hidden: int = _EST_HIDDEN) -> float:
+    """Activation memory with gradient checkpointing at micro_batch=1.
+
+    Linear in sequence length. Gradient accumulation does not reduce it: accumulation lowers
+    optimizer-step frequency, not the per-forward peak.
+    """
+    return layers * seq_len * hidden * 2 / 1e9 + 0.25
+
+
+def estimate_peak_gb(seq_len: int, cfg: HealConfig, dims: Any = None) -> float:
+    layers = getattr(dims, "n_layers", _EST_LAYERS) if dims else _EST_LAYERS
+    hidden = getattr(dims, "hidden_size", _EST_HIDDEN) if dims else _EST_HIDDEN
+    loss = cfg.loss_chunk * _EST_VOCAB * 10 / 1e9
+    return (
+        _EST_FIXED_GB
+        + _EST_CUDA_CONTEXT_GB
+        + _activation_gb(seq_len, layers, hidden)
+        + loss
+    )
+
+
+def _max_anneal_seq_len(vram_gb: float, cfg: HealConfig) -> int:
+    """Largest sequence length whose estimated peak leaves 1 GB spare."""
+    lo, hi = 256, 32768
+    best = 0
+    while lo <= hi:
+        mid = ((lo + hi) // 2 // 256) * 256
+        if mid <= 0:
+            break
+        if estimate_peak_gb(mid, cfg) <= vram_gb - 1.0:
+            best, lo = mid, mid + 256
+        else:
+            hi = mid - 256
+    return best
+
+
 @dataclass
 class HealConfig:
     """Stage 6. QLoRA against the cached top-K distribution, not next-token CE."""
@@ -158,9 +208,43 @@ class HealConfig:
     checkpoint_every_tokens: int = 10_000_000
     #: Stop when KL improvement over a checkpoint window falls below this. Banks the compute.
     kl_plateau_delta: float = 0.002
-    #: Optional final anneal at long context, mitigating the 2K-healing risk (section 7).
+    #: Optional final anneal at long context, mitigating the short-sequence healing risk.
+    #:
+    #: ``long_context_seq_len`` is NOT achievable on a 16 GB card at any value close to the
+    #: 16384 this project's brief suggests -- activation memory is linear in sequence length
+    #: and the weights do not shrink. Enabling it is validated at config load and refused with
+    #: the arithmetic rather than quietly reduced to something that fits; a shortened anneal
+    #: nobody asked for is worse than a clear "unavailable".
     long_context_tokens: int = 0
     long_context_seq_len: int = 16384
+
+    def validate_long_context(self, *, vram_gb: float, dims: Any = None) -> None:
+        """Refuse an anneal that cannot run, showing why. Called from :func:`load_run_config`.
+
+        The estimate uses the shipped 22B shape unless ``dims`` says otherwise. It is an
+        estimate, deliberately: the point is to reject 16384 on a 16 GB card, and no
+        reasonable error bar changes that verdict.
+        """
+        if self.long_context_tokens <= 0:
+            return
+        est = estimate_peak_gb(self.long_context_seq_len, self, dims=dims)
+        if est <= vram_gb - 1.0:
+            return
+        raise ValueError(
+            f"heal.long_context_tokens is set, but a long-context anneal at seq_len="
+            f"{self.long_context_seq_len} needs roughly {est:.1f} GB and the device has "
+            f"{vram_gb:.1f} GB.\n\n"
+            f"  weights + optimizer   ~{est - _activation_gb(self.long_context_seq_len):.1f} GB "
+            f"(constant; does not shrink with sequence length)\n"
+            f"  activations           ~{_activation_gb(self.long_context_seq_len):.1f} GB "
+            f"(linear in seq_len at micro_batch=1; gradient accumulation does not reduce it)\n\n"
+            f"  The anneal is UNAVAILABLE at this length on this hardware. It is not being "
+            f"silently shortened.\n"
+            f"  Options: set long_context_tokens: 0 to disable it, or lower "
+            f"long_context_seq_len to at most ~{_max_anneal_seq_len(vram_gb, self)} and accept "
+            f"the reduced long-range exercise. CPU-offloaded activation checkpointing would "
+            f"raise that ceiling and is not implemented."
+        )
 
 
 @dataclass
@@ -282,7 +366,7 @@ _NESTED: dict[str, type] = {
 }
 
 
-def load_run_config(path: str | Path) -> RunConfig:
+def load_run_config(path: str | Path, *, vram_gb: float | None = None) -> RunConfig:
     with Path(path).open(encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     if not isinstance(raw, dict):
@@ -300,4 +384,17 @@ def load_run_config(path: str | Path) -> RunConfig:
             kwargs[key] = [_build(QuantConfig, v) for v in (val or [])]
         else:
             kwargs[key] = val
-    return RunConfig(**kwargs)
+    cfg = RunConfig(**kwargs)
+
+    # Refuse an unrunnable long-context anneal here, not three days later. Deliberately at
+    # load time and deliberately fatal: silently substituting a length that fits would give
+    # back a shortened anneal nobody asked for, which is worse than knowing it is
+    # unavailable.
+    if vram_gb is None:
+        from marlowe import preflight
+
+        probed = preflight.probe().vram_total / 1e9
+        vram_gb = probed if probed > 0 else None
+    if vram_gb:
+        cfg.heal.validate_long_context(vram_gb=vram_gb)
+    return cfg

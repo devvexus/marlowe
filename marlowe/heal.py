@@ -701,6 +701,13 @@ MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
         rationale="fp16 lm_head: no quantisation noise in the logits the loss matches",
     ),
     MemoryCandidate(
+        name="fp16-head-1536",
+        quantize_lm_head=False,
+        optimizer_8bit=True,
+        seq_len=1536,
+        rationale="50% more long-range state exercise than 1024, at no other cost",
+    ),
+    MemoryCandidate(
         name="fp16-head-1024",
         quantize_lm_head=False,
         optimizer_8bit=True,
@@ -751,6 +758,7 @@ def search_memory_plan(
     n_steps: int = 8,
     max_gpu_gb: float | None = None,
     candidates: tuple[MemoryCandidate, ...] = MEMORY_CANDIDATES,
+    probe_all: bool = False,
 ) -> SearchResult:
     """Measure candidates in quality order and take the first that fits with margin.
 
@@ -759,6 +767,8 @@ def search_memory_plan(
     """
     result = SearchResult(chosen=None, config=None, probe=None)
     for cand in candidates:
+        if result.chosen is not None and not probe_all:
+            break
         trial = cand.apply(cfg)
         try:
             probe = probe_training(
@@ -782,7 +792,7 @@ def search_memory_plan(
             )
         )
         _free_cuda()
-        if fits:
+        if fits and result.chosen is None:
             result.chosen, result.config, result.probe = cand, trial, probe
             logutil.event(
                 log,
@@ -791,7 +801,8 @@ def search_memory_plan(
                 headroom_gb=round(headroom, 2),
                 tok_s=round(probe.tok_s, 1),
             )
-            return result
+            if not probe_all:
+                return result
     return result
 
 
