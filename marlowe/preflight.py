@@ -229,7 +229,11 @@ def disk_budget(rungs: list[tuple[str, float, int]]) -> list[BudgetItem]:
     # Rung 0: the original parent, plus the artefacts every later comparison depends on.
     items += [
         BudgetItem("parent", "bf16 safetensors", int(parent_b * 1e9 * 2), True),
-        BudgetItem("parent", "bf16 GGUF (KL reference source)", int(parent_b * 1e9 * 2), False),
+        BudgetItem("parent", "bf16 GGUF (quantisation source)", int(parent_b * 1e9 * 2), False),
+        # The KL reference is built from Q8_0, not bf16: 56 GB against 32 GB of RAM would
+        # page from disk for the whole pass, and Q8_0's own KL to bf16 is far below the
+        # deltas being measured.
+        BudgetItem("parent", "q8_0 GGUF (KL reference source)", int(parent_b * 1e9 * 1.06), False),
         BudgetItem("parent", "reference.kld", 2 * GB, True),
         BudgetItem("parent", "stage-0 quant candidates (8 x ~10 GB)", 80 * GB, False),
     ]

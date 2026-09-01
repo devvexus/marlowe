@@ -72,6 +72,46 @@ class StageContext:
         self.manifest.notes.append(text)
         log.info("%s", text)
 
+    # -- disk policy --------------------------------------------------------
+
+    @property
+    def keep_intermediates(self) -> bool:
+        """Default False: delete large regenerable artefacts as each stage finishes.
+
+        The whole ladder is ~491 GB retained against ~217 GB cleaned, and the safe path
+        should not require a flag. ``--keep-intermediates`` opts back in.
+        """
+        return bool(self.extra.get("keep_intermediates", False))
+
+    def drop_temp(self, path: str | Path, *, why: str) -> bool:
+        """Delete a regenerable artefact unless --keep-intermediates. Returns True if freed.
+
+        Never call this on anything a later stage needs: the merged rung-1 checkpoint is
+        rung 2's parent, and the KL reference is what every checkpoint is compared against.
+        """
+        import shutil
+
+        p = Path(path)
+        if not p.exists():
+            return False
+        gb = (
+            sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+            if p.is_dir()
+            else p.stat().st_size
+        ) / 1e9
+        if self.keep_intermediates:
+            logutil.event(log, "keeping intermediate", path=str(p), gb=round(gb, 2), why=why)
+            return False
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+        logutil.event(log, "freed intermediate", path=p.name, gb=round(gb, 2), why=why)
+        self.manifest.notes.append(
+            f"deleted {p.name} ({gb:.1f} GB) -- {why}. Pass --keep-intermediates to retain."
+        )
+        return True
+
 
 @dataclass
 class Stage:

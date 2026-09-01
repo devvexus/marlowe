@@ -387,3 +387,243 @@ class TestBf16BaselineIsFatal:
             ["run", "stage2-baselines", "--config", "configs/marlowe-22b.yaml"]
         )
         assert args.allow_missing_bf16_baseline is None
+
+
+class TestGpuBackendGate:
+    """Generation-bound stages must refuse a CPU-only llama.cpp, with the cost stated.
+
+    The repetition harness is ~410K tokens per quant variant. CPU decode on a ~10 GB model is
+    memory-bandwidth bound, so this is a 10x wall-clock difference, not a nuisance.
+    """
+
+    def test_projection_matches_the_measured_rates(self) -> None:
+        from marlowe.eval.kl import CPU_DECODE_TOK_S, GPU_DECODE_TOK_S, generation_hours
+
+        cpu_h = generation_hours(200, 2048, CPU_DECODE_TOK_S)
+        gpu_h = generation_hours(200, 2048, GPU_DECODE_TOK_S)
+        assert 27 < cpu_h < 30, f"one variant on CPU should be ~28 h, got {cpu_h:.1f}"
+        assert 2.5 < gpu_h < 3.2, f"one variant on GPU should be under 3 h, got {gpu_h:.1f}"
+
+    def test_message_names_both_wall_clocks_and_the_fix(self) -> None:
+        from marlowe.eval.kl import gpu_requirement_message
+
+        msg = gpu_requirement_message(
+            "stage0-bitwidth", n_variants=4, n_completions=200, max_tokens=2048
+        )
+        assert "CPU decode" in msg and "GPU decode" in msg
+        assert "days" in msg
+        assert "--allow-cpu-llamacpp" in msg
+        assert "cuda" in msg.lower()
+
+    def test_raises_when_cpu_only(self, monkeypatch) -> None:
+        from marlowe.eval import kl as kleval
+
+        monkeypatch.setattr(
+            kleval, "detect_backend", lambda: kleval.BackendInfo(devices=(), binary="x")
+        )
+        with pytest.raises(kleval.LlamaCppCpuOnly, match="CPU-only"):
+            kleval.require_gpu_backend("stage0-bitwidth")
+
+    def test_escape_hatch_allows_cpu(self, monkeypatch) -> None:
+        from marlowe.eval import kl as kleval
+
+        monkeypatch.setattr(
+            kleval, "detect_backend", lambda: kleval.BackendInfo(devices=(), binary="x")
+        )
+        assert not kleval.require_gpu_backend("stage0-bitwidth", allow_cpu=True).has_gpu
+
+    def test_passes_with_a_gpu(self, monkeypatch) -> None:
+        from marlowe.eval import kl as kleval
+
+        monkeypatch.setattr(
+            kleval,
+            "detect_backend",
+            lambda: kleval.BackendInfo(devices=("CUDA0: RTX 4080 SUPER",), binary="x"),
+        )
+        info = kleval.require_gpu_backend("stage0-bitwidth")
+        assert info.has_gpu
+        assert info.decode_tok_s == kleval.GPU_DECODE_TOK_S
+
+    def test_no_devices_means_no_gpu(self) -> None:
+        from marlowe.eval.kl import BackendInfo
+
+        assert not BackendInfo(devices=(), binary="x").has_gpu
+
+    @pytest.mark.parametrize("stage", ["stage0-bitwidth", "stage2-baselines", "stage7-ship"])
+    def test_the_three_decode_bound_stages_gate_on_it(self, stage: str) -> None:
+        import inspect
+
+        import marlowe.stages  # noqa: F401
+        from marlowe.pipeline import REGISTRY
+
+        src = inspect.getsource(REGISTRY[stage].fn)
+        assert "require_gpu_backend" in src, f"{stage} does not check the llama.cpp backend"
+        assert "allow_cpu_llamacpp" in src
+
+    def test_gpu_builds_are_preferred_on_the_search_path(self) -> None:
+        from marlowe.eval.kl import _LOCAL_BIN_DIRS
+
+        assert "llama-cuda" in str(_LOCAL_BIN_DIRS[0]), "the CUDA build must be tried first"
+
+
+class TestQ8ReferenceDefault:
+    """The KL reference is built from Q8_0, not bf16.
+
+    bf16 is 56 GB against 32 GB of RAM, so llama.cpp mmaps and pages from disk for the whole
+    pass. Q8_0 is ~28.6 GB and near-lossless, and since every number in the project is a
+    relative comparison against the same reference file, the substitution costs nothing.
+    """
+
+    def test_default_is_q8_0(self) -> None:
+        from marlowe.eval.kl import REFERENCE_OUTTYPE
+
+        assert REFERENCE_OUTTYPE == "q8_0"
+
+    def test_stage2_uses_the_constant_and_allows_override(self) -> None:
+        import inspect
+
+        from marlowe.stages import stage2_baselines
+
+        src = inspect.getsource(stage2_baselines)
+        assert "REFERENCE_OUTTYPE" in src
+        assert "reference_outtype" in src, "must be overridable for a machine with the RAM"
+
+    def test_cli_exposes_the_override(self) -> None:
+        from marlowe.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["run", "stage2-baselines", "--config", "configs/marlowe-22b.yaml",
+             "--reference-outtype", "bf16"]
+        )
+        assert args.reference_outtype == "bf16"
+
+    def test_override_defaults_to_unset(self) -> None:
+        from marlowe.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["run", "stage2-baselines", "--config", "configs/marlowe-22b.yaml"]
+        )
+        assert args.reference_outtype is None
+
+    def test_q8_0_is_a_converter_outtype(self) -> None:
+        """It must be producible directly by convert_hf_to_gguf, not via a second step."""
+        from marlowe.quantize import find_converter
+
+        src = find_converter().read_text(encoding="utf-8", errors="replace")
+        assert '"q8_0"' in src
+
+    def test_bf16_repetition_baseline_is_unaffected(self) -> None:
+        """It comes from the hosted endpoint, not from any local GGUF."""
+        import inspect
+
+        from marlowe.stages import _require_bf16_backend
+
+        assert "OpenAICompatBackend" in inspect.getsource(_require_bf16_backend)
+
+
+class TestDeleteTempsDefault:
+    """519 GB retained does not fit in ~350 GB free, so the safe path must not need a flag."""
+
+    def _ctx(self, tmp_path, **extra):
+        from marlowe.config import load_run_config
+        from marlowe.manifest import Manifest
+        from marlowe.pipeline import StageContext
+
+        return StageContext(
+            name="t",
+            cfg=load_run_config("configs/marlowe-22b.yaml"),
+            run_dir=tmp_path,
+            manifest=Manifest(stage="t"),
+            extra=extra,
+        )
+
+    def test_default_deletes(self, tmp_path) -> None:
+        ctx = self._ctx(tmp_path)
+        assert ctx.keep_intermediates is False
+        f = tmp_path / "big.gguf"
+        f.write_bytes(b"x" * 1024)
+        assert ctx.drop_temp(f, why="test") is True
+        assert not f.exists()
+        assert any("deleted big.gguf" in n for n in ctx.manifest.notes)
+
+    def test_flag_retains(self, tmp_path) -> None:
+        ctx = self._ctx(tmp_path, keep_intermediates=True)
+        f = tmp_path / "big.gguf"
+        f.write_bytes(b"x" * 1024)
+        assert ctx.drop_temp(f, why="test") is False
+        assert f.exists()
+
+    def test_handles_directories(self, tmp_path) -> None:
+        ctx = self._ctx(tmp_path)
+        d = tmp_path / "merged"
+        d.mkdir()
+        (d / "a.safetensors").write_bytes(b"y" * 512)
+        assert ctx.drop_temp(d, why="test") is True
+        assert not d.exists()
+
+    def test_missing_path_is_a_noop(self, tmp_path) -> None:
+        assert self._ctx(tmp_path).drop_temp(tmp_path / "nope", why="test") is False
+
+    def test_note_explains_how_to_opt_out(self, tmp_path) -> None:
+        ctx = self._ctx(tmp_path)
+        f = tmp_path / "x.gguf"
+        f.write_bytes(b"z")
+        ctx.drop_temp(f, why="regenerable")
+        assert any("--keep-intermediates" in n for n in ctx.manifest.notes)
+
+    def test_cli_flag_is_opt_in(self) -> None:
+        from marlowe.cli import build_parser
+
+        base = build_parser().parse_args(
+            ["run", "stage0-bitwidth", "--config", "configs/marlowe-22b.yaml"]
+        )
+        assert base.keep_intermediates is None  # absent -> default policy (delete)
+        opted = build_parser().parse_args(
+            ["run", "stage0-bitwidth", "--config", "configs/marlowe-22b.yaml",
+             "--keep-intermediates"]
+        )
+        assert opted.keep_intermediates is True
+
+    def test_persistent_artefacts_are_never_dropped(self) -> None:
+        """Nothing a later stage needs may be dropped.
+
+        Parses the first argument of every ctx.drop_temp() call rather than grepping lines --
+        the reason strings legitimately mention reference.kld, and a substring check on the
+        whole line reads those as the target.
+        """
+        import ast
+        import inspect
+
+        import marlowe.stages as st
+
+        #: variables holding artefacts that must survive their stage
+        forbidden = {"ref", "merged", "out_hf", "healed", "cache", "adapters"}
+        targets: list[str] = []
+        for node in ast.walk(ast.parse(inspect.getsource(st))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "drop_temp"
+                and node.args
+            ):
+                targets.append(ast.unparse(node.args[0]))
+
+        assert targets, "no drop_temp calls found; the delete-temps policy is not wired in"
+        for t in targets:
+            root = t.split(".")[0].split("[")[0].split("(")[0]
+            assert root not in forbidden, (
+                f"drop_temp({t}) targets a persistent artefact; a later stage needs it"
+            )
+
+    def test_budget_marks_the_next_rungs_parent_as_persistent(self) -> None:
+        from marlowe.preflight import default_rungs, disk_budget
+
+        merged = [i for i in disk_budget(default_rungs()) if "next rung" in i.what]
+        assert merged, "the merged checkpoint must appear in the budget"
+        assert all(i.persists for i in merged), "it is the next rung's parent; never a temp"
+
+    def test_cleaned_peak_is_well_under_retained(self) -> None:
+        from marlowe.preflight import budget_totals, default_rungs, disk_budget
+
+        t = budget_totals(disk_budget(default_rungs()))
+        assert t["peak_if_cleaned"] < t["total_if_nothing_deleted"] / 2

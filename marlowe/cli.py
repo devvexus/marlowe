@@ -19,6 +19,7 @@ from typing import Any
 
 from marlowe import logutil, preflight
 from marlowe.arch import ArchDims, Layout, load_config, positional_selection
+from marlowe.eval.kl import LlamaCppCpuOnly
 from marlowe.pipeline import MissingBaseline, StageBlocked
 
 GB = 1_000_000_000
@@ -63,10 +64,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             missing.append(mod)
 
     print("\nllama.cpp")
+    gpu_stages_blocked = False
     if have_llamacpp():
-        from marlowe.eval.kl import find_binary
+        from marlowe.eval.kl import detect_backend, find_binary, gpu_requirement_message
 
         print(f"  binaries: {Path(find_binary('llama-quantize')).parent}")
+        backend = detect_backend()
+        print(f"  backend:  {backend.describe()}")
+        if not backend.has_gpu:
+            gpu_stages_blocked = True
+            print()
+            print(
+                gpu_requirement_message(
+                    "Stages 0, 2 and 7", n_variants=8, n_completions=200, max_tokens=2048
+                )
+            )
     else:
         print("  MISSING -- stages 0, 1, 2, 7 need llama-quantize/perplexity/bench/server")
         print("  set LLAMA_CPP_BIN to the binary directory, or build llama.cpp")
@@ -102,21 +114,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     print(f"  {'free now':<52} ~{free_gb:>5.0f} GB")
 
-    if free_gb >= totals["total_if_nothing_deleted"]:
-        print("\n  Fits with every artefact retained; no staging needed.")
-    elif free_gb >= totals["peak_if_cleaned"]:
-        print(
-            f"\n  Fits if temps are deleted as each stage finishes "
-            f"(~{totals['total_if_nothing_deleted']:.0f} GB to keep everything). The stage-0 "
-            f"quant candidates and the parent bf16 GGUF are the large ones; both regenerate."
-        )
+    print(
+        "\n  Default policy deletes temps as each stage finishes; --keep-intermediates opts out."
+    )
+    if free_gb >= totals["peak_if_cleaned"]:
+        line = "  Default policy fits."
+        if free_gb < totals["total_if_nothing_deleted"]:
+            line += (
+                f" --keep-intermediates would need ~"
+                f"{totals['total_if_nothing_deleted']:.0f} GB and does NOT fit."
+            )
+        print(line)
     else:
         print(
-            f"\n  WARNING: short by ~{totals['peak_if_cleaned'] - free_gb:.0f} GB even with "
-            f"temps cleaned. Note the merged rung-1 checkpoint cannot be deleted -- it is "
-            f"rung 2's parent."
+            f"  WARNING: short by ~{totals['peak_if_cleaned'] - free_gb:.0f} GB even with temps "
+            f"deleted. The merged rung-1 checkpoint cannot be deleted -- it is rung 2's parent."
         )
-    return 1 if missing else 0
+    return 1 if (missing or gpu_stages_blocked) else 0
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -182,7 +196,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     extra: dict[str, Any] = {}
     for key in ("iq3_xxs_gguf", "hosted_base_url", "hosted_model", "hosted_api_key",
                 "child_config", "max_gpu_gb", "score_parent",
-                "allow_missing_bf16_baseline"):
+                "allow_missing_bf16_baseline", "allow_cpu_llamacpp",
+                "reference_outtype", "keep_intermediates"):
         val = getattr(args, key, None)
         if val is not None:
             extra[key] = val
@@ -290,6 +305,31 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--hosted-model", dest="hosted_model")
     r.add_argument("--hosted-api-key", dest="hosted_api_key")
     r.add_argument(
+        "--allow-cpu-llamacpp",
+        dest="allow_cpu_llamacpp",
+        action="store_true",
+        default=None,
+        help="run generation-bound stages on a CPU-only llama.cpp. ~10x slower; the "
+             "projected wall-clock is logged.",
+    )
+    r.add_argument(
+        "--reference-outtype",
+        dest="reference_outtype",
+        choices=("q8_0", "bf16", "f16"),
+        default=None,
+        help="precision of the KL reference model (default q8_0: bf16 is 56 GB against "
+             "32 GB of RAM and would page from disk for the whole pass).",
+    )
+    r.add_argument(
+        "--keep-intermediates",
+        dest="keep_intermediates",
+        action="store_true",
+        default=None,
+        help="keep large regenerable artefacts (bf16/q8_0 GGUFs, unhealed checkpoints, "
+             "quant candidates). Default is to delete them as each stage finishes; the "
+             "whole ladder is ~491 GB retained vs ~217 GB cleaned.",
+    )
+    r.add_argument(
         "--allow-missing-bf16-baseline",
         dest="allow_missing_bf16_baseline",
         action="store_true",
@@ -342,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.fn(args))
     except (
         preflight.ResourceError,
+        LlamaCppCpuOnly,
         MissingBaseline,
         StageBlocked,
         FileNotFoundError,

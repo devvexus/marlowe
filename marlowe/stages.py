@@ -220,6 +220,17 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
     """
     from marlowe import quantize as q
 
+    recipes = ctx.cfg.quants or q.stage0_recipes()
+    # Decode-bound and the most expensive stage to get wrong: state the cost before the
+    # first quantisation rather than discovering it eight variants in.
+    kleval.require_gpu_backend(
+        "stage0-bitwidth",
+        n_variants=len(recipes),
+        n_completions=ctx.cfg.repetition.n_completions,
+        max_tokens=ctx.cfg.repetition.max_tokens,
+        allow_cpu=bool(ctx.extra.get("allow_cpu_llamacpp")),
+    )
+
     src = ctx.declare_input("parent", _parent_dir(ctx))
     dims = ArchDims.from_config(load_config(src))
     layout = Layout.from_config(load_config(src))
@@ -230,7 +241,6 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
         q.convert_to_gguf(src, base, outtype="bf16")
     ctx.declare_output("parent_bf16_gguf", base)
 
-    recipes = ctx.cfg.quants or q.stage0_recipes()
     results: list[dict[str, Any]] = []
 
     for recipe, path in q.iter_recipe_outputs(ctx.gguf_dir / "stage0", recipes):
@@ -256,6 +266,12 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
         )
         results.append(row)
         ctx.declare_output(f"quant_{recipe.name}", path)
+
+    # The candidates are ~10 GB each and fully described by their measured metrics; the
+    # winning recipe is rebuilt in Stage 7 from the recipe definition.
+    for _, path in q.iter_recipe_outputs(ctx.gguf_dir / "stage0", recipes):
+        ctx.drop_temp(path, why="stage-0 candidate; metrics recorded, recipe reproducible")
+    ctx.drop_temp(base, why="quantisation source; regenerable from the parent safetensors")
 
     records = [
         CheckpointRecord(
@@ -381,22 +397,38 @@ def stage2_baselines(ctx: StageContext) -> dict[str, Any]:
     The gap between IQ3_XXS and bf16 is the entire opportunity this project targets. If it is
     small, the honest report is that the project may not beat what the user already runs.
     """
-    # Precondition first: hours of conversion follow, and this is the input most likely to be
-    # missing because it is the only one that lives outside this machine.
+    # Preconditions first: hours of conversion follow, and both of these are cheap to check.
+    kleval.require_gpu_backend(
+        "stage2-baselines",
+        n_variants=2,
+        n_completions=ctx.cfg.repetition.n_completions,
+        max_tokens=ctx.cfg.repetition.max_tokens,
+        allow_cpu=bool(ctx.extra.get("allow_cpu_llamacpp")),
+    )
     backend = _require_bf16_backend(ctx)
 
     src = ctx.declare_input("parent", _parent_dir(ctx))
     corpus = ctx.declare_input("kl_corpus", ctx.cfg.score.calib_path, deep=True)
 
-    base_gguf = ctx.gguf_dir / "parent-bf16.gguf"
-    if not base_gguf.exists():
+    # The KL reference is built from Q8_0, not bf16. bf16 is 56 GB against 32 GB of RAM, so
+    # llama.cpp would mmap and page from disk for the whole pass; Q8_0 is ~28.6 GB and its
+    # own KL to bf16 is far below the deltas being measured. Every number in the project is
+    # a relative comparison against this same reference file, so the substitution is free.
+    # --reference-outtype bf16 overrides it for a machine with the RAM.
+    outtype = str(ctx.extra.get("reference_outtype", kleval.REFERENCE_OUTTYPE))
+    ref_gguf = ctx.gguf_dir / f"parent-{outtype}.gguf"
+    if not ref_gguf.exists():
         from marlowe import quantize as q
 
-        q.convert_to_gguf(src, base_gguf, outtype="bf16")
+        q.convert_to_gguf(src, ref_gguf, outtype=outtype)
+    ctx.note(
+        f"KL reference model: {ref_gguf.name} "
+        f"({ref_gguf.stat().st_size / 1e9:.1f} GB); every checkpoint is compared to this file"
+    )
 
     ref = ctx.declare_output("kl_reference", ctx.metrics_dir / "reference.kld")
     if not ref.exists():
-        kleval.build_reference(base_gguf, corpus, ref)
+        kleval.build_reference(ref_gguf, corpus, ref)
 
     results: dict[str, Any] = {}
 
@@ -434,6 +466,10 @@ def stage2_baselines(ctx: StageContext) -> dict[str, Any]:
             save_completions=ctx.metrics_dir / "completions-bf16.jsonl",
         )
         results["bf16"] = {"label": "27b-bf16-hosted", "repetition": report.as_dict()}
+
+    # reference.kld is the persistent artefact -- every checkpoint in the project is compared
+    # against those exact bytes. The model that produced it is not needed again.
+    ctx.drop_temp(ref_gguf, why="reference.kld is written; the source model is regenerable")
 
     _write_json(ctx.metrics_dir / "stage2-baselines.json", results)
 
@@ -709,6 +745,14 @@ def stage7_ship(ctx: StageContext) -> dict[str, Any]:
     """Both ship criteria are required. If either fails, report which one and why."""
     from marlowe import quantize as q
     from marlowe.heal import latest_checkpoint, merge_adapters
+
+    kleval.require_gpu_backend(
+        "stage7-ship",
+        n_variants=len(ctx.cfg.quants or q.ship_recipes()),
+        n_completions=ctx.cfg.repetition.n_completions,
+        max_tokens=ctx.cfg.repetition.max_tokens,
+        allow_cpu=bool(ctx.extra.get("allow_cpu_llamacpp")),
+    )
 
     unhealed = ctx.declare_input("unhealed", ctx.models_dir / f"{ctx.cfg.name}-unhealed")
     adapters = ctx.declare_input("adapters", ctx.models_dir / f"{ctx.cfg.name}-adapters")

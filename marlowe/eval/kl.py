@@ -1,14 +1,16 @@
-"""KL divergence and top-1 agreement against the bf16 parent, via llama.cpp.
+"""KL divergence and top-1 agreement against the parent, via llama.cpp.
 
 Two-step protocol:
 
-1. ``llama-perplexity --kl-divergence-base ref.kld`` on the bf16 parent writes reference
-   logits to disk once.
+1. ``llama-perplexity --kl-divergence-base ref.kld`` on the parent writes reference logits
+   to disk once.
 2. ``llama-perplexity --kl-divergence`` on each candidate reads that file back.
 
 The reference file is large (it stores per-token distributions) and is the reason Stage 2
 runs before anything else: every later checkpoint is compared against the same bytes, so the
 numbers are commensurable across the whole project.
+
+The reference model is Q8_0 by default, not bf16 -- see :data:`REFERENCE_OUTTYPE`.
 
 What this catches: general fidelity loss. What it cannot catch: circling. See
 :mod:`marlowe.eval.repetition`.
@@ -36,11 +38,19 @@ class LlamaCppMissing(RuntimeError):
     """llama.cpp binaries are not available."""
 
 
+class LlamaCppCpuOnly(RuntimeError):
+    """llama.cpp is present but has no GPU backend, and this stage is decode-bound."""
+
+
 #: Local build locations, tried after $LLAMA_CPP_BIN and before PATH. Mirrors
-#: quantize.find_converter so a `.tools/llama.cpp` checkout works with no env var set.
+#: quantize.find_converter so a `.tools/` checkout works with no env var set.
+#: GPU builds come first: a CPU-only build is roughly 10x slower to decode and every
+#: generation-based metric in this project is decode-bound.
+_TOOLS = Path(__file__).resolve().parents[2] / ".tools"
 _LOCAL_BIN_DIRS = (
-    Path(__file__).resolve().parents[2] / ".tools" / "llama.cpp" / "build" / "bin" / "Release",
-    Path(__file__).resolve().parents[2] / ".tools" / "llama.cpp" / "build" / "bin",
+    _TOOLS / "llama-cuda",
+    _TOOLS / "llama.cpp" / "build" / "bin" / "Release",
+    _TOOLS / "llama.cpp" / "build" / "bin",
 )
 
 
@@ -71,6 +81,115 @@ def have_llamacpp() -> bool:
     except LlamaCppMissing:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# backend capability
+# ---------------------------------------------------------------------------
+
+#: Decode throughput on a ~10 GB quantised 27B, used for wall-clock projections.
+#: CPU decode is memory-bandwidth bound, which is why the gap is an order of magnitude and
+#: not a constant factor.
+CPU_DECODE_TOK_S = 4.0
+GPU_DECODE_TOK_S = 40.0
+
+
+@dataclass(frozen=True)
+class BackendInfo:
+    """What llama.cpp can actually offload to."""
+
+    devices: tuple[str, ...]
+    binary: str
+
+    @property
+    def has_gpu(self) -> bool:
+        return bool(self.devices)
+
+    @property
+    def decode_tok_s(self) -> float:
+        return GPU_DECODE_TOK_S if self.has_gpu else CPU_DECODE_TOK_S
+
+    def describe(self) -> str:
+        if not self.devices:
+            return "CPU only (no GPU backend compiled in)"
+        return ", ".join(self.devices)
+
+
+def detect_backend() -> BackendInfo:
+    """Ask llama.cpp which devices it was built to use. Empty tuple means CPU-only."""
+    exe = find_binary("llama-cli")
+    try:
+        proc = subprocess.run(
+            [exe, "--list-devices"], capture_output=True, text=True, timeout=120, check=False
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.warning("could not query llama.cpp devices: %s", exc)
+        return BackendInfo(devices=(), binary=exe)
+
+    devices: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        # "CUDA0: NVIDIA GeForce RTX 4080 SUPER (16375 MiB, 15061 MiB free)"
+        if ":" in line and not line.lower().startswith("available"):
+            tag = line.split(":", 1)[0].strip()
+            if tag and not tag.lower().startswith("cpu"):
+                devices.append(line)
+    return BackendInfo(devices=tuple(devices), binary=exe)
+
+
+def generation_hours(n_completions: int, max_tokens: int, tok_s: float) -> float:
+    return n_completions * max_tokens / tok_s / 3600
+
+
+def gpu_requirement_message(
+    stage: str, *, n_variants: int, n_completions: int, max_tokens: int
+) -> str:
+    """The cost of running a generation-bound stage on CPU, stated up front."""
+    tokens = n_variants * n_completions * max_tokens
+    cpu_h = generation_hours(n_completions * n_variants, max_tokens, CPU_DECODE_TOK_S)
+    gpu_h = generation_hours(n_completions * n_variants, max_tokens, GPU_DECODE_TOK_S)
+    return (
+        f"{stage} needs a GPU-enabled llama.cpp build, and this one is CPU-only.\n\n"
+        f"  The repetition harness generates {n_completions} x {max_tokens} tokens per "
+        f"variant x {n_variants} variant(s) = {tokens / 1000:.0f}K tokens.\n"
+        f"  CPU decode (~{CPU_DECODE_TOK_S:.0f} tok/s, memory-bandwidth bound on a ~10 GB "
+        f"model): ~{cpu_h:.0f} h ({cpu_h / 24:.1f} days)\n"
+        f"  GPU decode (~{GPU_DECODE_TOK_S:.0f} tok/s, RTX 4080 Super):            "
+        f"~{gpu_h:.0f} h ({gpu_h / 24:.1f} days)\n\n"
+        f"  Fix: point {BIN_ENV} at a CUDA build, or drop one in .tools/llama-cuda/.\n"
+        f"    b=b10738; curl -LO https://github.com/ggml-org/llama.cpp/releases/download/"
+        f"$b/llama-$b-bin-win-cuda-13.3-x64.zip\n"
+        f"    curl -LO https://github.com/ggml-org/llama.cpp/releases/download/"
+        f"$b/cudart-llama-bin-win-cuda-13.3-x64.zip\n"
+        f"  Or pass --allow-cpu-llamacpp to accept the wall-clock above."
+    )
+
+
+def require_gpu_backend(
+    stage: str,
+    *,
+    n_variants: int = 1,
+    n_completions: int = 200,
+    max_tokens: int = 2048,
+    allow_cpu: bool = False,
+) -> BackendInfo:
+    """Refuse a generation-bound stage on a CPU-only llama.cpp. Raises with the cost."""
+    info = detect_backend()
+    if info.has_gpu:
+        return info
+    if allow_cpu:
+        hours = generation_hours(n_completions * n_variants, max_tokens, CPU_DECODE_TOK_S)
+        log.warning(
+            "%s running on a CPU-only llama.cpp build (--allow-cpu-llamacpp): expect ~%.0f h",
+            stage,
+            hours,
+        )
+        return info
+    raise LlamaCppCpuOnly(
+        gpu_requirement_message(
+            stage, n_variants=n_variants, n_completions=n_completions, max_tokens=max_tokens
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +257,19 @@ def _run(cmd: list[str], timeout: int) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or "") + "\n" + (proc.stderr or "")
 
 
+#: The reference is built once and every checkpoint in the project is compared against the
+#: same bytes, so what matters is that it is fixed, not that it is bf16. Q8_0 is the default
+#: because bf16 does not fit: 56 GB against 32 GB of RAM means llama.cpp mmaps and pages from
+#: disk for the entire pass. Q8_0 is ~28.6 GB and near-lossless -- its own KL to bf16 is far
+#: below the deltas this project measures, and since every number is a relative comparison
+#: against this same reference, the substitution costs nothing.
+#:
+#: This does NOT affect the bf16 repetition baseline, which comes from a hosted endpoint.
+REFERENCE_OUTTYPE = "q8_0"
+
+
 def build_reference(
-    bf16_gguf: str | Path,
+    reference_gguf: str | Path,
     corpus: str | Path,
     out_file: str | Path,
     *,
@@ -148,18 +278,21 @@ def build_reference(
     chunks: int | None = None,
     timeout: int = 24 * 3600,
 ) -> KLResult:
-    """Write the reference logits file from the bf16 parent. Stage 2, step 1.
+    """Write the reference logits file from the parent. Stage 2, step 1.
 
-    ``n_gpu_layers`` defaults to 0: a bf16 27B does not fit in 16 GB and offloading part of
-    it is slower than running on CPU for a one-off reference pass that then gets reused
-    forever. Raise it only if the parent GGUF is quantised.
+    ``reference_gguf`` should be the Q8_0 parent (see :data:`REFERENCE_OUTTYPE`); bf16 works
+    too if the machine has the RAM for it.
+
+    ``n_gpu_layers`` defaults to 0 because neither a 28.6 GB Q8_0 nor a 56 GB bf16 fits in
+    16 GB of VRAM, and partial offload is slower than CPU for a one-off pass that is then
+    reused forever.
     """
     exe = find_binary("llama-perplexity")
     out_file = Path(out_file)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         exe,
-        "-m", str(bf16_gguf),
+        "-m", str(reference_gguf),
         "-f", str(corpus),
         "-c", str(ctx),
         "-ngl", str(n_gpu_layers),
@@ -167,14 +300,14 @@ def build_reference(
     ]
     if chunks:
         cmd += ["--chunks", str(chunks)]
-    with logutil.timed(log, "kl reference", model=str(bf16_gguf), out=str(out_file)):
+    with logutil.timed(log, "kl reference", model=str(reference_gguf), out=str(out_file)):
         rc, text = _run(cmd, timeout)
     if rc != 0 or not out_file.exists():
         raise RuntimeError(
             f"llama-perplexity --kl-divergence-base failed (rc={rc}).\n{text[-3000:]}"
         )
     return KLResult(
-        model=str(bf16_gguf),
+        model=str(reference_gguf),
         corpus=str(corpus),
         reference=str(out_file),
         metrics=parse_output(text),
