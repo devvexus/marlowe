@@ -195,6 +195,83 @@ def assert_no_bf16_resident(model: Any, *, allow_params: int = 200_000_000) -> N
     )
 
 
+# ---------------------------------------------------------------------------
+# disk budget
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BudgetItem:
+    """One artefact the pipeline puts on disk."""
+
+    rung: str
+    what: str
+    bytes_: int
+    #: False for artefacts that can be deleted once the stage that produced them is done.
+    persists: bool
+
+    @property
+    def gb(self) -> float:
+        return self.bytes_ / GB
+
+
+def disk_budget(rungs: list[tuple[str, float, int]]) -> list[BudgetItem]:
+    """Itemise disk use for a ladder.
+
+    ``rungs`` is ``[(name, params_b, teacher_tokens), ...]`` in ladder order. Sizes are derived
+    from the parameter counts rather than transcribed, so the second rung is accounted for
+    properly: its parent is the *merged* first-rung checkpoint, which is an additional
+    full-size safetensors tree that has to coexist with everything else.
+    """
+    items: list[BudgetItem] = []
+    parent_b = rungs[0][1] if rungs else 0.0
+
+    # Rung 0: the original parent, plus the artefacts every later comparison depends on.
+    items += [
+        BudgetItem("parent", "bf16 safetensors", int(parent_b * 1e9 * 2), True),
+        BudgetItem("parent", "bf16 GGUF (KL reference source)", int(parent_b * 1e9 * 2), False),
+        BudgetItem("parent", "reference.kld", 2 * GB, True),
+        BudgetItem("parent", "stage-0 quant candidates (8 x ~10 GB)", 80 * GB, False),
+    ]
+
+    for name, params_b, teacher_tokens in rungs[1:] if len(rungs) > 1 else []:
+        w = int(params_b * 1e9 * 2)
+        items += [
+            BudgetItem(name, "unhealed safetensors", w, False),
+            BudgetItem(
+                name,
+                f"teacher cache ({teacher_tokens / 1e6:.0f}M x top-16)",
+                teacher_tokens * 100,
+                False,
+            ),
+            BudgetItem(name, "LoRA checkpoints", 2 * GB, False),
+            # This is the one the brief's 187 GB estimate missed: the merged checkpoint is
+            # not a transient, it is the next rung's parent and must survive.
+            BudgetItem(name, "merged safetensors (= next rung's parent)", w, True),
+            BudgetItem(name, "bf16 GGUF", w, False),
+            BudgetItem(name, "quant candidates (2 x ~10 GB)", 20 * GB, False),
+        ]
+    return items
+
+
+def budget_totals(items: list[BudgetItem]) -> dict[str, float]:
+    """Peak with and without cleaning transients, in GB."""
+    persist = sum(i.bytes_ for i in items if i.persists)
+    transient = [i.bytes_ for i in items if not i.persists]
+    return {
+        "total_if_nothing_deleted": (persist + sum(transient)) / GB,
+        "persistent": persist / GB,
+        # Cleaning as you go still needs room for the single largest transient alongside it.
+        "peak_if_cleaned": (persist + max(transient, default=0)) / GB,
+    }
+
+
+def default_rungs() -> list[tuple[str, float, int]]:
+    """The shipped ladder: 27B parent -> 22B -> 18B."""
+    return [("parent 27B", 26.8961, 0), ("rung 1: 22B", 22.2968, 50_000_000),
+            ("rung 2: 18B", 18.0807, 100_000_000)]
+
+
 def check_bitsandbytes() -> None:
     """Fail early and specifically when NF4 is unavailable."""
     try:

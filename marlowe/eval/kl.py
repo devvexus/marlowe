@@ -36,11 +36,23 @@ class LlamaCppMissing(RuntimeError):
     """llama.cpp binaries are not available."""
 
 
+#: Local build locations, tried after $LLAMA_CPP_BIN and before PATH. Mirrors
+#: quantize.find_converter so a `.tools/llama.cpp` checkout works with no env var set.
+_LOCAL_BIN_DIRS = (
+    Path(__file__).resolve().parents[2] / ".tools" / "llama.cpp" / "build" / "bin" / "Release",
+    Path(__file__).resolve().parents[2] / ".tools" / "llama.cpp" / "build" / "bin",
+)
+
+
 def find_binary(name: str) -> str:
     """Resolve a llama.cpp binary. Raises with actionable instructions if absent."""
-    root = os.environ.get(BIN_ENV)
-    if root:
-        for cand in (Path(root) / name, Path(root) / f"{name}.exe"):
+    roots: list[Path] = []
+    env_root = os.environ.get(BIN_ENV)
+    if env_root:
+        roots.append(Path(env_root))
+    roots.extend(_LOCAL_BIN_DIRS)
+    for root in roots:
+        for cand in (root / name, root / f"{name}.exe"):
             if cand.exists():
                 return str(cand)
     found = shutil.which(name)

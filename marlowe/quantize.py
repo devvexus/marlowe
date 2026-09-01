@@ -240,17 +240,35 @@ def probe_converter(hf_dir: str | Path, gguf_path: str | Path) -> ProbeResult:
 # ---------------------------------------------------------------------------
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+VENDOR_PATCH = REPO_ROOT / "vendor" / "0001-qwen35-explicit-recurrent-layers.patch"
+
+#: Search order for a llama.cpp checkout holding convert_hf_to_gguf.py.
+_CONVERTER_ROOTS = ("LLAMA_CPP_ROOT",)
+_LOCAL_CHECKOUT = REPO_ROOT / ".tools" / "llama.cpp"
+
+
 def find_converter() -> Path:
-    """Locate convert_hf_to_gguf.py: vendored copy first, then LLAMA_CPP_ROOT, then PATH."""
+    """Locate convert_hf_to_gguf.py.
+
+    Upstream has split the model classes out of the single script into a ``conversion/``
+    package, so the converter is no longer one vendorable file. What gets vendored is the
+    *patch* (``vendor/0001-*.patch``) plus a pinned upstream commit; this resolves the
+    checkout it applies to.
+    """
     import os
     import shutil
 
-    vendored = Path(__file__).resolve().parent.parent / "vendor" / "convert_hf_to_gguf.py"
-    if vendored.exists():
-        return vendored
-    root = os.environ.get("LLAMA_CPP_ROOT")
-    if root:
-        cand = Path(root) / "convert_hf_to_gguf.py"
+    candidates: list[Path] = []
+    for env in _CONVERTER_ROOTS:
+        root = os.environ.get(env)
+        if root:
+            candidates.append(Path(root) / "convert_hf_to_gguf.py")
+    candidates.append(_LOCAL_CHECKOUT / "convert_hf_to_gguf.py")
+    # A single-file copy still works for older llama.cpp revisions.
+    candidates.append(REPO_ROOT / "vendor" / "convert_hf_to_gguf.py")
+
+    for cand in candidates:
         if cand.exists():
             return cand
     found = shutil.which("convert_hf_to_gguf.py")
@@ -258,9 +276,54 @@ def find_converter() -> Path:
         return Path(found)
     raise FileNotFoundError(
         "convert_hf_to_gguf.py not found. Set LLAMA_CPP_ROOT to a llama.cpp checkout, or "
-        "place a (possibly patched) copy at vendor/convert_hf_to_gguf.py. If Stage 1 shows "
-        "the stock converter mishandles non-uniform layer_types, the patched copy belongs "
-        "in vendor/ so runs are reproducible."
+        f"clone one into {_LOCAL_CHECKOUT}. Then apply {VENDOR_PATCH.name} -- without it the "
+        "converter mis-types layers on any depth-pruned stack."
+    )
+
+
+def converter_writes_explicit_layout(converter: Path | None = None) -> tuple[bool, str]:
+    """Does this converter emit an explicit per-layer recurrent mask? (Rule 3.4, statically)
+
+    Answers the Stage 1 blocking question without running a conversion, downloading weights,
+    or building llama.cpp: it checks whether the resolved converter can write
+    ``<arch>.attention.recurrent_layers`` at all.
+
+    The stock converter writes only ``full_attention_interval``, defaulting to 4. On a
+    uniform stack that is correct and invisible. On a pruned stack the loader regenerates a
+    3:1 alternation over the wrong layer count and silently mis-types layers -- including
+    attention layers treated as recurrent, which drops their KV cache.
+    """
+    converter = converter or find_converter()
+    root = converter.parent
+
+    def read(p: Path) -> str:
+        try:
+            return p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    # The writer lives in gguf-py; the call lives in the Qwen model class (or, on older
+    # single-file revisions, in the converter script itself).
+    writer_files = [root / "gguf-py" / "gguf" / "gguf_writer.py", converter]
+    caller_files = [converter, *sorted((root / "conversion").glob("qwen*.py"))]
+
+    has_writer = any("def add_recurrent_layers" in read(p) for p in writer_files)
+    has_call = any(
+        "self.gguf_writer.add_recurrent_layers(" in read(p) for p in caller_files
+    )
+
+    if has_writer and has_call:
+        return True, f"{root.name}: writes an explicit recurrent_layers array"
+    if not has_writer:
+        return False, (
+            f"{root} has no add_recurrent_layers writer in gguf-py. It can only emit "
+            f"full_attention_interval, which cannot describe a pruned hybrid stack. "
+            f"Apply vendor/{VENDOR_PATCH.name}:\n"
+            f"  git -C {root} apply {VENDOR_PATCH}"
+        )
+    return False, (
+        f"{root} has the writer but the Qwen converter never calls it. "
+        f"Apply vendor/{VENDOR_PATCH.name}."
     )
 
 

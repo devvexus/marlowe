@@ -14,11 +14,11 @@ from typing import Any
 
 from marlowe import logutil
 from marlowe.arch import ArchDims, Layout, load_config, positional_selection
-from marlowe.config import QuantConfig
+from marlowe.config import THINKING, QuantConfig
 from marlowe.eval import bench
 from marlowe.eval import kl as kleval
 from marlowe.eval import repetition as rep
-from marlowe.pipeline import StageContext, register
+from marlowe.pipeline import MissingBaseline, StageContext, register
 from marlowe.report import CheckpointRecord, bpw_curve, collect, ship_gate, write_report
 
 log = logutil.get("stages")
@@ -113,6 +113,18 @@ def stage1_smoke(ctx: StageContext) -> dict[str, Any]:
     """
     from marlowe import quantize as q
     from marlowe.surgery import run_surgery
+
+    # Static check first. It costs milliseconds and answers the blocking question outright:
+    # a converter with no way to emit an explicit per-layer recurrent mask can only write
+    # full_attention_interval, which cannot describe a pruned hybrid stack.
+    layout_ok, layout_detail = q.converter_writes_explicit_layout()
+    if not layout_ok:
+        raise RuntimeError(
+            f"BLOCKER (Stage 1): the GGUF converter cannot express a non-uniform layout.\n"
+            f"  {layout_detail}\n"
+            f"Nothing downstream can proceed until this is fixed."
+        )
+    ctx.note(f"converter layout support: {layout_detail}")
 
     src = ctx.declare_input("parent", _parent_dir(ctx))
     layout = Layout.from_config(load_config(src))
@@ -292,6 +304,69 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _require_bf16_backend(ctx: StageContext) -> rep.OpenAICompatBackend | None:
+    """Resolve and live-check the hosted bf16 endpoint. Fails closed. (Runs first.)
+
+    The bf16 repetition baseline is not one input among several -- it is the definition of
+    success. This project exists because circling appears at 2.97 bpw and vanishes at bf16.
+    Without that number Stage 7 can report that repetition improved, but not that it reached
+    target, and "better than a badly quantised model" is a bar the *unhealed* checkpoint might
+    clear on its own.
+
+    So this runs before the multi-hour GGUF conversion and KL reference build, and it sends a
+    real request rather than just checking that a flag was passed: an endpoint that is
+    configured but wrong is the same 80-hour failure as one that is missing.
+    """
+    hosted = ctx.extra.get("hosted_base_url")
+    allow_missing = bool(ctx.extra.get("allow_missing_bf16_baseline"))
+
+    if not hosted:
+        if allow_missing:
+            ctx.note(
+                "PROCEEDING WITHOUT THE BF16 BASELINE (--allow-missing-bf16-baseline). Stage 7's "
+                "ship gate will fail closed on the repetition criterion. Stages 3-6 artefacts "
+                "are still produced and still useful."
+            )
+            return None
+        raise MissingBaseline(
+            "no hosted bf16 endpoint configured, so the bf16 repetition baseline cannot be "
+            "measured.\n\n"
+            "  That baseline is the definition of success for this project, not an optional "
+            "extra: circling appears at 2.97 bpw and is absent at bf16, and the ship gate "
+            "requires the candidate's repetition rate to reach the bf16 level. Without it "
+            "Stage 7 can only say repetition improved -- a bar the unhealed checkpoint might "
+            "clear on its own.\n\n"
+            "  Configuring an endpoint now costs a few dollars. Discovering this at Stage 7 "
+            "costs the ~80 hours of scoring, caching and healing in between.\n\n"
+            "  Fix:   marlowe run stage2-baselines --config <cfg> \\\n"
+            "           --hosted-base-url https://openrouter.ai/api/v1 \\\n"
+            "           --hosted-model qwen/qwen3.8-27b \\\n"
+            "           --hosted-api-key $OPENROUTER_API_KEY\n"
+            "  Or:    --allow-missing-bf16-baseline   (Stages 3-6 only; Stage 7 cannot pass)"
+        )
+
+    backend = rep.OpenAICompatBackend(
+        base_url=str(hosted),
+        model=str(ctx.extra.get("hosted_model", ctx.cfg.parent)),
+        api_key=str(ctx.extra.get("hosted_api_key", "")),
+        extra_body=dict(ctx.extra.get("hosted_extra_body", {})),
+    )
+    probe = backend.generate("Reply with the single word: ready.", 32, THINKING, 0)
+    if probe.stop_reason == "error":
+        if allow_missing:
+            ctx.note(f"bf16 endpoint unreachable ({probe.error}); continuing without it")
+            return None
+        raise MissingBaseline(
+            f"the hosted bf16 endpoint at {hosted} did not answer a one-token probe.\n"
+            f"  error: {probe.error}\n\n"
+            f"  Checked before the GGUF conversion and KL reference build deliberately -- an "
+            f"endpoint that is configured but wrong fails exactly as expensively as one that "
+            f"was never configured. Verify the URL, model id and key, then re-run.\n"
+            f"  Or pass --allow-missing-bf16-baseline to proceed without the ship gate."
+        )
+    ctx.note(f"bf16 endpoint live: {backend.model} at {hosted}")
+    return backend
+
 @register(
     "stage2-baselines",
     "bf16 KL reference, IQ3_XXS KL (the number to beat), repetition on both.",
@@ -299,12 +374,17 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
     config_sections=("repetition",),
     estimated_hours=4.0,
 )
+
 def stage2_baselines(ctx: StageContext) -> dict[str, Any]:
     """Three numbers, all required before any pruning.
 
     The gap between IQ3_XXS and bf16 is the entire opportunity this project targets. If it is
     small, the honest report is that the project may not beat what the user already runs.
     """
+    # Precondition first: hours of conversion follow, and this is the input most likely to be
+    # missing because it is the only one that lives outside this machine.
+    backend = _require_bf16_backend(ctx)
+
     src = ctx.declare_input("parent", _parent_dir(ctx))
     corpus = ctx.declare_input("kl_corpus", ctx.cfg.score.calib_path, deep=True)
 
@@ -327,23 +407,20 @@ def stage2_baselines(ctx: StageContext) -> dict[str, Any]:
             ctx, "27b-iq3_xxs-baseline", iq3, tokenizer_path=str(src), reference=ref, corpus=corpus
         )
     else:
+        # Not fatal, unlike the bf16 baseline: this artefact is produced locally by Stage 0,
+        # which runs earlier in BUILD_ORDER, so its absence means a stage was skipped rather
+        # than an external dependency going unconfigured. Flip to MissingBaseline here if you
+        # want both gate inputs enforced identically.
         ctx.note(
-            f"IQ3_XXS build not found at {iq3}. Pass --iq3-xxs <path> to point at the user's "
-            f"current build; without it the number to beat is unknown and the ship gate "
-            f"cannot be evaluated."
+            f"IQ3_XXS build not found at {iq3}. Pass --iq3-xxs-gguf <path> to point at your "
+            f"current build; without it the number to beat is unknown and the ship gate's KL "
+            f"criterion cannot be evaluated."
         )
 
     # bf16 repetition goes through a hosted API: the bf16 weights are 55.6 GB and cannot run
     # on this machine at any useful speed.
-    hosted = ctx.extra.get("hosted_base_url")
-    if hosted:
+    if backend is not None:
         prompts = rep.load_prompts(ctx.cfg.repetition.prompts_path)
-        backend = rep.OpenAICompatBackend(
-            base_url=str(hosted),
-            model=str(ctx.extra.get("hosted_model", ctx.cfg.parent)),
-            api_key=str(ctx.extra.get("hosted_api_key", "")),
-            extra_body=dict(ctx.extra.get("hosted_extra_body", {})),
-        )
         report = rep.run_repetition(
             backend,
             prompts,
@@ -357,11 +434,6 @@ def stage2_baselines(ctx: StageContext) -> dict[str, Any]:
             save_completions=ctx.metrics_dir / "completions-bf16.jsonl",
         )
         results["bf16"] = {"label": "27b-bf16-hosted", "repetition": report.as_dict()}
-    else:
-        ctx.note(
-            "no hosted endpoint configured, so the bf16 repetition baseline is missing. That "
-            "baseline is one of the two ship criteria; without it Stage 7 cannot pass."
-        )
 
     _write_json(ctx.metrics_dir / "stage2-baselines.json", results)
 
@@ -802,9 +874,13 @@ def stage8_ladder(ctx: StageContext) -> dict[str, Any]:
         "already in hand."
     )
 
-    mans = run_all(child, run_dir=ctx.run_dir / child.name, stages=(
-        "stage3-score", "stage4-surgery", "stage5-teacher", "stage6-heal", "stage7-ship",
-    ))
+    mans = run_all(
+        child,
+        run_dir=ctx.run_dir / child.name,
+        stages=("stage3-score", "stage4-surgery", "stage5-teacher", "stage6-heal",
+                "stage7-ship"),
+        extra=ctx.extra,
+    )
     return {
         "child": child.name,
         "stages": {k: v.status for k, v in mans.items()},

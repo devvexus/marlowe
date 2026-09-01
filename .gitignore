@@ -23,3 +23,6 @@ data/*.csv
 
 # A patched converter IS tracked -- reproducibility depends on it.
 !vendor/convert_hf_to_gguf.py
+
+# Local llama.cpp checkout + build. Reproducibility lives in vendor/*.patch, not here.
+.tools/

@@ -115,6 +115,15 @@ class StageBlocked(RuntimeError):
     """A prerequisite stage has not succeeded."""
 
 
+class MissingBaseline(RuntimeError):
+    """A measurement the ship gate depends on cannot be obtained.
+
+    Raised at stage entry rather than at ship time. The alternative is discovering at Stage 7
+    that the gate cannot be evaluated, after the ~80 hours of scoring, caching and healing
+    that sit in between.
+    """
+
+
 def check_requirements(stage: Stage, run_dir: Path) -> None:
     for req in stage.requires:
         m = Manifest.load(run_dir, req)
@@ -213,8 +222,13 @@ def run_all(
     run_dir: str | Path | None = None,
     stages: tuple[str, ...] = BUILD_ORDER,
     force: bool = False,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Manifest]:
+    """Run stages in order. ``extra`` reaches every stage.
+
+    It must: the hosted bf16 endpoint arrives this way, and Stage 2 fails closed without it.
+    """
     out: dict[str, Manifest] = {}
     for name in stages:
-        out[name] = run_stage(name, cfg, run_dir=run_dir, force=force)
+        out[name] = run_stage(name, cfg, run_dir=run_dir, force=force, extra=extra)
     return out

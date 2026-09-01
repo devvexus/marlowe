@@ -19,6 +19,9 @@ from typing import Any
 
 from marlowe import logutil, preflight
 from marlowe.arch import ArchDims, Layout, load_config, positional_selection
+from marlowe.pipeline import MissingBaseline, StageBlocked
+
+GB = 1_000_000_000
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -61,33 +64,57 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     print("\nllama.cpp")
     if have_llamacpp():
-        print("  binaries found")
+        from marlowe.eval.kl import find_binary
+
+        print(f"  binaries: {Path(find_binary('llama-quantize')).parent}")
     else:
         print("  MISSING -- stages 0, 1, 2, 7 need llama-quantize/perplexity/bench/server")
         print("  set LLAMA_CPP_BIN to the binary directory, or build llama.cpp")
     try:
-        from marlowe.quantize import find_converter
+        from marlowe.quantize import converter_writes_explicit_layout, find_converter
 
-        print(f"  converter: {find_converter()}")
+        conv = find_converter()
+        print(f"  converter: {conv}")
+        ok, detail = converter_writes_explicit_layout(conv)
+        print(f"  layout support: {'OK' if ok else 'BROKEN'} -- {detail.splitlines()[0]}")
+        if not ok:
+            print("    A depth-pruned stack WILL be mis-typed. See vendor/ for the patch.")
     except FileNotFoundError as exc:
         print(f"  converter: MISSING ({exc.args[0].splitlines()[0]})")
 
-    print("\ndisk budget")
-    for what, gb in (
-        ("bf16 27B safetensors", 56),
-        ("bf16 GGUF", 56),
-        ("unhealed 22B safetensors", 45),
-        ("teacher cache (50M x top-16)", 5),
-        ("quant candidates", 25),
-    ):
-        print(f"  {what:<32} ~{gb:>4} GB")
-    print(f"  {'TOTAL peak':<32} ~{187:>4} GB")
-    print(f"  free now                         {res.free_disk / 1e9:>5.0f} GB")
-    if res.free_disk < 150e9:
+    print("\ndisk budget (whole ladder: 27B -> 22B -> 18B)")
+    items = preflight.disk_budget(preflight.default_rungs())
+    rung = None
+    for it in items:
+        if it.rung != rung:
+            rung = it.rung
+            print(f"  {rung}")
+        print(f"    {'keep' if it.persists else 'temp'}  {it.what:<44} ~{it.gb:>5.0f} GB")
+    totals = preflight.budget_totals(items)
+    free_gb = res.free_disk / GB
+    print(f"\n  {'persistent (never deletable)':<52} ~{totals['persistent']:>5.0f} GB")
+    print(
+        f"  {'peak, deleting temps as each stage finishes':<52} "
+        f"~{totals['peak_if_cleaned']:>5.0f} GB"
+    )
+    print(
+        f"  {'peak, keeping everything':<52} ~{totals['total_if_nothing_deleted']:>5.0f} GB"
+    )
+    print(f"  {'free now':<52} ~{free_gb:>5.0f} GB")
+
+    if free_gb >= totals["total_if_nothing_deleted"]:
+        print("\n  Fits with every artefact retained; no staging needed.")
+    elif free_gb >= totals["peak_if_cleaned"]:
         print(
-            "\n  WARNING: under the 150 GB the pipeline assumes. Options: stage the bf16 "
-            "GGUF to another volume and delete it after Stage 2, or run surgery straight "
-            "from a streamed download."
+            f"\n  Fits if temps are deleted as each stage finishes "
+            f"(~{totals['total_if_nothing_deleted']:.0f} GB to keep everything). The stage-0 "
+            f"quant candidates and the parent bf16 GGUF are the large ones; both regenerate."
+        )
+    else:
+        print(
+            f"\n  WARNING: short by ~{totals['peak_if_cleaned'] - free_gb:.0f} GB even with "
+            f"temps cleaned. Note the merged rung-1 checkpoint cannot be deleted -- it is "
+            f"rung 2's parent."
         )
     return 1 if missing else 0
 
@@ -154,13 +181,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     cfg = load_run_config(args.config)
     extra: dict[str, Any] = {}
     for key in ("iq3_xxs_gguf", "hosted_base_url", "hosted_model", "hosted_api_key",
-                "child_config", "max_gpu_gb", "score_parent"):
+                "child_config", "max_gpu_gb", "score_parent",
+                "allow_missing_bf16_baseline"):
         val = getattr(args, key, None)
         if val is not None:
             extra[key] = val
 
     if args.stage in ("all", None):
-        mans = run_all(cfg, run_dir=args.run_dir, force=args.force)
+        mans = run_all(cfg, run_dir=args.run_dir, force=args.force, extra=extra)
     else:
         mans = {args.stage: run_stage(
             args.stage, cfg, run_dir=args.run_dir, force=args.force, extra=extra
@@ -261,6 +289,14 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--hosted-base-url", dest="hosted_base_url", help="for the bf16 baseline")
     r.add_argument("--hosted-model", dest="hosted_model")
     r.add_argument("--hosted-api-key", dest="hosted_api_key")
+    r.add_argument(
+        "--allow-missing-bf16-baseline",
+        dest="allow_missing_bf16_baseline",
+        action="store_true",
+        default=None,
+        help="run stage2 without the bf16 repetition baseline. Stages 3-6 still produce "
+             "their artefacts, but Stage 7's ship gate cannot pass.",
+    )
     r.add_argument("--child-config", dest="child_config", help="stage8: the 18B config")
     r.add_argument("--max-gpu-gb", dest="max_gpu_gb", type=float)
     r.set_defaults(fn=cmd_run)
@@ -304,7 +340,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     logutil.setup(args.cmd, getattr(args, "run_dir", None))
     try:
         return int(args.fn(args))
-    except (preflight.ResourceError, FileNotFoundError, ValueError, AssertionError) as exc:
+    except (
+        preflight.ResourceError,
+        MissingBaseline,
+        StageBlocked,
+        FileNotFoundError,
+        ValueError,
+        AssertionError,
+    ) as exc:
         print(f"\n{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 

@@ -187,23 +187,38 @@ non-uniform layout, Stage 0's results are irrelevant until that is fixed.
 | `stage7-ship` | 4 h | merge, needle @128K, quantize candidates, ship gate |
 | `stage8-ladder` | 96 h | re-score against the **healed** parent, repeat for 18B |
 
-### The Stage 1 blocker
+### The Stage 1 blocker — CONFIRMED, patch required
 
-`convert_hf_to_gguf.py` may regenerate the layout from `full_attention_interval` rather than
-reading a non-uniform `layer_types`. If it does, everything downstream is dead.
+`convert_hf_to_gguf.py` regenerates the layout from `full_attention_interval` instead of
+reading `layer_types`. This was tested and it is real.
 
-`quantize.probe_converter` reads the produced GGUF back and checks which blocks actually carry
-attention tensors. It uses a small built-in GGUF metadata reader, so it needs no llama.cpp
-binaries and runs anywhere:
+The loader is not the problem — `src/models/qwen35.cpp` already prefers an explicit
+`<arch>.attention.recurrent_layers` array. The gap is that `gguf-py` had no writer for that
+key, so `conversion/qwen.py` could only emit an interval, defaulting to 4.
+
+Measured on a 52-layer stack (27B minus 12 evenly spaced linear layers), the stock converter
+makes the loader mis-type **15 of 52 layers**, including `full_attention` layers marked
+recurrent — silently dropping their KV cache. Uniform stacks are unaffected, which is why
+nobody has hit this.
+
+The fix is three small additions, tracked as
+[vendor/0001-qwen35-explicit-recurrent-layers.patch](vendor/0001-qwen35-explicit-recurrent-layers.patch)
+against a pinned upstream commit. See [vendor/README.md](vendor/README.md).
 
 ```bash
-marlowe probe --model ./Marlowe-22B --gguf ./marlowe-22b-bf16.gguf
+git -C .tools/llama.cpp apply vendor/0001-qwen35-explicit-recurrent-layers.patch
+marlowe doctor        # "layout support: OK"
 ```
 
+Three checks, cheapest first:
+
+- `marlowe doctor` — static, no weights or binaries. Answers the blocking question outright.
+- Stage 1 calls the same check before doing any work, and refuses to proceed without it.
+- `marlowe probe --model <hf-dir> --gguf <out.gguf>` — checks a produced GGUF, using a small
+  built-in GGUF reader, so it needs no llama.cpp binaries.
+
 A converter that regenerated the layout produces a clean 3:1 alternation over the *pruned*
-layer count — which looks plausible and is wrong. That is exactly what the probe catches. If
-it fails, patch the converter, put the patched copy at `vendor/convert_hf_to_gguf.py` (it is
-picked up automatically), and upstream it.
+layer count — plausible-looking and wrong. That is what the probe catches.
 
 ### Stage 3 outputs a standalone artefact
 
@@ -223,6 +238,20 @@ Both required, neither negotiable:
 
 A missing measurement fails the gate rather than passing it. Needle @128K below 0.9 and a
 build over 10.0 GB warn but do not block.
+
+The bf16 repetition baseline is enforced much earlier than the gate. Stage 2 refuses to start
+without a reachable hosted endpoint — the check sends a real one-token request before the
+multi-hour GGUF conversion, because an endpoint that is configured but wrong fails exactly as
+expensively as one that was never configured. That baseline is the definition of success:
+without it Stage 7 can only report that repetition improved, which is a bar the *unhealed*
+checkpoint might clear on its own.
+
+```bash
+marlowe run stage2-baselines --config configs/marlowe-22b.yaml   --hosted-base-url https://openrouter.ai/api/v1   --hosted-model qwen/qwen3.8-27b --hosted-api-key $OPENROUTER_API_KEY
+```
+
+`--allow-missing-bf16-baseline` proceeds without it: Stages 3–6 still produce their
+artefacts, and Stage 7's gate fails closed.
 
 ---
 
@@ -245,8 +274,10 @@ Two consequences worth knowing about:
   overhead does not shrink when you prune — it scales with hidden size (5120, unchanged) and
   the 16 preserved attention layers.
 
-`marlowe doctor` reports the disk budget against actual free space. Peak is ~187 GB; the
-brief's 150 GB assumption is already tight.
+`marlowe doctor` itemises the disk budget against actual free space, derived from the
+configs rather than transcribed. The whole ladder is ~217 GB peak if temps are deleted as each
+stage finishes, ~491 GB if nothing is. Note that the merged rung-1 checkpoint is *not* a
+temp — it is rung 2's parent, which is the item a flat "~187 GB" estimate misses.
 
 ---
 
@@ -300,7 +331,7 @@ Expect measured degradation to exceed what the MCQA-style GPQA column suggests.
 ## Development
 
 ```bash
-pytest            # 150 tests, no GPU or weights needed
+pytest            # 180 tests, no GPU or weights needed
 ruff check .
 mypy marlowe      # strict
 ```
@@ -309,11 +340,15 @@ Tests run against a synthetic mini-checkpoint with realistic tensor naming and *
 competing `.layers.` namespaces — text (12 layers), a vision-tower decoy (27), and an MTP
 decoy (1) — so prefix detection is proven to select by depth rather than by name or ordering.
 
+`tests/test_regressions.py` pins every defect found in the original scripts and during the
+build. They share one property, which is why they are collected together: none of them raise
+on their own, and all produce a model that loads and runs.
+
 ## Known risks
 
 | risk | detection | fallback |
 |---|---|---|
-| GGUF converter can't read non-uniform `layer_types` | Stage 1, day one | patch and vendor the converter |
+| ~~GGUF converter can't read non-uniform `layer_types`~~ **CONFIRMED** | `marlowe doctor`, static | patch vendored: `vendor/0001-*.patch` |
 | circling threshold above 3.66 bpw | Stage 0 | skip 22B, go direct to 18B at IQ4_XS |
 | 50M tokens insufficient for 12 cuts | KL plateau, Stage 6 day 2 | fall back to 8 cuts, re-heal on cached data |
 | measured selection no better than positional | Stage 3 control | report as finding; use positional |

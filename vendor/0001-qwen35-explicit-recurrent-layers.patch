@@ -1,0 +1,96 @@
+# Qwen3.5/Qwen3-Next: write an explicit per-layer recurrent mask
+#
+# Upstream commit this applies to: 8887a48f050554f0ee59f56753860c061836b02d
+# Apply with:  git -C <llama.cpp> apply /path/to/this.patch
+#
+# WHY
+# conversion/qwen.py wrote only <arch>.full_attention_interval, defaulting to 4 when the
+# key is absent. src/models/qwen35.cpp already PREFERS an explicit per-layer array
+# <arch>.attention.recurrent_layers and only falls back to the interval -- but gguf-py
+# had no constant or writer for that key, so nothing could ever produce it.
+#
+# For a uniform stack the interval is correct and nobody notices. For a depth-pruned
+# hybrid stack it is not: removing linear-attention layers leaves periods of unequal
+# length that no interval describes. Measured on a 52-layer stack (Qwen3.8-27B minus 12
+# evenly spaced linear layers), the stock converter causes the loader to mis-type 15 of
+# 52 layers -- including full_attention layers treated as recurrent, which silently
+# drops their KV cache. The model loads, runs at full speed, and is wrong.
+#
+# This adds the constant, the writer, and makes the Qwen converter emit the explicit
+# array whenever config.json carries layer_types.
+
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index 4196118..b844f46 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -379,7 +379,36 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
+         self.gguf_writer.add_ssm_group_count(self.hparams["linear_num_key_heads"])
+         self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
+         self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
+-        self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
++        # Prefer the explicit per-layer list when the checkpoint provides one. A uniform
++        # interval cannot describe a depth-pruned hybrid stack: dropping linear-attention
++        # layers leaves periods of unequal length, and regenerating the layout from an
++        # interval then yields a model that loads, runs, and silently treats the wrong
++        # layers as recurrent. The C++ loader already prefers
++        # `<arch>.attention.recurrent_layers` (src/models/qwen35.cpp) -- until now nothing
++        # wrote it.
++        layer_types = self.hparams.get("layer_types")
++        if layer_types is not None:
++            n_layer = self.hparams["num_hidden_layers"]
++            if len(layer_types) != n_layer:
++                raise ValueError(
++                    f"layer_types has {len(layer_types)} entries but num_hidden_layers is "
++                    f"{n_layer}; refusing to guess the layout"
++                )
++            self.gguf_writer.add_recurrent_layers(
++                [t == "linear_attention" for t in layer_types]
++            )
++
++        interval = self.hparams.get("full_attention_interval")
++        if interval is not None:
++            self.gguf_writer.add_full_attention_interval(interval)
++        elif layer_types is None:
++            # Neither an explicit list nor an interval: the old default, but say so.
++            logger.warning(
++                "no layer_types and no full_attention_interval in config; assuming the "
++                "default interval of 4. If this model is depth-pruned, the layout will be "
++                "wrong."
++            )
++            self.gguf_writer.add_full_attention_interval(4)
+         if (rope_dim := self.hparams.get("head_dim")) is None:
+             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.25)))
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index c99feb3..bfe9441 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -215,6 +215,7 @@ class Keys:
+         KV_LORA_RANK_SWA             = "{arch}.attention.kv_lora_rank_swa"
+         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
+         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
++        RECURRENT_LAYERS             = "{arch}.attention.recurrent_layers"
+         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
+         ROPE_PATTERN                 = "{arch}.attention.rope_pattern"
+ 
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index d95fe9b..c212db4 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -838,6 +838,16 @@ class GGUFWriter:
+         else:
+             self.add_array(key, value)
+ 
++    def add_recurrent_layers(self, value: Sequence[bool]) -> None:
++        """Explicit per-layer recurrent/attention mask.
++
++        Needed whenever the layout is not a uniform interval -- e.g. a depth-pruned hybrid
++        stack, where some periods have lost a linear-attention layer and no single interval
++        describes the result. The loader prefers this key and falls back to
++        `full_attention_interval` only when it is absent.
++        """
++        self.add_array(Keys.Attention.RECURRENT_LAYERS.format(arch=self.arch), value)
++
+     def add_rope_pattern(self, value: Sequence[bool]) -> None:
+         self.add_array(Keys.Attention.ROPE_PATTERN.format(arch=self.arch), value)
+ 
