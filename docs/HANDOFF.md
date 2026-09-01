@@ -13,6 +13,41 @@ The deliverable is **a base that quantises well**, not a checkpoint that fits on
 
 ---
 
+## 0. What to do first
+
+Ordered. Do not infer priority from the rest of this document.
+
+1. **Read §5 and get the peaks.** A memory-configuration search was in flight when this was
+   written. If it finished, its output is the selected config and measured peak VRAM for each
+   candidate. If it died with the session, restart it — nothing downstream can be sized
+   without it:
+   ```bash
+   marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml --steps 6
+   ```
+   The sizing-only 22B is a throwaway built with positional cuts; shape determines the memory
+   envelope, cut selection does not. Rebuild with `marlowe surgery --auto 12` if it is gone.
+
+2. **Prefer seq_len 1024 unless something changed.** 73.5 vs 44.3 tok/s is 66% faster and
+   neither length trains DeltaNet state eviction, so 2048 winning the memory search does not
+   make it the choice (§2, §3b). If the search selects 2048, override it deliberately.
+
+3. **Run the Unsloth evaluation once the GPU is free** (§4 item 5). It can halve a 15-day
+   schedule, costs about an hour, and its harness is written. Isolated venv only. If it
+   passes, re-run `marlowe fitcheck` — the whole memory ladder was measured on plain peft.
+
+4. **Stage 2 is blocked on the operator's OpenRouter endpoint.** Everything else is
+   unblocked. Do not work around it with `--allow-missing-bf16-baseline` unless the operator
+   asks: that baseline defines the repetition ship criterion.
+
+5. **Stage 0 can run whenever the GPU is free.** Control curve, not a gate. Synthetic prompt
+   set, labelled as such in every report (§2). ~8 h.
+
+The GPU is the scarce resource and only one of these can use it at a time. Rough order if it
+is free and nothing else is pending: finish the fitcheck, then Unsloth, then Stage 0
+overnight.
+
+---
+
 ## 1. Current state
 
 | stage | status | notes |
