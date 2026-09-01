@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Run artefacts. Big, regenerable, and manifests record how.
+runs/
+*.gguf
+*.safetensors
+*.kld
+teacher-cache/
+
+# Real data is the operator's; only the templates and README are tracked.
+data/*.jsonl
+data/*.csv
+!data/circling_prompts.jsonl
+
+# A patched converter IS tracked -- reproducibility depends on it.
+!vendor/convert_hf_to_gguf.py

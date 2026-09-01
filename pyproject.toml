@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marlowe"
+version = "0.1.0"
+description = "Structure-aware depth pruning and distillation pipeline for Qwen3.8-27B"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.57",
+    "safetensors>=0.4.3",
+    "accelerate>=0.34",
+    "numpy>=1.26",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+    "psutil>=5.9",
+    "huggingface-hub>=0.25",
+]
+
+[project.optional-dependencies]
+# Stage 3/5 need NF4. Stage 6 needs the QLoRA stack.
+score = ["bitsandbytes>=0.43"]
+heal = ["bitsandbytes>=0.43", "peft>=0.13", "trl>=0.11", "datasets>=2.20"]
+plot = ["matplotlib>=3.8"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11", "types-PyYAML"]
+
+[project.scripts]
+marlowe = "marlowe.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["marlowe*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ANN", "BLE001", "S310"]
+ignore = [
+    "ANN401",  # typing.Any is legitimate at the JSON/config boundary
+    "B905",    # zip(strict=) noise on short paired iterables
+    "SIM108",  # ternary-vs-if is a readability call, not a rule
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "E501"]
+"vendor/*" = ["ALL"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+# torch/transformers/bitsandbytes ship incomplete or absent stubs.
+ignore_missing_imports = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+exclude = "^(vendor|build)/"
+
+[[tool.mypy.overrides]]
+module = ["torch.*", "transformers.*", "safetensors.*", "peft.*", "trl.*", "datasets.*", "matplotlib.*", "bitsandbytes.*"]
+ignore_errors = true
+follow_imports = "skip"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: needs real weights or a GPU; deselected by default in CI",
+    "needs_llamacpp: needs llama.cpp binaries on PATH or LLAMA_CPP_BIN",
+]

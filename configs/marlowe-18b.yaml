@@ -1,0 +1,90 @@
+# Marlowe-18B: 11 further cuts from the HEALED Marlowe-22B.
+#
+#   22.2968 B - 11 x 383.279 M = 18.0807 B, 41 layers (25 linear + 16 attention)
+#
+# `parent` is overwritten at run time by stage8-ladder with the healed 22B checkpoint path.
+#
+# This rung MUST come via the ladder. A direct 27B -> 18B cut removes 36% of depth in one
+# step, outside the band where healing reliably recovers; two sequential ~19% cuts from an
+# already-healed parent stay inside it. `requires_healed_parent` is the enforcement.
+#
+# The Stage 3 ranking is recomputed against the healed 22B. Reusing the 27B ranking is a
+# correctness error: the damage profile shifts after healing.
+
+name: marlowe-18b
+parent: runs/marlowe-22b/models/marlowe-22b   # replaced by stage8-ladder
+n_cuts: 11
+run_dir: runs/marlowe-18b
+
+requires_healed_parent: true
+
+max_per_period: 2
+protect_first_periods: 1
+protect_last_periods: 1
+
+drop_vision: true
+drop_mtp: true
+
+expected_params: 18.0807
+expected_layers: 41
+
+score:
+  mode: oneshot
+  seq_len: 32768
+  n_seqs: 4
+  n_positions: 512
+  position_start_frac: 0.25
+  seed: 0
+  calib_path: data/calib.jsonl
+  load_in_4bit: true
+  run_positional_control: true
+
+teacher:
+  # The teacher stays the 27B where affordable; against the healed 22B it is cheaper and
+  # closer to the student. Point `parent` at whichever you intend and record it.
+  tokens: 100000000
+  top_k: 16
+  seq_len: 2048
+  batch_size: 4
+  corpus_path: data/heal_corpus.jsonl
+  shard_tokens: 5000000
+
+heal:
+  tokens: 100000000
+  seq_len: 2048
+  lora_rank: 32
+  lora_alpha: 64
+  learning_rate: 0.0001
+  warmup_steps: 200
+  grad_accum: 16
+  micro_batch: 1
+  gradient_checkpointing: true
+  checkpoint_every_tokens: 10000000
+  kl_plateau_delta: 0.002
+  long_context_tokens: 0
+  long_context_seq_len: 16384
+
+repetition:
+  n_completions: 200
+  max_tokens: 2048
+  ngram_sizes: [8, 32]
+  prompts_path: data/circling_prompts.jsonl
+  preset: thinking
+  seed: 0
+
+ship:
+  max_kl_vs_baseline: iq3_xxs
+  max_repetition_vs: bf16
+
+# 18B ships at IQ4_XS (~4.25 bpw, ~10.2 GB) -- the extra headroom is the point of this rung.
+quants:
+  - name: iq4_xs
+    base_type: iq4_xs
+    target_gb: 10.2
+  - name: mix_gate_q6
+    base_type: iq3_s
+    target_gb: 10.2
+    tensor_types:
+      q_proj: q6_K
+      "linear_attn.*": q6_K
+      "ffn_.*": iq3_xxs
