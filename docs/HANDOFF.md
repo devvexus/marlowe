@@ -23,8 +23,9 @@ The deliverable is **a base that quantises well**, not a checkpoint that fits on
 | `stage3-score` | ready | 8 h, needs `data/calib.jsonl` (still a placeholder) |
 | `stage4`–`stage8` | not started | |
 
-**Running right now:** a memory-configuration search (`marlowe fitcheck`) against a
-sizing-only 22B. Results were not in when this was written. See §5.
+**In progress:** a memory-configuration search (`marlowe fitcheck`) against a sizing-only
+22B. The first attempt was voided by a measurement bug (§3) and re-run against corrected
+code. See §5 for what is and is not known.
 
 ### Where things live
 
