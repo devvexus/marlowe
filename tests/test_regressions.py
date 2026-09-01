@@ -821,7 +821,7 @@ class TestMemoryPlanSearch:
         assert lengths == sorted(lengths, reverse=True), (
             "the fp16 ladder must give up context gradually, never jump back up"
         )
-        assert lengths == [2048, 1536, 1024]
+        assert lengths == [2048, 1536, 1024, 1024]  # the last pair differ by LoRA rank
 
     def test_shortening_the_sequence_is_preferred_over_quantising_the_head(self) -> None:
         """Halving context is a real cost; corrupting the loss target is a worse one."""
@@ -856,11 +856,18 @@ class TestMemoryPlanSearch:
         monkeypatch.setattr(heal, "_free_cuda", lambda: None)
         res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
 
-        assert res.chosen is not None
-        assert res.chosen.name == "nf4-head-adamw32"
-        # both fp16 candidates tried and rejected, then the first NF4 one fits
-        # every fp16 candidate tried and rejected, then the first NF4 one fits
+        # NF4 candidates need explicit approval, so without it the search stops here.
+        assert res.chosen is None
+        assert res.exhausted_without_approval
         n_fp16 = sum(1 for c in heal.MEMORY_CANDIDATES if not c.quantize_lm_head)
+        assert calls == [False] * n_fp16, "gated candidates must not be probed"
+
+        calls.clear()
+        approved = heal.search_memory_plan(
+            "x", HealConfig(), margin_gb=0.8, allow_quantized_head=True
+        )
+        assert approved.chosen is not None
+        assert approved.chosen.name == "nf4-head-adamw32"
         assert calls == [False] * n_fp16 + [True], "must not probe further once one fits"
 
     def test_search_prefers_fp16_head_when_it_fits(self, monkeypatch) -> None:
@@ -893,7 +900,9 @@ class TestMemoryPlanSearch:
 
         monkeypatch.setattr(heal, "probe_training", fake_probe)
         monkeypatch.setattr(heal, "_free_cuda", lambda: None)
-        res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.5)
+        res = heal.search_memory_plan(
+            "x", HealConfig(), margin_gb=0.5, allow_quantized_head=True
+        )
         assert res.chosen is not None and res.chosen.quantize_lm_head is True
         assert any("OOM" in outcome for _, outcome in res.attempts)
 
@@ -920,8 +929,13 @@ class TestMemoryPlanSearch:
             ),
         )
         monkeypatch.setattr(heal, "_free_cuda", lambda: None)
-        res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
+        # With approval granted, exhausting every candidate is a plain "nothing fits" --
+        # distinct from stopping at the approval gate, which has its own message.
+        res = heal.search_memory_plan(
+            "x", HealConfig(), margin_gb=0.8, allow_quantized_head=True
+        )
         assert res.chosen is None
+        assert not res.blocked
         assert "NOTHING FIT" in res.render(50_000_000)
 
 
@@ -1292,7 +1306,169 @@ class TestSequenceLengthLadder:
         monkeypatch.setattr(heal, "probe_training", fake)
         monkeypatch.setattr(heal, "_free_cuda", lambda: None)
 
-        res = heal.search_memory_plan("x", HealConfig(), probe_all=True)
+        res = heal.search_memory_plan(
+            "x", HealConfig(), probe_all=True, allow_quantized_head=True
+        )
         assert len(seen) == len(heal.MEMORY_CANDIDATES)
         assert res.chosen is not None and res.chosen.name == "fp16-head-2048"
         assert len(res.attempts) == len(heal.MEMORY_CANDIDATES)
+
+        # Without approval, probe_all still walks the fp16 ladder but never measures a
+        # gated candidate: reporting must not spend GPU time on a non-option.
+        seen.clear()
+        heal.search_memory_plan("x", HealConfig(), probe_all=True)
+        n_fp16 = sum(1 for c in heal.MEMORY_CANDIDATES if not c.quantize_lm_head)
+        assert len(seen) == n_fp16
+
+
+class TestQuantizedHeadNeedsApproval:
+    """The fp16 ladder exhausting is a decision point, not the next rung down."""
+
+    def _tight(self, headroom: float):
+        from marlowe import heal
+
+        def probe(path, cfg, **k):
+            return heal.ProbeResult(
+                tok_s=120.0, peak_vram_gb=17.17 - headroom, total_vram_gb=17.17,
+                step_s=1.0, seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+            )
+
+        return probe
+
+    def test_rank16_precedes_every_quantized_candidate(self) -> None:
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        names = [c.name for c in MEMORY_CANDIDATES]
+        first_nf4 = min(i for i, c in enumerate(MEMORY_CANDIDATES) if c.quantize_lm_head)
+        assert names.index("fp16-head-1024-rank16") < first_nf4
+
+    def test_rank16_halves_the_adapter_not_the_target(self) -> None:
+        from marlowe.config import HealConfig
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        cand = next(c for c in MEMORY_CANDIDATES if c.name == "fp16-head-1024-rank16")
+        cfg = cand.apply(HealConfig(lora_rank=32))
+        assert cfg.lora_rank == 16
+        assert cfg.quantize_lm_head is False, "the loss target must stay intact"
+
+    def test_only_quantized_candidates_are_gated(self) -> None:
+        from marlowe.heal import MEMORY_CANDIDATES
+
+        for c in MEMORY_CANDIDATES:
+            assert c.requires_approval == c.quantize_lm_head
+
+    def test_search_stops_instead_of_selecting_a_quantized_head(self, monkeypatch) -> None:
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        monkeypatch.setattr(heal, "probe_training", self._tight(0.5))
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        res = heal.search_memory_plan("x", HealConfig(), margin_gb=1.0)
+
+        assert res.chosen is None
+        assert res.exhausted_without_approval
+        assert {n for n, _ in res.blocked} == {"nf4-head-adamw32", "nf4-head-adamw8"}
+        text = res.render(50_000_000)
+        assert "LADDER IS EXHAUSTED" in text
+        assert "--allow-quantized-head" in text
+
+    def test_gated_candidates_are_never_probed_without_approval(self, monkeypatch) -> None:
+        """Blocked means not measured: probing them would waste GPU time on a non-option."""
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        seen: list[bool] = []
+
+        def probe(path, cfg, **k):
+            seen.append(cfg.quantize_lm_head)
+            return heal.ProbeResult(
+                tok_s=1.0, peak_vram_gb=16.7, total_vram_gb=17.17, step_s=1.0,
+                seq_len=cfg.seq_len, n_steps=1, lora_params=1,
+            )
+
+        monkeypatch.setattr(heal, "probe_training", probe)
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        heal.search_memory_plan("x", HealConfig(), margin_gb=1.0)
+        assert not any(seen), "an approval-gated candidate was probed"
+
+    def test_approval_lets_the_search_continue(self, monkeypatch) -> None:
+        from marlowe import heal
+        from marlowe.config import HealConfig
+
+        def probe(path, cfg, **k):
+            headroom = 2.0 if cfg.quantize_lm_head else 0.5
+            return heal.ProbeResult(
+                tok_s=120.0, peak_vram_gb=17.17 - headroom, total_vram_gb=17.17,
+                step_s=1.0, seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+            )
+
+        monkeypatch.setattr(heal, "probe_training", probe)
+        monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+        res = heal.search_memory_plan(
+            "x", HealConfig(), margin_gb=1.0, allow_quantized_head=True
+        )
+        assert res.chosen is not None and res.chosen.name == "nf4-head-adamw32"
+        assert not res.blocked
+
+    def test_stage5_refuses_rather_than_trading_silently(self) -> None:
+        import inspect
+
+        import marlowe.stages  # noqa: F401
+        from marlowe.pipeline import REGISTRY
+
+        src = inspect.getsource(REGISTRY["stage5-teacher"].fn)
+        assert "exhausted_without_approval" in src
+        assert "allow_quantized_head" in src
+
+    def test_cli_exposes_the_flag_on_both_commands(self) -> None:
+        from marlowe.cli import build_parser
+
+        fit = build_parser().parse_args(
+            ["fitcheck", "--model", "m", "--allow-quantized-head"]
+        )
+        assert fit.allow_quantized_head is True
+        run = build_parser().parse_args(
+            ["run", "stage5-teacher", "--config", "configs/marlowe-22b.yaml",
+             "--allow-quantized-head"]
+        )
+        assert run.allow_quantized_head is True
+
+
+class TestNoTorchAccountingInFitDecisions:
+    """The torch-vs-device confusion appeared twice; pin that it cannot appear a third time."""
+
+    def test_probe_decides_on_device_level_memory(self) -> None:
+        import inspect
+
+        from marlowe.heal import probe_training
+
+        src = inspect.getsource(probe_training)
+        assert "mem_get_info" in src
+        assert "peak_vram_gb=peak_device_used" in src
+
+    def test_torch_accounting_is_recorded_but_not_decisive(self) -> None:
+        from marlowe.heal import ProbeResult
+
+        r = ProbeResult(
+            tok_s=1.0, peak_vram_gb=16.0, total_vram_gb=17.0, step_s=1.0,
+            seq_len=1024, n_steps=1, lora_params=1,
+            torch_allocated_gb=13.0, torch_reserved_gb=14.0,
+        )
+        # headroom must come from the device figure, not either torch figure
+        assert abs(r.headroom_gb() - 1.0) < 1e-9
+
+    def test_preflight_probes_the_device_not_torch_accounting(self) -> None:
+        import inspect
+
+        from marlowe.preflight import probe
+
+        src = inspect.getsource(probe)
+        assert "mem_get_info" in src
+        assert "max_memory_allocated" not in src
+
+    def test_estimator_accounts_for_the_cuda_context(self) -> None:
+        import inspect
+
+        from marlowe.config import estimate_peak_gb
+
+        assert "_EST_CUDA_CONTEXT_GB" in inspect.getsource(estimate_peak_gb)

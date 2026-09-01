@@ -666,6 +666,12 @@ class MemoryCandidate:
     rationale: str
     #: Override the configured sequence length. None keeps it.
     seq_len: int | None = None
+    #: Override the LoRA rank. Halving it roughly halves adapter parameters and their
+    #: optimizer moments, without touching the loss target.
+    lora_rank: int | None = None
+    #: Requires an explicit human decision before it may be selected. Set on every candidate
+    #: that quantises the head: that is a quality cliff, not another notch on a dial.
+    requires_approval: bool = False
 
     def apply(self, cfg: HealConfig) -> HealConfig:
         import copy
@@ -675,6 +681,8 @@ class MemoryCandidate:
         out.optimizer_8bit = self.optimizer_8bit
         if self.seq_len is not None:
             out.seq_len = self.seq_len
+        if self.lora_rank is not None:
+            out.lora_rank = self.lora_rank
         return out
 
 
@@ -715,15 +723,26 @@ MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
         rationale="halve the sequence rather than corrupt the loss target",
     ),
     MemoryCandidate(
+        name="fp16-head-1024-rank16",
+        quantize_lm_head=False,
+        optimizer_8bit=True,
+        seq_len=1024,
+        lora_rank=16,
+        rationale="half the adapter capacity, but the loss target stays intact",
+    ),
+    # --- everything below quantises the head and needs an explicit decision -------------
+    MemoryCandidate(
         name="nf4-head-adamw32",
         quantize_lm_head=True,
         optimizer_8bit=False,
+        requires_approval=True,
         rationale="NF4 head, but fp32 optimizer moments; head gets LoRA + trained final norm",
     ),
     MemoryCandidate(
         name="nf4-head-adamw8",
         quantize_lm_head=True,
         optimizer_8bit=True,
+        requires_approval=True,
         rationale="most aggressive; both savings taken",
     ),
 )
@@ -735,13 +754,34 @@ class SearchResult:
     config: HealConfig | None
     probe: ProbeResult | None
     attempts: list[tuple[str, str]] = field(default_factory=list)
+    #: Candidates skipped because they need an explicit decision, not because they failed.
+    blocked: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def exhausted_without_approval(self) -> bool:
+        return self.chosen is None and bool(self.blocked)
 
     def render(self, tokens: int) -> str:
         lines = ["memory configuration search (best quality first):"]
         for name, outcome in self.attempts:
-            lines.append(f"  {name:<18} {outcome}")
+            lines.append(f"  {name:<24} {outcome}")
         if self.chosen is None or self.probe is None:
-            lines.append("\n  NOTHING FIT. Lower seq_len, lora_rank, or loss_chunk.")
+            if self.blocked:
+                lines += [
+                    "",
+                    "  THE fp16 LADDER IS EXHAUSTED. Stopping rather than selecting a "
+                    "quantised head.",
+                    "",
+                    *(f"  not taken  {n:<24} {w}" for n, w in self.blocked),
+                    "",
+                    "  Quantising lm_head injects noise into the logits the top-K KL loss is "
+                    "matching, and merge_adapters loads the base in bf16 -- so the adapter "
+                    "learns to cancel an error that never reaches inference.",
+                    "  That is a decision to take knowingly. Pass --allow-quantized-head to "
+                    "proceed, or lower heal.lora_rank / heal.loss_chunk further.",
+                ]
+            else:
+                lines.append("\n  NOTHING FIT. Lower seq_len, lora_rank, or loss_chunk.")
             return "\n".join(lines)
         lines += [
             f"\nselected: {self.chosen.name} -- {self.chosen.rationale}",
@@ -759,6 +799,7 @@ def search_memory_plan(
     max_gpu_gb: float | None = None,
     candidates: tuple[MemoryCandidate, ...] = MEMORY_CANDIDATES,
     probe_all: bool = False,
+    allow_quantized_head: bool = False,
 ) -> SearchResult:
     """Measure candidates in quality order and take the first that fits with margin.
 
@@ -769,6 +810,13 @@ def search_memory_plan(
     for cand in candidates:
         if result.chosen is not None and not probe_all:
             break
+        if cand.requires_approval and not allow_quantized_head:
+            # Deliberately not "the next thing to try". Quantising the head corrupts the
+            # logits the loss is matching, and merge_adapters loads the base in bf16 -- so
+            # the adapter's compensation never reaches inference. That is a decision to be
+            # taken knowingly, not a step the search takes on its own.
+            result.blocked.append((cand.name, cand.rationale))
+            continue
         trial = cand.apply(cfg)
         try:
             probe = probe_training(

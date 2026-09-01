@@ -197,7 +197,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     for key in ("iq3_xxs_gguf", "hosted_base_url", "hosted_model", "hosted_api_key",
                 "child_config", "max_gpu_gb", "score_parent",
                 "allow_missing_bf16_baseline", "allow_cpu_llamacpp",
-                "reference_outtype", "keep_intermediates"):
+                "reference_outtype", "keep_intermediates", "allow_quantized_head"):
         val = getattr(args, key, None)
         if val is not None:
             extra[key] = val
@@ -293,6 +293,7 @@ def cmd_fitcheck(args: argparse.Namespace) -> int:
         margin_gb=margin,
         n_steps=args.steps,
         max_gpu_gb=args.max_gpu_gb,
+        allow_quantized_head=bool(args.allow_quantized_head),
     )
     print(search.render(cfg.tokens))
     if search.config is not None and args.write_config and args.config:
@@ -435,6 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r.add_argument("--child-config", dest="child_config", help="stage8: the 18B config")
     r.add_argument("--max-gpu-gb", dest="max_gpu_gb", type=float)
+    r.add_argument("--allow-quantized-head", dest="allow_quantized_head",
+                   action="store_true", default=None,
+                   help="permit an NF4 lm_head if the fp16 ladder is exhausted")
     r.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("surgery", help="streaming depth surgery")
@@ -476,6 +480,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--margin", type=float, default=None,
         help="required device-level VRAM headroom in GB (default: heal.FIT_MARGIN_GB)",
     )
+    fc.add_argument("--allow-quantized-head", dest="allow_quantized_head",
+                    action="store_true",
+                    help="permit NF4 lm_head candidates; they corrupt the loss target")
     fc.add_argument("--no-search", dest="no_search", action="store_true",
                     help="probe the config as written instead of searching candidates")
     fc.add_argument("--write-config", dest="write_config", action="store_true",

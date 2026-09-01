@@ -631,10 +631,20 @@ def stage5_teacher(ctx: StageContext) -> dict[str, Any]:
     student = ctx.models_dir / f"{ctx.cfg.name}-unhealed"
     plan_path = ctx.declare_output("memory_plan", ctx.metrics_dir / MEMORY_PLAN_FILE)
     search = search_memory_plan(
-        str(student), ctx.cfg.heal, max_gpu_gb=ctx.extra.get("max_gpu_gb")
+        str(student),
+        ctx.cfg.heal,
+        max_gpu_gb=ctx.extra.get("max_gpu_gb"),
+        allow_quantized_head=bool(ctx.extra.get("allow_quantized_head")),
     )
     for line in search.render(ctx.cfg.heal.tokens).splitlines():
         ctx.note(line)
+    if search.exhausted_without_approval:
+        raise preflight.ResourceError(
+            "the fp16 memory ladder is exhausted and the remaining candidates quantise "
+            "lm_head. Stopping here rather than making that trade automatically -- it "
+            "corrupts the logits the loss is matching, and the compensation does not "
+            "survive the merge.\n\n" + search.render(ctx.cfg.heal.tokens)
+        )
     if search.config is None:
         raise preflight.ResourceError(
             "no Stage 6 memory configuration fit with margin, so the teacher cache would be "
