@@ -18,6 +18,7 @@ automatically rather than silently inheriting a stale one.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import subprocess
@@ -44,6 +45,17 @@ IMATRIX_CTX = 4096
 #: new IQ type appearing upstream should fail closed here rather than be attempted and
 #: rejected after a full quantisation pass.
 IMATRIX_REQUIRED_PREFIXES: tuple[str, ...] = ("iq1", "iq2", "iq3")
+
+#: Chunks below which a matrix is treated as under-sampled and says so.
+#:
+#: llama.cpp's own examples land around 100-300 chunks, so this is the low end of normal
+#: rather than a hard floor. It exists because an interrupted pass leaves a file that is
+#: structurally perfect -- every tensor present, every block covered -- and silently
+#: under-sampled: a kernel panic stopped one at 120 of ~420 chunks and nothing about the
+#: artifact said so. Stage 0 is the control curve every later "healing or quantisation?"
+#: judgement is measured against, and that is the worst place to accept an uncontrolled
+#: variable.
+MIN_GOOD_CHUNKS = 200
 
 
 def recipe_needs_imatrix(base_type: str) -> bool:
@@ -116,13 +128,25 @@ def build_imatrix(
         "-c", str(ctx),
         "-ngl", str(n_gpu_layers),
     ]
-    with logutil.timed(log, "imatrix", src=str(src_gguf), ctx=ctx):
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-    if proc.returncode != 0 or not out_path.exists():
-        raise RuntimeError(
-            f"llama-imatrix failed (rc={proc.returncode}).\n"
-            f"{(proc.stderr or proc.stdout or '')[-3000:]}"
+    # Stream to a log rather than capturing.
+    #
+    # capture_output holds everything until the process exits, so a pass that takes hours
+    # shows nothing at all while it runs -- and if it is killed (this machine kernel-panicked
+    # during one), the output is lost with it. llama-imatrix prints per-chunk progress, which
+    # is the only way to know whether a long pass is advancing or wedged.
+    progress = out_path.with_suffix(".log")
+    with (
+        logutil.timed(log, "imatrix", src=str(src_gguf), ctx=ctx, progress=str(progress)),
+        progress.open("w", encoding="utf-8", errors="replace") as fh,
+    ):
+        proc = subprocess.run(
+            cmd, stdout=fh, stderr=subprocess.STDOUT, timeout=timeout, check=False
         )
+    if proc.returncode != 0 or not out_path.exists():
+        tail = ""
+        with contextlib.suppress(OSError):
+            tail = progress.read_text(encoding="utf-8", errors="replace")[-3000:]
+        raise RuntimeError(f"llama-imatrix failed (rc={proc.returncode}).\n{tail}")
     logutil.event(
         log, "imatrix built", out=str(out_path),
         mb=round(out_path.stat().st_size / 1e6, 1), ctx=ctx,
@@ -164,6 +188,31 @@ def describe_imatrix(path: str | Path) -> dict[str, Any]:
     return out
 
 
+def warn_if_undersampled(info: dict[str, Any], *, min_chunks: int = MIN_GOOD_CHUNKS) -> bool:
+    """Say so when a matrix covers less of its corpus than it should. Returns True if fine."""
+    chunks = info.get("imatrix.chunk_count")
+    if info.get("unreadable"):
+        log.warning(
+            "imatrix provenance is unreadable (%s); cannot confirm how much of the corpus "
+            "it covers", info["unreadable"],
+        )
+        return False
+    if not isinstance(chunks, int):
+        log.warning("imatrix reports no chunk_count; cannot confirm its coverage")
+        return False
+    if chunks < min_chunks:
+        log.warning(
+            "imatrix saw only %d chunks (%s tokens), below the %d that reads as fully "
+            "sampled. It is structurally complete -- every tensor and block is present -- so "
+            "nothing will fail; the quantisation is simply tuned on thinner statistics. "
+            "Rebuild it if this feeds Stage 0's control curve, which every later "
+            "healing-vs-quantisation judgement is measured against.",
+            chunks, f"{info.get('tokens_seen', 0):,}", min_chunks,
+        )
+        return False
+    return True
+
+
 def imatrix_for(
     src_gguf: str | Path,
     corpus_txt: str | Path,
@@ -188,6 +237,7 @@ def imatrix_for(
             log, "imatrix cache hit", path=str(out), fingerprint=fp,
             chunks=info.get("imatrix.chunk_count"), tokens_seen=info.get("tokens_seen"),
         )
+        warn_if_undersampled(info)
         _write_meta(meta, src_gguf, fp, corpus_txt, kw, info)
         return out
     build_imatrix(src_gguf, corpus_txt, out, **kw)
