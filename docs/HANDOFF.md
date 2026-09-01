@@ -252,6 +252,31 @@ Taking it means `configs/marlowe-18b.yaml` must drop `requires_healed_parent: tr
 `stage8-ladder`'s refusal must be overridden deliberately — both exist to stop this happening
 by accident, and neither should be relaxed except as this decision.
 
+### Stage 9 — MTP head retrain, per child (deferred, after Stage 7 ships)
+
+Surgery drops the MTP draft head (`drop_mtp: true`, −0.38 B) because it is invalid once
+layers are removed: it predicts from hidden states produced by a 64-layer stack, and after a
+12- or 23-layer cut that relationship no longer holds. Every GGUF this pipeline builds is
+converted with `--no-mtp` (see §3, the `block_count` mismatch).
+
+It can be given back, and the cheap way is a separate stage rather than a healing-budget
+line item. **Retrain the head standalone against the healed base, with the base frozen:**
+forward through the base for hidden states, backward only through the head.
+
+Why this is easy where Stage 6 is hard: the resident set is base weights + head + the head's
+optimizer state. No LoRA, no adapter gradients, and **no 52-layer backward** — and the
+52-layer backward transient is the entire reason Stage 6 is tight (13.1 GB steady against an
+18.2 GB peak, §3a). It fits comfortably on the same card, converges fast once the base is
+stable, and costs nothing from the healing budget.
+
+Do the converter fix with the stage, not before: write `block_count` flags rather than
+`num_hidden_layers`, and **confirm the MTP slot's flag against the loader** rather than
+inferring it from `qwen35.cpp`'s interval fallback — that line guards on `i < n_layer()` and
+it is not obvious whether `n_layer()` there is 64 or 65. Guessing the recurrent flag for a
+block is precisely how this codebase produces a model that loads, runs, and is wrong.
+
+`convert_to_gguf(..., no_mtp=False)` is preserved and tested for exactly this.
+
 ### Ship gate: three bit-widths, all required
 
 `SHIP_BIT_WIDTHS = ("q4_K_M", "iq4_xs", "iq3_m")`. Under-healed weights carry larger
