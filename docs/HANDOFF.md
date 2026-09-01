@@ -86,6 +86,18 @@ also leaves the target intact. Both are cheaper than corrupting the target.
 If the fp16 ladder exhausts, the search **stops and reports** rather than stepping over the
 cliff. Gated candidates are not even probed without approval.
 
+**The NF4 gate is now nearly moot on throughput alone.** Measured: 9.8 tok/s for
+`nf4-head + AdamW fp32` against 44.3 for the fp16 equivalent at the same sequence length —
+**4.5x slower**. They lose on schedule before the quality argument is even reached. If the
+fp16 ladder ever exhausts, the answer is almost certainly a smaller rank or a shorter
+sequence, not a quantised head.
+
+**Sequence length is a schedule decision, not only a memory one.** 1024 measured 73.5 tok/s
+against 2048's 44.3 — 66% faster. Neither length is long enough to train DeltaNet state
+eviction, so they are not meaningfully different for long-range exercise. **2048 winning the
+memory search does not automatically make it the choice**; prefer 1024 unless there is a
+specific reason not to.
+
 Two savings are near-free and are in *every* candidate: `embed_tokens` on CPU (not a Linear,
 so NF4 can't touch it; 2.5 GB; a lookup on CPU is cheap) and a chunked loss (`2048 × 248320`
 is 1.02 GB in bf16 before any softmax intermediate).
@@ -219,6 +231,39 @@ Corollaries that earned their place:
 
 ---
 
+## 3b. Schedule — the brief's estimate was 3-4x optimistic
+
+The brief assumed ~200 tok/s, which came from an Unsloth-based estimate. This stack is plain
+peft plus bitsandbytes. Measured on the 22.3B student (RTX 4080 Super, fp16 head, AdamW8bit,
+micro_batch 1, gradient checkpointing, loss chunked at 256):
+
+```
+seq 2048, rank 32, AdamW8bit                44.3 tok/s
+seq 1024, rank 32, AdamW8bit                73.5 tok/s
+seq 2048, rank 32, NF4 head, AdamW fp32      9.8 tok/s
+```
+
+`marlowe schedule` regenerates this from whatever rate is current:
+
+```
+healing wall-clock at 73.5 tok/s (93 tok/s estimated for the 18B, scaled by depth)
+
+  tokens         22B         18B    both rungs
+     20M       3.1 d       2.5 d         5.6 d
+     35M       5.5 d       4.3 d         9.9 d
+     50M       7.9 d       6.2 d        14.1 d
+    100M      15.7 d      12.4 d        28.2 d
+```
+
+**The shipped configs (22B=50M, 18B=100M) are 20.3 days of healing alone.** That needs an
+explicit decision before Stage 5; the operator was choosing at the point this was written.
+
+Stage 5's teacher cache is a further unmeasured cost. The brief budgeted 6 hours from an
+assumed 2500 tok/s — the same source as the 200 tok/s. Scaling the measured training rate by
+a forward-only factor of ~3 and by depth (64 vs 52 layers) suggests **~3 days per rung at
+50M tokens**, not 6 hours. `teacher_cache_days()` computes it; **it is an estimate and Stage 5
+should replace it with its own logged rate.**
+
 ## 4. Open items
 
 1. **Stage 2 needs a hosted bf16 endpoint.** It fails closed without one, by design — that
@@ -244,6 +289,9 @@ Corollaries that earned their place:
    start unless the calibration set yields 4 sequences of 32768 tokens. See `data/README.md`.
 
 4. **The memory search result is not in.** See §5.
+
+5. **The healing token budget needs re-deciding against measured throughput.** See §3b. The
+   configs still carry the 3-day-era numbers.
 
 ---
 

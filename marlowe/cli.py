@@ -367,6 +367,20 @@ def cmd_repetition(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_schedule(args: argparse.Namespace) -> int:
+    """Wall-clock for a token budget, from measured throughput rather than an assumption."""
+    from marlowe.heal import MEASURED_TOK_S, render_schedule
+
+    if args.tok_s is None:
+        print("measured rates (22.3B student, plain peft + bitsandbytes, RTX 4080 Super):")
+        for k, v in MEASURED_TOK_S.items():
+            print(f"  {k:<40} {v:>6.1f} tok/s")
+        print()
+    tok_s = args.tok_s or MEASURED_TOK_S["22b-seq1024-rank32"]
+    print(render_schedule(tok_s, [int(float(b) * 1e6) for b in args.budgets]))
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     from marlowe.report import collect, render_table, write_report
 
@@ -498,6 +512,13 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("-n", type=int, help="override n_completions")
     rr.add_argument("--out", help="write the full report JSON here")
     rr.set_defaults(fn=cmd_repetition)
+
+    sc = sub.add_parser("schedule", help="token budget vs wall-clock, from measured tok/s")
+    sc.add_argument("--tok-s", dest="tok_s", type=float,
+                    help="training throughput (default: the measured 1024/rank32 rate)")
+    sc.add_argument("--budgets", nargs="+", default=["20", "35", "50", "100"],
+                    help="token budgets in millions")
+    sc.set_defaults(fn=cmd_schedule)
 
     rp = sub.add_parser("report", help="unified metrics table")
     rp.add_argument("--run-dir", required=True)

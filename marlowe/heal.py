@@ -46,7 +46,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1123,6 +1123,99 @@ def probe_training(
             seq,
         )
     return result
+
+
+#: Measured on the 22.3B student, plain peft + bitsandbytes, fp16 head, AdamW8bit,
+#: micro_batch 1, gradient checkpointing on, loss chunked at 256. RTX 4080 Super.
+#:
+#: The project brief assumed ~200 tok/s, which came from an Unsloth-based estimate. This
+#: stack is not Unsloth, and the gap is a factor of 3-4. Schedules must use these.
+MEASURED_TOK_S: dict[str, float] = {
+    "22b-seq2048-rank32": 44.3,
+    "22b-seq1024-rank32": 73.5,
+    "22b-seq2048-rank32-nf4head-adamw32": 9.8,
+}
+
+
+def scale_tok_s(tok_s: float, from_layers: int, to_layers: int) -> float:
+    """Scale throughput between rungs by decoder depth.
+
+    Per-step cost is dominated by the decoder stack, which is linear in layer count. The
+    embedding and head are constant, so this slightly *under*-estimates the smaller model's
+    speed -- an error in the conservative direction for scheduling.
+    """
+    return tok_s * from_layers / to_layers
+
+
+def schedule_rows(
+    tok_s: float,
+    budgets: Sequence[int],
+    *,
+    layers: int = 52,
+    child_layers: int = 41,
+) -> list[dict[str, float]]:
+    """Wall-clock for a heal budget on each rung, and both together."""
+    child_tok_s = scale_tok_s(tok_s, layers, child_layers)
+    rows: list[dict[str, float]] = []
+    for tokens in budgets:
+        h1 = tokens / tok_s / 3600
+        h2 = tokens / child_tok_s / 3600
+        rows.append(
+            {
+                "tokens": float(tokens),
+                "rung1_h": h1,
+                "rung1_d": h1 / 24,
+                "rung2_h": h2,
+                "rung2_d": h2 / 24,
+                "both_d": (h1 + h2) / 24,
+            }
+        )
+    return rows
+
+
+#: Forward-only work costs roughly a third of a training step (no backward, no optimizer,
+#: no stored activations). ESTIMATE, not measured -- Stage 5 logs its real rate.
+FORWARD_ONLY_SPEEDUP = 3.0
+
+
+def teacher_cache_days(tok_s: float, tokens: int, *, student_layers: int = 52,
+                       teacher_layers: int = 64) -> float:
+    """Rough Stage 5 wall-clock, scaled from the measured training rate.
+
+    The brief budgeted 6 hours from an assumed 2500 tok/s. That came from the same source as
+    the 200 tok/s training estimate, which measured 73.5. Treat this as the order of
+    magnitude and let Stage 5's own logs replace it.
+    """
+    fwd = scale_tok_s(tok_s * FORWARD_ONLY_SPEEDUP, student_layers, teacher_layers)
+    return tokens / fwd / 3600 / 24
+
+
+def render_schedule(tok_s: float, budgets: Sequence[int], **kw: Any) -> str:
+    rows = schedule_rows(tok_s, budgets, **kw)
+    child = scale_tok_s(tok_s, kw.get("layers", 52), kw.get("child_layers", 41))
+    out = [
+        f"healing wall-clock at {tok_s:.1f} tok/s measured on the 22B "
+        f"({child:.0f} tok/s estimated for the 18B, scaled by depth)",
+        "",
+        f"{'tokens':>8}  {'22B':>10}  {'18B':>10}  {'both rungs':>12}",
+        f"{'-' * 8}  {'-' * 10}  {'-' * 10}  {'-' * 12}",
+    ]
+    for r in rows:
+        out.append(
+            f"{r['tokens'] / 1e6:>7.0f}M  {r['rung1_d']:>8.1f} d  "
+            f"{r['rung2_d']:>8.1f} d  {r['both_d']:>10.1f} d"
+        )
+    out += [
+        "",
+        "healing only. Stage 5 builds a teacher cache per rung, forward-only on the 27B:",
+        "",
+        f"{'tokens':>8}  {'cache/rung':>12}  {'both caches':>13}   ESTIMATE, not measured",
+        f"{'-' * 8}  {'-' * 12}  {'-' * 13}",
+    ]
+    for r in rows:
+        d = teacher_cache_days(tok_s, int(r["tokens"]))
+        out.append(f"{r['tokens'] / 1e6:>7.0f}M  {d:>10.1f} d  {2 * d:>11.1f} d")
+    return "\n".join(out)
 
 
 def kl_plateaued(history: list[dict[str, Any]], delta: float, window: int = 2) -> bool:
