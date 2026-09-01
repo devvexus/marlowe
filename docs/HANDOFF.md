@@ -33,19 +33,51 @@ Ordered. Do not infer priority from the rest of this document.
    around 13-16 GB), the `base cached` / `training probe` lines in the log, and
    `runs/<name>/logs/*.jsonl` if it was launched under a stage rather than standalone.
 
-2. **Prefer seq_len 1024 unless something changed.** 73.5 vs 44.3 tok/s is 66% faster and
-   neither length trains DeltaNet state eviction, so 2048 winning the memory search does not
-   make it the choice (§2, §3b). If the search selects 2048, override it deliberately.
+2. **Validate that 1024 is not itself paging — ten minutes, do this before trusting any
+   throughput number.**
 
-3. **Run the Unsloth evaluation once the GPU is free** (§4 item 5). It can halve a 15-day
+   Measured: 2048 ran at 10.4 tok/s against 1024's 114.7. **2048 should be *faster* per
+   token**, not 11x slower — longer sequences amortise per-step overhead better. An 11x
+   inversion is the signature of paging, not a workload effect. Under WDDM, exceeding VRAM
+   does not OOM: the driver pages to host memory and the job silently runs about an order of
+   magnitude slower.
+
+   If 2048 pages catastrophically, 1024 may page mildly and 114.7 would be an inflated
+   number to plan against. The test:
+
+   ```bash
+   marlowe fitcheck --model <sizing-22b> --no-search --seq-len 512  --steps 8 2>&1 | tee p512.log
+   marlowe fitcheck --model <sizing-22b> --no-search --seq-len 768  --steps 8 2>&1 | tee p768.log
+   marlowe fitcheck --model <sizing-22b> --no-search --seq-len 1024 --steps 8 2>&1 | tee p1024.log
+   ```
+
+   **Both 512 and 768 must be SLOWER per token than 1024**, because shorter sequences
+   amortise per-step overhead worse. If either comes out *faster*, 1024 is also paging and
+   the real ceiling is below it — drop to the fastest length that still increases with
+   sequence size.
+
+   If the ordering holds, 114.7 tok/s is clean and **35M at 1024 is ~3.5 days for the 22B**,
+   close to the brief's original intent without needing Unsloth.
+
+3. **Prefer seq_len 1024 unless something changed.** Faster and neither length trains
+   DeltaNet state eviction, so 2048 winning a memory search does not make it the choice
+   (§2, §3b). If a search selects 2048, override it deliberately.
+
+   **On this platform, throughput is the fit signal and memory accounting is a diagnostic.**
+   `probe_training` has been wrong three times (§3); the throughput measurement has never
+   been wrong. A configuration that does not fit announces itself by running ~10x slow, not
+   by crashing.
+
+4. **Run the Unsloth evaluation once the GPU is free** (§4 item 5). It can halve a 15-day
    schedule, costs about an hour, and its harness is written. Isolated venv only. If it
    passes, re-run `marlowe fitcheck` — the whole memory ladder was measured on plain peft.
+   Urgency dropped once 1024 measured 114.7 tok/s: the schedule may already be acceptable.
 
-4. **Stage 2 is blocked on the operator's OpenRouter endpoint.** Everything else is
+5. **Stage 2 is blocked on the operator's OpenRouter endpoint.** Everything else is
    unblocked. Do not work around it with `--allow-missing-bf16-baseline` unless the operator
    asks: that baseline defines the repetition ship criterion.
 
-5. **Stage 0 can run whenever the GPU is free.** Control curve, not a gate. Synthetic prompt
+6. **Stage 0 can run whenever the GPU is free.** Control curve, not a gate. Synthetic prompt
    set, labelled as such in every report (§2). ~8 h.
 
 The GPU is the scarce resource and only one of these can use it at a time. Rough order if it
