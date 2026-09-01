@@ -285,9 +285,25 @@ def cmd_fitcheck(args: argparse.Namespace) -> int:
     margin = args.margin if args.margin is not None else FIT_MARGIN_GB
 
     if args.no_search:
-        result = probe_training(args.model, cfg, n_steps=args.steps, max_gpu_gb=args.max_gpu_gb)
+        result = probe_training(
+            args.model, cfg, n_steps=args.steps, max_gpu_gb=args.max_gpu_gb,
+            log_every=args.log_every or 0,
+        )
         print(result.render(cfg.tokens))
-        return 0 if result.headroom_gb() >= margin else 1
+        if result.trace:
+            slope = result.fragmentation_slope_gb_per_1k()
+            print(f"\nsoak over {args.steps} steps:")
+            if slope is None:
+                print("  too few samples after warm-up to fit a slope")
+            else:
+                print(f"  trapped fragmentation slope  {slope * 1000:+.1f} MB / 1000 steps")
+                exhaust = result.steps_to_exhaust(margin)
+                if exhaust is None:
+                    print("  flat or shrinking: the allocator reached a steady block pattern")
+                else:
+                    print(f"  at that rate a {margin:.1f} GB margin is gone in "
+                          f"{exhaust:,.0f} steps -- set the restart interval below it")
+        return 0 if result.fits(margin) else 1
 
     search = search_memory_plan(
         args.model,
@@ -491,6 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--steps", type=int, default=12)
     fc.add_argument("--seq-len", dest="seq_len", type=int)
     fc.add_argument("--lora-rank", dest="lora_rank", type=int)
+    fc.add_argument("--log-every", dest="log_every", type=int,
+                    help="sample trapped fragmentation every N steps (soak mode)")
     fc.add_argument("--loss-chunk", dest="loss_chunk", type=int,
                     help="sequence chunk for the logit/loss computation (static-footprint lever)")
     fc.add_argument("--max-gpu-gb", dest="max_gpu_gb", type=float)

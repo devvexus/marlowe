@@ -901,6 +901,38 @@ class ProbeResult:
     #: What the driver did with memory during the probe. This, not headroom and not
     #: throughput, is the fit decision -- see :meth:`fits` and marlowe.gpumem.
     paging: PagingReport = field(default_factory=PagingReport)
+    #: ``(step, allocated_gb, trapped_gb)`` samples, when the probe ran with ``log_every``.
+    #: Empty for a short fit probe; populated for a soak.
+    trace: list[tuple[int, float, float]] = field(default_factory=list)
+
+    def fragmentation_slope_gb_per_1k(self, skip: int = 50) -> float | None:
+        """Growth in trapped bytes per 1000 steps, or None without enough samples.
+
+        The soak question is not "did it survive N steps" but whether the allocator reaches
+        a steady block pattern. Early samples are warm-up -- the pool is still being carved --
+        so ``skip`` drops them before fitting; a slope measured through warm-up is steep and
+        meaningless. A flat slope after warm-up means 40,000 steps is credible. A positive
+        one is not automatically disqualifying: it sets the restart interval, and only a
+        slope steep enough to exhaust the margin inside one checkpoint interval is fatal.
+        """
+        pts = [(s, t) for s, _, t in self.trace if s >= skip]
+        if len(pts) < 3:
+            return None
+        n = len(pts)
+        mean_x = sum(x for x, _ in pts) / n
+        mean_y = sum(y for _, y in pts) / n
+        denom = sum((x - mean_x) ** 2 for x, _ in pts)
+        if denom == 0:
+            return None
+        slope = sum((x - mean_x) * (y - mean_y) for x, y in pts) / denom
+        return slope * 1000
+
+    def steps_to_exhaust(self, margin_gb: float, skip: int = 50) -> float | None:
+        """Steps until fragmentation growth eats ``margin_gb``. None if flat or unknown."""
+        slope = self.fragmentation_slope_gb_per_1k(skip)
+        if slope is None or slope <= 0:
+            return None
+        return margin_gb / slope * 1000
     #: What torch itself accounted for. Lower than peak_vram_gb by the CUDA context and
     #: allocator fragmentation; kept for diagnosis, never for the fit decision.
     torch_allocated_gb: float = 0.0
@@ -1309,6 +1341,7 @@ def probe_training(
     n_steps: int = 12,
     max_gpu_gb: float | None = None,
     base: Any = None,
+    log_every: int = 0,
 ) -> ProbeResult:
     """Run a few real training steps and measure throughput and peak VRAM.
 
@@ -1380,6 +1413,7 @@ def probe_training(
     t_lp = torch.log_softmax(torch.randn(cfg.micro_batch, seq, k, device=device), dim=-1)
 
     timings: list[float] = []
+    trace: list[tuple[int, float, float]] = []
     for i in range(n_steps):
         t0 = time.time()
         out = decoder(input_ids=ids, use_cache=False)
@@ -1409,6 +1443,17 @@ def probe_training(
         # Discard the first two steps: allocator warm-up and cuBLAS autotuning.
         if i >= 2:
             timings.append(time.time() - t0)
+        if log_every and (i % log_every == 0 or i == n_steps - 1):
+            # Trapped bytes: reserved the allocator holds but cannot hand out. This is the
+            # number that decides whether a multi-day run survives -- an OOM at hour 30 is
+            # this figure growing, not the live footprint changing.
+            alloc = torch.cuda.memory_allocated() / 1e9
+            trapped = (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) / 1e9
+            trace.append((i, alloc, trapped))
+            logutil.event(
+                log, "soak", step=i, allocated_gb=round(alloc, 2),
+                trapped_gb=round(trapped, 3),
+            )
 
     # The footprint that actually constrains the run: the CUDA context plus the allocator's
     # high-water reservation. The context is measured once and globally (see
@@ -1444,6 +1489,7 @@ def probe_training(
         lm_head_precision=_measured_head_precision(model),
         modules_trained_in_full=effective_lora_targets(cfg)[1],
         paging=paging,
+        trace=trace,
     )
     del optim
     if base is None:
