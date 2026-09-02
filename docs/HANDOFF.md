@@ -100,14 +100,37 @@ cannot run alongside a training probe that has taken the whole card.
 | stage | status | notes |
 |---|---|---|
 | `stage1-smoke` | **complete** | converter blocker closed against real weights |
-| `stage0-bitwidth` | **blocked** | needs `data/calib.jsonl`: IQ-class recipes require an importance matrix, and that is built from the calibration corpus (§4) |
+| `stage3-score` | **complete** | 3.84 h. Cut list selected; beats positional control by 42% (§1a) |
+| `stage0-bitwidth` | **partial** | 4-5 of 8 variants measured. Resumable at zero re-work |
 | `stage2-baselines` | **blocked** | needs a hosted bf16 endpoint (§4) |
-| `stage3-score` | **blocked** | 8 h; needs `data/calib.jsonl`, still a placeholder (§4) |
-| `stage4`–`stage8` | not started | |
+| `stage4-surgery` | **ready** | Stage 3's cut list is on disk; this is the next thing to run |
+| `stage5`–`stage8` | not started | Stage 6 is blocked on the fit (§3a) |
 
-**In progress:** a memory-configuration search (`marlowe fitcheck`) against a sizing-only
-22B. The first attempt was voided by a measurement bug (§3) and re-run against corrected
-code. See §5 for what is and is not known.
+Both corpora are built (`data/calib.jsonl` 1.71M tokens / 34 sequences,
+`data/heal_corpus.jsonl` 35.01M tokens), and the parent importance matrix is complete
+(415 chunks, the full corpus). Those three were the blockers on everything downstream of
+quantisation.
+
+## 1a. Stage 3 result: the cut list
+
+```
+selected   [4, 5, 8, 9, 13, 14, 16, 17, 37, 38, 40, 41]
+child      52 layers (16 full_attention, 36 linear_attention), 22.2968 B  (matches expected_params)
+profile    runs/marlowe-22b/metrics/layer_profile.json  (+ .png)
+```
+
+**Measured selection beats the positional control by 42%**, which is the empirical
+justification for the stage costing four hours rather than cutting evenly:
+
+```
+positional control  [4,9,13,18,24,29,33,38,44,49,53,58]   summed KL 0.217355
+measured selection  [4,5,8,9,13,14,16,17,37,38,40,41]     summed KL 0.125685
+overlap: 4 of 12
+```
+
+The selection clusters in two bands (4-17, 37-41) rather than spreading out, which is
+structure even spacing cannot find. Ranked least-damaging first:
+`16, 17, 5, 38, 37, 9, 13, 14, 41, 4, 40, 8, 45, 29, ...`
 
 ### Where things live
 
@@ -348,6 +371,14 @@ baseline, which comes from a hosted endpoint.
 | memory metric saturated across candidates | `search_memory_plan` base caching | the allocator's high-water reservation is not returned between candidates, so every candidate after the first inherits the first one's peak. Reported 23.99 / 23.97 / 23.95 GB across a 2× change in sequence length — identical, saturated, not a measurement |
 | `cuda_context_bytes()` returned 0 | `probe_training` via the search | it is measured lazily, and in the search path the first call happens after the cached base is resident. Its "subtract what torch reserved back out" fallback then collapses to zero, silently dropping the ~1.4 GB context term and overstating headroom by the same amount |
 
+| `imatrix` parameter never passed | `quantize()` + every call site | the argument existed from the start and nothing supplied one. Stage 0 died on its first recipe -- after a 54 GB conversion, seven minutes in -- with "this quantization requires an importance matrix!" |
+| an interrupted imatrix is indistinguishable from a finished one | `llama-imatrix` output | it writes a complete, valid GGUF at every periodic save. A kernel panic stopped one at 120 of ~420 chunks and the file was structurally perfect: all 64 blocks, 992 tensors. Only `imatrix.chunk_count` says otherwise, and nothing read it |
+| Stage 0 re-measured variants it had already measured | `stage0_bitwidth` loop | quantisation was skipped when the GGUF existed; the ~50-minute harness was not. Stopping after three recipes and resuming would have re-generated 2.5 h before reaching the fourth |
+| `llm_int8_enable_fp32_cpu_offload` missing | `score.load_4bit` | present in `heal.load_student` since it was written. Stage 3's load was refused outright: "Some modules are dispatched on the CPU or the disk" |
+| `device_map="auto"` | `score.load_4bit` | `heal.load_student` documents that accelerate spills Linear4bit modules and dies reading `quant_state.offset.item()` on a meta tensor. Here it was a **segmentation fault** during load -- log ending mid-sentence, no traceback |
+| a probe that could never succeed, defaulting to the wrong answer | `score.detect_return_style` | it called the decoder layer without `position_embeddings`, a required positional argument, so it **always** raised -- and the handler read that as "returns a tuple". This architecture returns a bare tensor, so every ablated layer handed back `(hidden,)` and the next real layer called `input_layernorm` on a tuple. Stage 3 ran the entire reference pass and died on its first candidate, eight minutes in |
+| `estimated_hours` believed | every `@register` | Stage 0 declares 4.0 h and takes ~8.0; Stage 3 declares 8.0 h and takes ~3.5. Neither had ever been measured (§5) |
+
 **The pattern: every one of these loads, runs, and produces plausible output.** None crashes.
 None OOMs. The model generates fluent text, the search reports a number, the config parses.
 That is the failure shape this codebase produces, and it is what to look for.
@@ -551,6 +582,72 @@ project from candidate intervals, not from the reference.
 To measure a stage in flight rather than waiting for it: Stage 0 exposes decode progress via
 llama-server's `/slots` (`next_token[0].n_decoded`, which resets per completion -- count the
 resets), and Stage 3 logs `candidate scored` per candidate.
+
+## 5a. A quantised variant above ~12 GB falls off a throughput cliff
+
+Stage 0's harness runs at **137 tok/s aggregate** (4 llama-server slots) for variants up to
+~12.6 GB, and at **31 tok/s** for `q4_k_s` at 15.59 GB -- a 4.4x collapse, turning a 50-minute
+variant into 3.7 hours.
+
+The cause is not the model size alone: llama-server is started with `-c ctx * parallel`, so
+4 slots x 8192 is 32768 tokens of KV cache on top of the weights. At 15.59 GB of weights the
+two no longer fit in 16 GB, layers spill to CPU, and decode drops by the ratio you would
+expect from running part of a model on system RAM.
+
+Consequences worth planning around:
+
+- **Budget Stage 0 by variant size, not variant count.** The eight recipes are not eight
+  equal units of work.
+- `SHIP_BIT_WIDTHS` includes `q4_K_M`. On the 22B child that measured **13.75 GB**, which is
+  in the same danger zone -- Stage 7's gate will be slow at that width for the same reason,
+  and on the parent it would be slower still.
+- If a wider variant is needed cheaply, lower `repetition.parallel` (fewer slots means less
+  KV cache and possibly a fit) before touching `n_completions`, which costs statistics.
+
+## 5b. Measuring a run in flight
+
+Neither harness prints throughput, and both write results only when a unit of work finishes,
+so a healthy run and a hung one look identical from the log. These are the two live signals:
+
+- **Stage 0**: `curl http://127.0.0.1:8080/slots` -- each slot's `next_token[0].n_decoded`
+  counts tokens for the *current* completion and resets when it finishes, so sample
+  repeatedly and treat a decrease as `(2048 - prev) + cur`. Sampling naively across a reset
+  reports ~0.2 tok/s and looks like a hang; it is not.
+- **Stage 3**: `candidate scored` per candidate. Time the interval between two, multiply by
+  42. Do not project from the reference pass -- it runs at 134 s/forward against the
+  candidates' 75 s because of first-pass warm-up.
+
+Corroborating signals that separate "expensive" from "hung": GPU power draw *fluctuating*
+(compute- and memory-bound phases alternating) rather than pinned, and the process's CPU
+time rising.
+
+## 5c. Claims this document made that turned out to be wrong
+
+Recorded because a handoff that only accumulates conclusions teaches the next reader to
+trust it more than it deserves.
+
+- **"Throughput is the fit signal; memory accounting is a diagnostic."** Falsified. A probe
+  measured 74.5 tok/s while 6.8 GB over the card. Under WDDM the driver pages rather than
+  refusing, so an over-committed run can look fast. The gate is the driver's Shared Usage
+  counter (§0 item 3).
+- **`score.n_seqs` should be raised to use the whole corpus.** Pushed repeatedly during one
+  session, framed as "a one-line change now, or an 8-hour redo later". It would have made
+  Stage 3 a **68-hour** job: `(42 + 1) x n_seqs` forwards. 4 is the compute budget and is
+  correct. The framing was wrong in both directions -- it implied the change was cheap and
+  that not making it was risky.
+- **"Moving the desktop apps to the iGPU frees the 1.38 GB context."** It does not. That
+  figure is this process's own WDDM reservation: with the card at 0 MiB and nvidia-smi
+  reporting 254 MiB after CUDA init, `mem_get_info` still reports 1.42 GB used. Re-measuring
+  after the apps moved gave a byte-identical deficit.
+- **"Our IQ3_XXS is 12% larger than Unsloth's."** It is 2.3% larger (11.186 GB against
+  10.935 GB). The "10 GB" was a rounded display figure, and the comparison tag was wrong --
+  `marlowe-dusk:27b` is Q4_K_S with a vision tower, not IQ3_XXS.
+- **"Our quant contains 64 vision tensors."** It contains zero. The detection pattern `v.`
+  matched `attn_qkv.weight`.
+- **`expandable_segments` reduces fragmentation here.** It is rejected outright on Windows
+  (torch 2.5.1, `get_allocator_backend()` reports `native`). The 2.95 GB of fragmentation
+  measured during training accrued with that flag set. What does work: `max_split_size_mb`
+  and `garbage_collection_threshold`, which are supported (§3a).
 
 ## 6. Do not re-litigate
 
