@@ -179,15 +179,77 @@ informative than a curve with structure. If real triggers arrive,
 note Stage 0 deletes its candidates on *successful* completion: the five GGUFs are on disk
 only because the run was stopped early.
 
-## 1c. Stage 4 is running; the KL reference is the thing to get right
+## 1c. Stage 4 is done. The floor is measured, and the gate is tighter than it looks
 
-**In flight** (background agent): surgery on the Stage 3 cut list -> GGUF convert -> child
-imatrix -> IQ3_M -> Q4_K_M. Surgery is streaming safetensors on CPU (`safe_open` per tensor,
-no `from_pretrained`); nothing in this path makes the 27B resident in bf16.
+**Complete.** Surgery -> GGUF convert -> child imatrix -> IQ3_M -> Q4_K_M, all verified.
+Surgery streamed safetensors on CPU (`safe_open` per tensor, no `from_pretrained`), peak RSS
+4.9 GB; nothing in this path ever made the 27B resident in bf16.
+
+| artefact | size | detail |
+| --- | --- | --- |
+| `models/marlowe-22b-unhealed` | 44.6 GB | 52 layers, 36 linear + 16 full, 22.2968 B params, 683 tensors |
+| `gguf/marlowe-22b-unhealed-bf16.gguf` | 44.61 GB | `block_count` 52, `recurrent_layers` length 52, matches `child_layout` element-for-element |
+| `gguf/imatrix/child-unhealed-full.dat` | 11.0 MB | 415 chunks at 4096, 800 tensors, 1,699,840 tokens |
+| `gguf/marlowe-22b-unhealed-iq3_m.gguf` | 10.495 GB | bpw 3.7656 |
+| `gguf/marlowe-22b-unhealed-q4_k_m.gguf` | 13.739 GB | bpw 4.9296 |
+| `metrics/reference.kld` | **77.28 GB** | 38 chunks at `-c 8192`, PPL 4.885, certified |
 
 Note `stage4_surgery`'s docstring says the unhealed checkpoint "gets measured". **It does
 not** -- the code runs surgery and asserts the parameter count, nothing else. The floor KL is
 separate work, done through llama.cpp only.
+
+### The floor, measured
+
+Both against `metrics/reference.kld` (Q8_0 parent, held-out corpus, `-c 8192`):
+
+| | kl_mean | kl_median | kl_p99 | kl_max | top-p agree |
+| --- | --- | --- | --- | --- | --- |
+| 27B iq3_xxs (gate baseline) | 0.144219 | 0.022859 | 1.647745 | 33.36 | 89.96% |
+| **22B child IQ3_M (floor)** | **0.451331** | 0.153132 | 4.879992 | 36.84 | 77.98% |
+
+0.45 nats unhealed is inside the expected band for 19% layer removal. The median moved 6.7x
+against the mean's 3.1x, which says the damage is **diffuse rather than concentrated in a
+tail** -- the case LoRA recovers well. Record this as the floor; it is the number healing has
+to close.
+
+### The gate is tight at IQ3_M, and that is a width problem, not a healing problem
+
+The comparison is not symmetric, and it is easy to read it as though it were:
+
+* the **baseline** (27B iq3_xxs) carries **quantisation error only**
+* the **child at IQ3_M** carries **pruning residual + its own quantisation error**
+
+IQ3_M's advantage over IQ3_XXS is only ~0.04-0.06 nats. So for the child to clear the
+baseline at IQ3_M, the *healing residual* has to land under roughly **0.05 nats** -- near
+complete recovery of the pruning damage, with the width contributing almost nothing.
+
+**Expect IQ4_XS to pass before IQ3_M does.** IQ3_M is the demanding width in
+`SHIP_BIT_WIDTHS`, not the representative one. A run that passes at IQ4_XS and Q4_K_M and
+fails at IQ3_M is the *expected* intermediate state, not a failure of the approach. Do not
+retune the recipe on the strength of an IQ3_M miss alone.
+
+### Stage 3 was one-shot, so cut interaction was never measured
+
+Ablation KL was scored one layer at a time against the full model. The cut list removes
+twelve layers *together*, and **eight of the twelve fall in periods 1-4**. Nothing in Stage 3
+measured what happens when neighbours in the same period go at once.
+
+If the floor comes in worse than the summed single-layer ablation KL predicts, this is the
+first place to look, and it is the argument for running the **greedy-rescoring mode on the
+18B rung** rather than one-shot again: greedy scores each candidate on top of the cuts
+already taken, which is the only way interaction shows up.
+
+### Stage 6: decide at the first checkpoint, not at the end
+
+Stage 6 checkpoints every 10M tokens and runs both metrics at each. At the **first**
+checkpoint (10M tokens), measure KL against `reference.kld` and branch:
+
+* **below ~0.25 and still falling** -> continue, the budget is working
+* **flattening above ~0.30** -> **stop and report**. The token budget is insufficient;
+  whether to extend it is the operator's call, not the run's.
+
+Do not spend the full 35M to discover this. The whole point of checkpointing at 10M is that
+the answer is legible there, and a flat curve at 10M does not become a falling one at 35M.
 
 ### The KL reference must be held out from healing, and nothing else must be
 
