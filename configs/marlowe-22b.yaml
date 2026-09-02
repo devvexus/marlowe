@@ -41,8 +41,12 @@ teacher:
   # once and consumed once. At the measured forward rate every surplus 10M tokens is
   # roughly another day of Stage 5 for data training never reads.
   tokens: 35000000
-  top_k: 16
-  seq_len: 2048
+  # K=64, not 16. Top-K costs cache bytes and nothing else at train time,
+  # and it is the cheapest transfer lever available (TRANSFER_PLAN lever 2).
+  top_k: 64
+  # Must match heal.seq_len: the cache is built at one fixed length and its
+  # distributions are position-aligned.
+  seq_len: 1024
   batch_size: 4
   corpus_path: data/heal_corpus.jsonl
   shard_tokens: 5000000
@@ -52,7 +56,11 @@ heal:
   # is the intermediate: a direct 27B -> 18B cut is outside the band where healing recovers,
   # and this rung exists to keep each step near 19%.
   tokens: 35000000
-  seq_len: 2048            # what makes 3 days possible; verify at 128K before shipping
+  # 1024, not 2048. Every fit measurement in this project was taken at 1024, and the fit
+  # ended ~96 MiB short there -- so the 2048 rungs are unreachable by construction, and
+  # the 44.3 tok/s that built the published schedule is a rate for a config that cannot
+  # run. Verify long context at 128K before shipping; the anneal is the mitigation.
+  seq_len: 1024
   lora_rank: 32
   lora_alpha: 64
   learning_rate: 0.0001

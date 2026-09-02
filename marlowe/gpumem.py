@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,27 +90,40 @@ class PagingSampler:
     holds nothing on the device, which is what makes the floor self-calibrating. That also
     removes the need to identify the discrete adapter up front -- whichever instance shows
     the largest dedicated usage over the run is the one doing the work.
+
+    **Reads typeperf's stdout, not its ``-o`` file.** The file variant never produced a single
+    sample: typeperf buffers into the output file and ``terminate()`` kills it before any
+    flush, so the file was still zero bytes after a five-second run. Every probe therefore
+    reported ``available=False`` and fell back to torch accounting -- the instrument this
+    module exists to replace. stdout is line-buffered and drained by a reader thread, so the
+    samples already collected survive termination.
     """
 
     def __init__(self, interval_s: int = 2) -> None:
         self._interval = interval_s
-        self._proc: subprocess.Popen[bytes] | None = None
-        self._path: Path | None = None
+        self._proc: subprocess.Popen[str] | None = None
+        self._lines: list[str] = []
+        self._thread: threading.Thread | None = None
+
+    def _drain(self) -> None:
+        assert self._proc is not None and self._proc.stdout is not None
+        for line in self._proc.stdout:
+            self._lines.append(line)
 
     def start(self) -> None:
         if sys.platform != "win32":
             return
-        fd, name = tempfile.mkstemp(suffix=".csv", prefix="marlowe-gpumem-")
-        os.close(fd)
-        self._path = Path(name)
         try:
             self._proc = subprocess.Popen(
-                ["typeperf", _SHARED, _DEDICATED, "-si", str(self._interval),
-                 "-sc", "100000", "-o", str(self._path)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                ["typeperf", _SHARED, _DEDICATED, "-si", str(self._interval), "-sc", "100000"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1,
             )
         except OSError:
             self._proc = None
+            return
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
 
     def stop(self) -> PagingReport:
         if self._proc is None:
@@ -119,19 +133,14 @@ class PagingSampler:
             self._proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._proc.kill()
-        report = _parse(self._path) if self._path else PagingReport(available=False)
-        if self._path is not None:
-            self._path.unlink(missing_ok=True)
-        return report
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return _parse_rows(self._lines)
 
 
-def _parse(path: Path) -> PagingReport:
-    """Reduce the counter log to one adapter's peak spill above its own floor."""
-    try:
-        with path.open(encoding="utf-8", errors="replace", newline="") as f:
-            rows = list(csv.reader(f))
-    except OSError:
-        return PagingReport(available=False)
+def _parse_rows(lines: list[str]) -> PagingReport:
+    """Reduce typeperf CSV lines to one adapter's peak spill above its own floor."""
+    rows = [r for r in csv.reader(lines) if r]
     if len(rows) < 2:
         return PagingReport(available=False)
 

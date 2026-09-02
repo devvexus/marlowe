@@ -49,12 +49,15 @@ Two operational rules from the brief, both enforced here:
 from __future__ import annotations
 
 import json
+import os
 import math
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from marlowe import logutil, preflight
 from marlowe.config import HealConfig
@@ -323,6 +326,125 @@ def embedding_module_name(model_path: str | Path) -> str:
         if name.endswith("embed_tokens.weight"):
             return name[: -len(".weight")]
     raise ValueError(f"no embed_tokens tensor found in {model_path}")
+
+
+#: Bytes the embedding table occupies: 248,320 x 5,120 x 2. The number that matters is not
+#: this one but how much of it crosses the bus per forward -- see :func:`use_cpu_gather_embedding`.
+EMBED_TABLE_BYTES = 248320 * 5120 * 2
+
+
+class CpuGatherEmbedding(torch.nn.Module):
+    """Look the rows up on the host and move only the rows.
+
+    ``embed_tokens`` sits on the CPU because it is not a Linear, NF4 cannot touch it, and
+    2.54 GB is a quarter of the card. That much is right. What was wrong is the assumption
+    that "a lookup on CPU is cheap" describes what accelerate actually does: its
+    ``pre_forward`` hook copies the **whole 2.54 GB table** onto the device before every
+    forward and frees it after. So the memory is paid anyway, as a transient on top of an
+    already-full card, plus the fragmentation of allocating and releasing it every step.
+
+    Measured on the 22B at seq 768: after ``empty_cache`` the card had 2.49 GB free and the
+    hook needed 2.54 GB. Fifty megabytes. That is the "~96 MiB short" this project spent days
+    against, and every rung of the memory ladder died at the same line, before anything the
+    ladder varies had been allocated.
+
+    A gather moves ``[batch, seq, hidden]`` instead of ``[vocab, hidden]``: at seq 768 that is
+    7.9 MB against 2540 MB, a factor of ~320. The table never leaves the host.
+    """
+
+    def __init__(self, weight: torch.Tensor, device: torch.device, padding_idx: int | None):
+        super().__init__()
+        # A plain attribute, NOT a Parameter and NOT a buffer.
+        #
+        # register_buffer looks like the tidy choice and defeats the entire purpose: buffers
+        # are walked by Module.to(), so peft's and accelerate's device placement moved the
+        # 2.54 GB table straight back onto the card. Measured -- allocated went from 12.78 GB
+        # to 15.33 GB the moment this was a buffer, which is the table, exactly.
+        #
+        # nn.Module.__setattr__ intercepts Parameters and Modules; a bare Tensor lands in
+        # __dict__ and no device walk can reach it. That is the property being relied on.
+        self.weight = weight
+        self.num_embeddings, self.embedding_dim = weight.shape
+        self.padding_idx = padding_idx
+        self._device = device
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        flat = input_ids.reshape(-1).to("cpu", non_blocking=True)
+        rows = self.weight.index_select(0, flat)
+        out = rows.to(self._device, non_blocking=True).view(*input_ids.shape, self.embedding_dim)
+        # Explicit, because this path bypasses accelerate's hook and therefore bypasses
+        # whatever enable_input_require_grads() attached to it. Gradient checkpointing needs
+        # an input that requires grad or it silently recomputes nothing and the LoRA layers
+        # below receive no gradient.
+        out.requires_grad_(True)
+        return out
+
+
+def use_cpu_gather_embedding(model: Any, embed_name: str) -> dict[str, Any]:
+    """Replace the offloaded embedding with a CPU gather, and prove the hook is gone.
+
+    Returns what was measured, so the caller can assert on it rather than trust it.
+    """
+    import accelerate.hooks as ahooks
+
+    parent_path, _, attr = embed_name.rpartition(".")
+    parent = model.get_submodule(parent_path) if parent_path else model
+    old = getattr(parent, attr)
+
+    # Detach accelerate's hook first. remove_hook_from_module restores the module's original
+    # forward; without it the hook survives on the object we are about to read the weight from.
+    #
+    # It also materialises the offloaded weight onto the execution device on its way out --
+    # measured: allocated jumped 12.78 -> 15.33 GB, which is the 2.54 GB table landing on the
+    # card. So the old module's parameter is dropped explicitly below. Letting Python's GC
+    # get to it eventually is not good enough when the next allocation is 50 MB from failing.
+    ahooks.remove_hook_from_module(old, recurse=True)
+
+    weight = old.weight.detach().to("cpu", copy=True)
+    if weight.is_meta:
+        raise RuntimeError(
+            f"{embed_name}.weight is a meta tensor -- accelerate has not materialised it, so "
+            f"there is nothing to gather from. Load with the module named in device_map "
+            f"rather than relying on device_map='auto'."
+        )
+    # Deliberately NOT pinned. Pinning 2.54 GB of host memory raised a raw
+    # "CUDA error: out of memory" from cudaHostAlloc on this 32 GB box and left the context
+    # unusable -- the next tiny allocation failed. The gather moves 7.9 MB per forward at seq
+    # 768, so pinned staging would buy microseconds against a 2.5 GB failure mode.
+    pinned = False
+
+    device = next(p.device for p in model.parameters() if p.device.type == "cuda")
+    new = CpuGatherEmbedding(weight, device, getattr(old, "padding_idx", None))
+    setattr(parent, attr, new)
+    # Drop the old module's GPU copy now, by hand.
+    old._parameters.pop("weight", None)
+    old._buffers.pop("weight", None)
+    del old
+    torch.cuda.empty_cache()
+    try:
+        model.set_input_embeddings(new)
+    except (AttributeError, NotImplementedError):
+        pass
+
+    replaced = model.get_submodule(embed_name)
+    has_hook = hasattr(replaced, "_hf_hook")
+    if has_hook:
+        raise RuntimeError(
+            f"{embed_name} still carries an accelerate hook after replacement. The hook is "
+            f"what stages the whole {EMBED_TABLE_BYTES / 1e9:.2f} GB table onto the device "
+            f"every forward, so leaving it attached reinstates the exact failure this "
+            f"replaces."
+        )
+    info = {
+        "module": embed_name,
+        "replaced_with": type(replaced).__name__,
+        "accelerate_hook_present": has_hook,
+        "weight_device": str(replaced.weight.device),
+        "pinned": pinned,
+        "table_gb": round(EMBED_TABLE_BYTES / 1e9, 3),
+    }
+    logutil.event(log, "cpu gather embedding installed", **info)
+    return info
 
 
 def assert_layers_on_gpu(model: Any) -> dict[str, Any]:
@@ -682,6 +804,22 @@ def load_student(
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     assert_layers_on_gpu(model)
+    # Immediately: accelerate's hook on the offloaded embedding stages the whole 2.54 GB
+    # table onto the device before every forward, which is 320x the bytes the lookup needs
+    # and was the single thing every rung of the memory ladder died on.
+    #
+    # MARLOWE_CPU_GATHER_EMBED=0 restores the hook path. It exists to reproduce the failure
+    # on demand: a paging detector that has only ever been run against configurations that do
+    # not page has not been shown to detect anything. This is the known-positive case.
+    if os.environ.get("MARLOWE_CPU_GATHER_EMBED", "1") != "0":
+        use_cpu_gather_embedding(model, embed)
+        torch.cuda.empty_cache()
+    else:
+        log.warning(
+            "MARLOWE_CPU_GATHER_EMBED=0: keeping accelerate's offload hook, which stages "
+            "%.2f GB onto the device every forward. Diagnostic only.",
+            EMBED_TABLE_BYTES / 1e9,
+        )
     # Once, not twice. The second call was a no-op that re-walked every parameter, and it
     # ran only on the non-base_only path, so the two entry points did not do the same thing.
     model = prepare_for_kbit_training(model, cfg)
@@ -1031,37 +1169,44 @@ class MemoryCandidate:
 #: sees, which is a real cost, but it leaves the loss target itself intact. fp32 Adam moments
 #: come last because optimizer state never enters the forward pass at all.
 MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
+    # Capacity first, then length. Rank is the axis that determines how much of the parent's
+    # behaviour the adapter can re-express, and it is a permanent ceiling on the shipped
+    # model. Sequence length is a schedule cost: neither 1024 nor 768 trains long-range state
+    # -- that is what the long-context anneal at the end of Stage 6 exists for -- so shortening
+    # it gives up throughput and nothing the run was relying on.
+    #
+    # So: try rank 32 at BOTH lengths before dropping to rank 16 at either. An earlier order
+    # spent rank before length, which trades the model to save the calendar.
+    #
+    # There is no seq-2048 rung. Every fit measurement in this project was taken at 1024 and
+    # ended ~96 MiB short there, so 2048 is unreachable by construction; heal.seq_len is now
+    # 1024 to match, and the 44.3 tok/s that built the published schedule was the rate of a
+    # configuration that cannot run.
     MemoryCandidate(
-        name="rank32-chunk256",
+        name="rank32-seq1024",
         quantize_lm_head=False,
         optimizer_8bit=True,
         lora_rank=32,
         loss_chunk=256,
-        rationale="full adapter capacity; nothing given up",
+        rationale="full adapter capacity at the configured length; nothing given up",
     ),
     MemoryCandidate(
-        name="rank16-chunk256",
+        name="rank32-seq768",
+        quantize_lm_head=False,
+        optimizer_8bit=True,
+        lora_rank=32,
+        loss_chunk=256,
+        seq_len=768,
+        rationale="full adapter capacity, bought with throughput rather than capacity",
+    ),
+    MemoryCandidate(
+        name="rank16-seq1024",
         quantize_lm_head=False,
         optimizer_8bit=True,
         lora_rank=16,
         loss_chunk=256,
-        rationale="half the adapter capacity, but the loss target stays intact",
+        rationale="half the adapter capacity, at the configured length",
     ),
-    # loss_chunk is deliberately NOT a rung. Measured at seq 1024, rank 16: chunk 128 gave
-    # 18.33 GB allocated / 20.63 GB reserved / 5.26 GB paged -- identical to chunk 256 to
-    # the last decimal -- for 127.7 tok/s against 160.9. It bounds a transient the peak does
-    # not fall on, so it buys nothing and costs 21% throughput. It stays fixed at 256, with
-    # the CPU embeddings, as a saving every candidate keeps.
-    # rank8 is NOT a rung. It was one, ahead of seq768, and it does not pay for itself:
-    # the measured 32 -> 16 step saved 0.14 GB, so 16 -> 8 buys roughly 0.07 GB -- less than
-    # the deficit it would be spent on -- while halving what remains of the adapter's
-    # capacity to re-express the parent. seq768 saves ~0.25 GB for throughput alone and
-    # touches neither adapter capacity nor the loss target.
-    #
-    # Sequence length costs schedule; rank costs the model. If rank 8 is ever reinstated it
-    # goes AFTER seq768 and behind an explicit decision, never on tuple order alone -- which
-    # is how it came to be tried first, back when it and seq768 both claimed to be "the last
-    # rung before the loss target is touched".
     MemoryCandidate(
         name="rank16-seq768",
         quantize_lm_head=False,
@@ -1069,8 +1214,19 @@ MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
         lora_rank=16,
         loss_chunk=256,
         seq_len=768,
-        rationale="shorter sequence, adapter capacity and loss target intact",
+        rationale="least capacity and least context, but the loss target stays intact",
     ),
+    # loss_chunk is deliberately NOT a rung. Measured at seq 1024, rank 16: chunk 128 gave
+    # 18.33 GB allocated / 20.63 GB reserved / 5.26 GB paged -- identical to chunk 256 to
+    # the last decimal -- for 127.7 tok/s against 160.9. It bounds a transient the peak does
+    # not fall on, so it buys nothing and costs 21% throughput. It stays fixed at 256, with
+    # the CPU embeddings, as a saving every candidate keeps.
+    #
+    # rank8 is NOT a rung. The measured 32 -> 16 step saved 0.14 GB, so 16 -> 8 buys roughly
+    # 0.07 GB -- less than the deficit it would be spent on -- while halving what remains of
+    # the adapter's capacity. If it is ever reinstated it goes after every rank-16 rung and
+    # behind an explicit decision, never on tuple order alone, which is how it once came to
+    # be tried ahead of a shorter sequence.
     # --- everything below quantises the head and needs an explicit decision -------------
     MemoryCandidate(
         name="nf4-head-adamw32",

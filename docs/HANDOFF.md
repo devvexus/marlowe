@@ -512,8 +512,41 @@ memory search does not automatically make it the choice**; prefer 1024 unless th
 specific reason not to.
 
 Two savings are near-free and are in *every* candidate: `embed_tokens` on CPU (not a Linear,
-so NF4 can't touch it; 2.5 GB; a lookup on CPU is cheap) and a chunked loss (`2048 × 248320`
-is 1.02 GB in bf16 before any softmax intermediate).
+so NF4 can't touch it; 2.5 GB) and a chunked loss (`2048 × 248320` is 1.02 GB in bf16 before
+any softmax intermediate).
+
+**"A lookup on CPU is cheap" was true of the lookup and false of accelerate's implementation
+of it, and the difference cost this project days.** Naming `embed_tokens` in `device_map`
+attaches an `AlignDevicesHook`, whose `pre_forward` copies the **entire 2.54 GB table onto
+the device before every forward** and frees it after. The memory is therefore paid anyway —
+as a transient on top of an already-full card, plus the fragmentation of allocating and
+releasing 2.54 GB every step. The saving was zero and the cost was real.
+
+Measured at seq 768, rank 16: after `empty_cache` the card had **2.49 GB free and the hook
+needed 2.54 GB**. Fifty megabytes. That is the "~96 MiB short" the ladder chased, and *every
+rung died on that same line* — before anything the ladder varies had been allocated, which is
+why four rungs "OOM'd" in fifteen seconds and produced four identical non-measurements.
+
+`CpuGatherEmbedding` replaces the module: `index_select` on the host weight, and only the
+`[batch, seq, hidden]` result crosses the bus — 7.9 MB at seq 768 against 2540 MB, ~320×.
+Forward-start free went 0.00 → 2.49 GB and every rung became measurable.
+
+Three traps in implementing it, all of which reinstate the bug silently:
+
+* **`register_buffer` is wrong.** Buffers are walked by `Module.to()`, so peft's device
+  placement moves the table straight back onto the card — `allocated` jumped 12.78 → 15.33 GB,
+  exactly the table. It must be a plain attribute: `nn.Module.__setattr__` intercepts
+  Parameters and Modules, and a bare Tensor lands in `__dict__` where no device walk reaches it.
+* **`remove_hook_from_module` materialises the offloaded weight onto the execution device on
+  its way out**, and the old module keeps that GPU copy alive. Drop it by hand; GC is not
+  fast enough when the next allocation is 50 MB from failing.
+* **Do not pin the weight.** `pin_memory()` on 2.54 GB raised a raw `CUDA error: out of
+  memory` from `cudaHostAlloc` on this 32 GB host and left the context unusable — the next
+  `randint` failed. At 7.9 MB per forward, pinning buys microseconds against a 2.5 GB failure.
+
+`requires_grad_(True)` on the gathered output is not optional: this path bypasses accelerate's
+hook and therefore whatever `enable_input_require_grads()` attached to it, and gradient
+checkpointing needs an input that requires grad or the LoRA layers below receive nothing.
 
 ### Stage 0 is a control curve, not a go/no-go
 
