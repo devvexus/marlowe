@@ -192,7 +192,7 @@ class HealConfig:
     #: together, and that single transient is what sets the peak: measured 13.1 GB steady
     #: against an 18.2 GB peak, with no phase boundary above 15.2 GB. Halving the largest
     #: recompute costs one extra boundary per layer and buys ~0.75 GB.
-    sublayer_checkpointing: bool = True
+    sublayer_checkpointing: bool = False
 
     # -- memory/quality trade-offs, ordered by quality cost ------------------
     #: Quantise lm_head to NF4. bitsandbytes skips it by default for a reason: the loss here

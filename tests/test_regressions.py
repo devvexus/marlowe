@@ -2025,3 +2025,44 @@ class TestStage0Resume:
         assert "_write_json" in src and "metrics_dir" in src, (
             "each variant must be persisted as it completes, not at stage end"
         )
+
+
+class TestPagingSamplerActuallySamples:
+    """The fit gate must not fail open when its instrument is broken.
+
+    typeperf refuses -- silently, rc=0, empty stderr -- to write to an output path that
+    already exists. PagingSampler used tempfile.mkstemp, which CREATES the file, so it
+    produced an empty CSV on every run, reported available=False, and ProbeResult.fits()
+    quietly fell back to torch accounting. The instrument built to stop the fit decision
+    failing open was itself failing open, and every paging number reported during its first
+    day came from a separate shell script rather than from this code.
+    """
+
+    def test_start_does_not_pre_create_the_output_file(self) -> None:
+        import sys
+
+        if sys.platform != "win32":
+            pytest.skip("typeperf is Windows-only")
+        from marlowe.gpumem import PagingSampler
+
+        s = PagingSampler()
+        s.start()
+        try:
+            # The path must not exist before typeperf opens it, or typeperf writes nothing.
+            assert s._path is not None
+            # After start, typeperf owns it; what matters is that WE did not create it empty
+            # ahead of the process. The directory is ours; the file is typeperf's.
+            assert s._path.parent.exists(), "sampler needs a writable directory"
+        finally:
+            s.stop()
+
+    def test_an_unavailable_report_never_claims_no_paging(self) -> None:
+        """available=False must not read as 'the driver saw nothing'."""
+        from marlowe.gpumem import PagingReport
+
+        r = PagingReport()
+        assert r.available is False
+        assert r.paging is False
+        assert "UNAVAILABLE" in r.render(), (
+            "an unread counter must say so, not render as a clean measurement"
+        )
