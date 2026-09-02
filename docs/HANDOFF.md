@@ -267,6 +267,56 @@ merely too flat to break a self-reinforcing cycle. **Healing has to sharpen a bl
 distribution, not reconstruct one.** That is the cheaper of the two problems, and it is
 consistent with the diffuse damage signature (median moved 6.7x against the mean's 3.1x).
 
+### The lock is not inherited. Pruning makes the model quantisation-fragile
+
+All at `pp=0.0`, thinking preset, prompt `core-equations-ai`, seed 0.
+
+| model | bpw | tokens | rep8 | longest run | locks? |
+| --- | --- | --- | --- | --- | --- |
+| parent Q8_0 (bf16 proxy) | ~8.5 | 3072 | 0.0000 | 0 | no |
+| **parent IQ3_XXS** | **3.27** | 3072 | 0.0000 | 0 | **no** |
+| child unhealed bf16 (NF4) | ~4.5 | 2048 | 0.0000 | 0 | no |
+| **child unhealed IQ3_M** | **3.77** | 2048 | 0.0784 | 36 | **yes** |
+| child unhealed IQ3_M | 3.77 | 3072 | 0.3424 | 435 | yes |
+
+Read the two bold rows together. **The parent survives 3.27 bpw. The child fails at 3.77
+bpw** -- half a bit *more* precision, and it locks anyway.
+
+So neither cause is sufficient alone:
+
+* pruning alone does not lock -- the child in bf16 is clean;
+* quantisation alone does not lock -- the parent at a *lower* bit-width is clean;
+* the two together do. **Pruning does not cause the repetition; it removes the margin that
+  made the model tolerant of quantisation.**
+
+An earlier reading of the bf16-vs-IQ3_M pair concluded "pruning does not reach the attractor,
+quantisation tips it". That was right as far as it went and incomplete: it did not explain
+why the *parent* tolerates even fewer bits. The parent controls are what distinguish
+"quantisation is the cause" from "pruning made quantisation lethal", and only the second
+survives the data.
+
+**This is the strongest evidence so far that healing addresses the problem.** Healing's whole
+effect is to restore the margin pruning removed -- that is what taking KL from 0.451 toward
+~0.05 means -- and margin is precisely the property the parent has and the unhealed child
+lacks. The mechanism is no longer a plausible story; it is the difference between two
+measured rows.
+
+It also means the collapse should **not** be treated as inherited from the 27B, and `pp=1.5`
+should not be planned for as the shipped answer. The parent does not need it.
+
+### Measured decode rates, and what they cost Stage 7
+
+```
+parent Q8_0,   -ngl 30 (partial offload, CPU-bound)     3.2 tok/s
+parent IQ3_XXS, -ngl 64 (fully resident)               41.1 tok/s
+```
+
+**The Q8_0 repetition baseline is ~36 h, not ~14 h.** 200 completions x 2048 tokens =
+409,600 tokens at 3.2 tok/s = 35.6 h single-slot. Partial offload is CPU-bound, so extra
+llama-server slots will not scale it the way they do for a resident model -- assume the
+parallel speedup is small until measured. Schedule it accordingly, after healing, when the
+GPU is free.
+
 ### The ship gate stays at `presence_penalty=0.0`
 
 `THINKING` is `presence_penalty=0.0, repeat_penalty=1.0`, and that is how the model actually
