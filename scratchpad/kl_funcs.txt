@@ -1,0 +1,253 @@
+def gguf_vocab_size(gguf: str | Path) -> int:
+    """Read n_vocab from GGUF metadata. Needed to predict the reference file's size."""
+    from gguf import GGUFReader
+
+    reader = GGUFReader(str(gguf))
+    tokens = reader.fields.get("tokenizer.ggml.tokens")
+    if tokens is None:
+        raise RuntimeError(f"{gguf} has no tokenizer.ggml.tokens; cannot determine n_vocab")
+    return len(tokens.data)
+
+
+def count_corpus_tokens(gguf: str | Path, corpus: str | Path, *, timeout: int = 3600) -> int:
+    """Exact token count of the corpus under this model's tokenizer, via llama-tokenize.
+
+    Exact rather than estimated because it feeds the disk guard: a 2x error in the token
+    count is a 2x error in the projected reference size, and the volume is 95% full.
+    """
+    exe = find_binary("llama-tokenize")
+    rc, text = _run([exe, "-m", str(gguf), "-f", str(corpus), "--ids"], timeout)
+    if rc != 0:
+        raise RuntimeError(f"llama-tokenize failed (rc={rc}).\n{text[-2000:]}")
+    body = text[text.find("[") : text.rfind("]") + 1]
+    ids = re.findall(r"-?\d+", body)
+    if not ids:
+        raise RuntimeError(
+            f"could not parse token ids from llama-tokenize output.\n{text[-2000:]}"
+        )
+    return len(ids)
+
+
+def _parse_run_shape(text: str) -> tuple[int | None, int | None]:
+    """(chunks, n_ctx) as llama-perplexity reported them, or (None, None)."""
+    m = _RUN_SHAPE.search(text)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+def build_reference(
+    reference_gguf: str | Path,
+    corpus: str | Path,
+    out_file: str | Path,
+    *,
+    ctx: int = 8192,
+    n_gpu_layers: int = 0,
+    chunks: int | None = None,
+    n_vocab: int | None = None,
+    timeout: int = 24 * 3600,
+) -> KLResult:
+    """Write the reference logits file from the parent. Stage 2, step 1.
+
+    ``reference_gguf`` should be the Q8_0 parent (see :data:`REFERENCE_OUTTYPE`); bf16 works
+    too if the machine has the RAM for it.
+
+    ``n_gpu_layers`` defaults to 0 because neither a 28.6 GB Q8_0 nor a 56 GB bf16 fits in
+    16 GB of VRAM, and partial offload is slower than CPU for a one-off pass that is then
+    reused forever.
+
+    Three things happen around the run that are not optional:
+
+    * **Disk is checked first.** The file costs ~2.03 GB per chunk at ``-c 8192`` for this
+      project's 248,320-token vocabulary. Discovering that at 100% disk, hours in, destroys
+      the run and whatever else is writing at the time.
+    * **The context is read back from llama-perplexity's own output**, not from ``ctx``.
+      llama.cpp does not error when a reference is built at a context other than intended,
+      and a 4096 file is byte-indistinguishable from an 8192 one afterwards.
+    * **A sidecar is written** recording what the file actually is, so :func:`measure` can
+      refuse a mismatched pairing instead of quietly producing commensurable-looking
+      numbers that are not commensurable.
+    """
+    exe = find_binary("llama-perplexity")
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if n_vocab is None:
+        n_vocab = gguf_vocab_size(reference_gguf)
+
+    corpus_tokens = count_corpus_tokens(reference_gguf, corpus)
+    available = kld_chunks_for_corpus(corpus_tokens, ctx)
+    planned = min(chunks, available) if chunks else available
+    if planned < 1:
+        raise ValueError(
+            f"{corpus} tokenises to {corpus_tokens} tokens, fewer than one {ctx}-token "
+            f"chunk. The reference would be empty."
+        )
+    per_chunk = kld_expected_bytes(n_vocab, ctx, 1) - KLD_HEADER_BYTES
+    projected = kld_expected_bytes(n_vocab, ctx, planned)
+    free = shutil.disk_usage(out_file.parent).free
+    logutil.event(
+        log,
+        "kl reference plan",
+        corpus_tokens=corpus_tokens,
+        chunks=planned,
+        ctx=ctx,
+        scored_tokens=planned * kld_tokens_per_chunk(ctx),
+        gb_per_chunk=round(per_chunk / 1e9, 2),
+        projected_gb=round(projected / 1e9, 1),
+        free_gb=round(free / 1e9, 1),
+    )
+    if free < projected + DISK_MARGIN_BYTES:
+        raise ResourceWarning(
+            f"the reference needs ~{projected / 1e9:.1f} GB ({planned} chunks x "
+            f"{per_chunk / 1e9:.2f} GB) plus a {DISK_MARGIN_BYTES / 1e9:.0f} GB working "
+            f"margin, but only {free / 1e9:.1f} GB is free on {out_file.parent}. Shrink the "
+            f"corpus or pass chunks=N: at -c {ctx} each chunk consumes {ctx} corpus tokens "
+            f"and costs {per_chunk / 1e9:.2f} GB."
+        )
+
+    cmd = [
+        exe,
+        "-m", str(reference_gguf),
+        "-f", str(corpus),
+        "-c", str(ctx),
+        "-ngl", str(n_gpu_layers),
+        "--kl-divergence-base", str(out_file),
+    ]
+    if chunks:
+        cmd += ["--chunks", str(chunks)]
+    with logutil.timed(log, "kl reference", model=str(reference_gguf), out=str(out_file)):
+        rc, text = _run(cmd, timeout)
+    if rc != 0 or not out_file.exists():
+        raise RuntimeError(
+            f"llama-perplexity --kl-divergence-base failed (rc={rc}).\n{text[-3000:]}"
+        )
+
+    actual_chunks, actual_ctx = _parse_run_shape(text)
+    if actual_ctx is None or actual_chunks is None:
+        raise RuntimeError(
+            "llama-perplexity did not print its chunk count and context, so the reference "
+            "cannot certify what it is. Refusing to write a sidecar from the requested "
+            f"values.\n{text[-2000:]}"
+        )
+    if actual_ctx != ctx:
+        raise RuntimeError(
+            f"asked for -c {ctx} but llama-perplexity computed at n_ctx={actual_ctx}. The "
+            f"file at {out_file} is not the reference that was requested; delete it."
+        )
+
+    size = out_file.stat().st_size
+    predicted = kld_expected_bytes(n_vocab, actual_ctx, actual_chunks)
+    if abs(size - predicted) > max(1 << 20, predicted // 100):
+        raise RuntimeError(
+            f"{out_file} is {size / 1e9:.3f} GB but the file format predicts "
+            f"{predicted / 1e9:.3f} GB for {actual_chunks} chunks at n_ctx={actual_ctx}, "
+            f"n_vocab={n_vocab}. One of those is wrong, and the disk projection that sized "
+            f"this run rests on the same arithmetic."
+        )
+
+    sidecar = {
+        "reference": str(out_file),
+        "model": str(reference_gguf),
+        "corpus": str(corpus),
+        "corpus_sha256": sha256_file(corpus),
+        "corpus_tokens": corpus_tokens,
+        "ctx": actual_ctx,
+        "chunks": actual_chunks,
+        "scored_tokens": actual_chunks * kld_tokens_per_chunk(actual_ctx),
+        "n_vocab": n_vocab,
+        "bytes": size,
+        "command": cmd,
+        "provenance": "ctx and chunks parsed from llama-perplexity output, not from arguments",
+    }
+    sidecar_path(out_file).write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+    logutil.event(
+        log,
+        "kl reference written",
+        ctx=actual_ctx,
+        chunks=actual_chunks,
+        scored_tokens=sidecar["scored_tokens"],
+        gb=round(size / 1e9, 2),
+    )
+
+    return KLResult(
+        model=str(reference_gguf),
+        corpus=str(corpus),
+        reference=str(out_file),
+        metrics=parse_output(text),
+        command=cmd,
+        returncode=rc,
+        stdout_tail=text[-2000:],
+    )
+
+
+def measure(
+    gguf: str | Path,
+    corpus: str | Path,
+    reference: str | Path,
+    *,
+    ctx: int | None = None,
+    n_gpu_layers: int = 999,
+    chunks: int | None = None,
+    timeout: int = 12 * 3600,
+) -> KLResult:
+    """Measure a candidate against the reference logits. Stage 2, step 2.
+
+    ``ctx`` defaults to whatever the reference was actually built at, read from its sidecar.
+    Passing a different value is an error rather than an override: llama.cpp adopts the base
+    file's context without saying so, so a mismatch yields numbers that look fine and are
+    comparable to nothing.
+    """
+    exe = find_binary("llama-perplexity")
+    reference = Path(reference)
+    if not reference.exists():
+        raise FileNotFoundError(
+            f"reference logits {reference} not found. Run build_reference() on the bf16 "
+            f"parent first -- every checkpoint in this project is compared against the "
+            f"same reference bytes."
+        )
+
+    meta = read_sidecar(reference)
+    if meta is None:
+        raise RuntimeError(
+            f"{reference} has no sidecar ({sidecar_path(reference).name}), so the context "
+            f"and corpus behind it are unknown. llama.cpp adopts the base file's context "
+            f"silently, which makes a mismatch invisible in the result. Rebuild the "
+            f"reference with build_reference()."
+        )
+    ref_ctx = int(meta["ctx"])
+    if ctx is not None and ctx != ref_ctx:
+        raise ValueError(
+            f"reference {reference.name} was built at n_ctx={ref_ctx}, but ctx={ctx} was "
+            f"requested. llama.cpp would quietly use {ref_ctx} and report a KL that is not "
+            f"the one asked for. Pass ctx={ref_ctx}, or rebuild the reference."
+        )
+    ctx = ref_ctx
+    if meta.get("corpus_sha256") and sha256_file(corpus) != meta["corpus_sha256"]:
+        raise ValueError(
+            f"{corpus} is not the corpus the reference was built from "
+            f"({Path(meta['corpus']).name}). KL is only defined over the same tokens."
+        )
+
+    cmd = [
+        exe,
+        "-m", str(gguf),
+        "-f", str(corpus),
+        "-c", str(ctx),
+        "-ngl", str(n_gpu_layers),
+        "--kl-divergence",
+        "--kl-divergence-base", str(reference),
+    ]
+    if chunks:
+        cmd += ["--chunks", str(chunks)]
+    with logutil.timed(log, "kl measure", model=str(gguf)):
+        rc, text = _run(cmd, timeout)
+    if rc != 0:
+        raise RuntimeError(f"llama-perplexity --kl-divergence failed (rc={rc}).\n{text[-3000:]}")
+
+    metrics = parse_output(text)
+    if "kl_mean" not in metrics:
+        raise RuntimeError(
+            "could not parse a mean KLD from llama-perplexity output. The label may have "
+            f"changed upstream; update marlowe/eval/kl.py::_PATTERNS.\n{text[-2000:]}"
+        )

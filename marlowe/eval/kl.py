@@ -18,6 +18,8 @@ What this catches: general fidelity loss. What it cannot catch: circling. See
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -232,6 +234,88 @@ def parse_output(text: str) -> dict[str, float]:
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# the reference file: how big it is, and what it certifies about itself
+# ---------------------------------------------------------------------------
+
+#: What llama-perplexity itself prints when it starts a --kl-divergence-base pass.
+#: This is the only trustworthy source for the context and chunk count actually used:
+#: the Python argument records what was *asked for*, and the two can differ. A sidecar
+#: written from the argument would certify a value nothing verified.
+_RUN_SHAPE = re.compile(r"computing over\s+(\d+)\s+chunks,\s*n_ctx\s*=\s*(\d+)", re.I)
+
+
+def kld_tokens_per_chunk(ctx: int) -> int:
+    """Tokens whose logits get written, per chunk.
+
+    llama.cpp scores only the second half of each window -- the first ``n_ctx//2`` tokens
+    are context for the rest and are never predicted -- so this is ``ctx - 1 - ctx//2``,
+    not ``ctx``.
+
+    Both counts are real and they differ by 2x, which is the whole trap: at ``-c 8192`` the
+    scored count is 4096, numerically identical to the old default context, so a slip that
+    uses the wrong one looks like a plausible number arrived at correctly.
+    """
+    return ctx - 1 - ctx // 2
+
+
+def kld_chunks_for_corpus(corpus_tokens: int, ctx: int) -> int:
+    """Chunks a corpus of ``corpus_tokens`` yields: each chunk *consumes* ``ctx`` tokens.
+
+    Note the asymmetry with :func:`kld_tokens_per_chunk`. A chunk eats ``ctx`` tokens of
+    corpus and scores half of them. Dividing a corpus budget by the scored count doubles
+    the chunk estimate and doubles the projected disk.
+    """
+    return corpus_tokens // ctx
+
+
+def kld_row_width(n_vocab: int) -> int:
+    """uint16 values written per scored token: ``2*((n_vocab+1)//2) + 4``.
+
+    The +4 carries the per-token scalars llama.cpp packs beside the quantised log-probs.
+    This is read off the file format, so treat it as a prediction: ``build_reference``
+    checks it against the bytes that actually land and fails if they disagree.
+    """
+    return 2 * ((n_vocab + 1) // 2) + 4
+
+
+#: ``_logits_`` magic plus n_ctx, n_vocab, n_chunk.
+KLD_HEADER_BYTES = 8 + 3 * 4
+
+
+def kld_expected_bytes(n_vocab: int, ctx: int, chunks: int) -> int:
+    """Predicted size of a .kld reference file, in bytes."""
+    return KLD_HEADER_BYTES + chunks * kld_tokens_per_chunk(ctx) * kld_row_width(n_vocab) * 2
+
+
+def sha256_file(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def sidecar_path(kld: str | Path) -> Path:
+    """Sidecar beside the reference recording what it actually is."""
+    return Path(str(kld) + ".json")
+
+
+def read_sidecar(kld: str | Path) -> dict[str, Any] | None:
+    sc = sidecar_path(kld)
+    if not sc.exists():
+        return None
+    try:
+        return json.loads(sc.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+#: Headroom to leave beyond the reference file itself. The pass runs for hours next to
+#: quantisation writing 10-25 GB files; filling the volume kills both.
+DISK_MARGIN_BYTES = 40 * 1000**3
+
 # ---------------------------------------------------------------------------
 # running
 # ---------------------------------------------------------------------------
@@ -268,14 +352,53 @@ def _run(cmd: list[str], timeout: int) -> tuple[int, str]:
 REFERENCE_OUTTYPE = "q8_0"
 
 
+def gguf_vocab_size(gguf: str | Path) -> int:
+    """Read n_vocab from GGUF metadata. Needed to predict the reference file's size."""
+    from gguf import GGUFReader
+
+    reader = GGUFReader(str(gguf))
+    tokens = reader.fields.get("tokenizer.ggml.tokens")
+    if tokens is None:
+        raise RuntimeError(f"{gguf} has no tokenizer.ggml.tokens; cannot determine n_vocab")
+    return len(tokens.data)
+
+
+def count_corpus_tokens(gguf: str | Path, corpus: str | Path, *, timeout: int = 3600) -> int:
+    """Exact token count of the corpus under this model's tokenizer, via llama-tokenize.
+
+    Exact rather than estimated because it feeds the disk guard: a 2x error in the token
+    count is a 2x error in the projected reference size, and the volume is 95% full.
+    """
+    exe = find_binary("llama-tokenize")
+    rc, text = _run([exe, "-m", str(gguf), "-f", str(corpus), "--ids"], timeout)
+    if rc != 0:
+        raise RuntimeError(f"llama-tokenize failed (rc={rc}).\n{text[-2000:]}")
+    body = text[text.find("[") : text.rfind("]") + 1]
+    ids = re.findall(r"-?\d+", body)
+    if not ids:
+        raise RuntimeError(
+            f"could not parse token ids from llama-tokenize output.\n{text[-2000:]}"
+        )
+    return len(ids)
+
+
+def _parse_run_shape(text: str) -> tuple[int | None, int | None]:
+    """(chunks, n_ctx) as llama-perplexity reported them, or (None, None)."""
+    m = _RUN_SHAPE.search(text)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
 def build_reference(
     reference_gguf: str | Path,
     corpus: str | Path,
     out_file: str | Path,
     *,
-    ctx: int = 4096,
+    ctx: int = 8192,
     n_gpu_layers: int = 0,
     chunks: int | None = None,
+    n_vocab: int | None = None,
     timeout: int = 24 * 3600,
 ) -> KLResult:
     """Write the reference logits file from the parent. Stage 2, step 1.
@@ -286,10 +409,57 @@ def build_reference(
     ``n_gpu_layers`` defaults to 0 because neither a 28.6 GB Q8_0 nor a 56 GB bf16 fits in
     16 GB of VRAM, and partial offload is slower than CPU for a one-off pass that is then
     reused forever.
+
+    Three things happen around the run that are not optional:
+
+    * **Disk is checked first.** The file costs ~2.03 GB per chunk at ``-c 8192`` for this
+      project's 248,320-token vocabulary. Discovering that at 100% disk, hours in, destroys
+      the run and whatever else is writing at the time.
+    * **The context is read back from llama-perplexity's own output**, not from ``ctx``.
+      llama.cpp does not error when a reference is built at a context other than intended,
+      and a 4096 file is byte-indistinguishable from an 8192 one afterwards.
+    * **A sidecar is written** recording what the file actually is, so :func:`measure` can
+      refuse a mismatched pairing instead of quietly producing commensurable-looking
+      numbers that are not commensurable.
     """
     exe = find_binary("llama-perplexity")
     out_file = Path(out_file)
     out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if n_vocab is None:
+        n_vocab = gguf_vocab_size(reference_gguf)
+
+    corpus_tokens = count_corpus_tokens(reference_gguf, corpus)
+    available = kld_chunks_for_corpus(corpus_tokens, ctx)
+    planned = min(chunks, available) if chunks else available
+    if planned < 1:
+        raise ValueError(
+            f"{corpus} tokenises to {corpus_tokens} tokens, fewer than one {ctx}-token "
+            f"chunk. The reference would be empty."
+        )
+    per_chunk = kld_expected_bytes(n_vocab, ctx, 1) - KLD_HEADER_BYTES
+    projected = kld_expected_bytes(n_vocab, ctx, planned)
+    free = shutil.disk_usage(out_file.parent).free
+    logutil.event(
+        log,
+        "kl reference plan",
+        corpus_tokens=corpus_tokens,
+        chunks=planned,
+        ctx=ctx,
+        scored_tokens=planned * kld_tokens_per_chunk(ctx),
+        gb_per_chunk=round(per_chunk / 1e9, 2),
+        projected_gb=round(projected / 1e9, 1),
+        free_gb=round(free / 1e9, 1),
+    )
+    if free < projected + DISK_MARGIN_BYTES:
+        raise ResourceWarning(
+            f"the reference needs ~{projected / 1e9:.1f} GB ({planned} chunks x "
+            f"{per_chunk / 1e9:.2f} GB) plus a {DISK_MARGIN_BYTES / 1e9:.0f} GB working "
+            f"margin, but only {free / 1e9:.1f} GB is free on {out_file.parent}. Shrink the "
+            f"corpus or pass chunks=N: at -c {ctx} each chunk consumes {ctx} corpus tokens "
+            f"and costs {per_chunk / 1e9:.2f} GB."
+        )
+
     cmd = [
         exe,
         "-m", str(reference_gguf),
@@ -306,6 +476,54 @@ def build_reference(
         raise RuntimeError(
             f"llama-perplexity --kl-divergence-base failed (rc={rc}).\n{text[-3000:]}"
         )
+
+    actual_chunks, actual_ctx = _parse_run_shape(text)
+    if actual_ctx is None or actual_chunks is None:
+        raise RuntimeError(
+            "llama-perplexity did not print its chunk count and context, so the reference "
+            "cannot certify what it is. Refusing to write a sidecar from the requested "
+            f"values.\n{text[-2000:]}"
+        )
+    if actual_ctx != ctx:
+        raise RuntimeError(
+            f"asked for -c {ctx} but llama-perplexity computed at n_ctx={actual_ctx}. The "
+            f"file at {out_file} is not the reference that was requested; delete it."
+        )
+
+    size = out_file.stat().st_size
+    predicted = kld_expected_bytes(n_vocab, actual_ctx, actual_chunks)
+    if abs(size - predicted) > max(1 << 20, predicted // 100):
+        raise RuntimeError(
+            f"{out_file} is {size / 1e9:.3f} GB but the file format predicts "
+            f"{predicted / 1e9:.3f} GB for {actual_chunks} chunks at n_ctx={actual_ctx}, "
+            f"n_vocab={n_vocab}. One of those is wrong, and the disk projection that sized "
+            f"this run rests on the same arithmetic."
+        )
+
+    sidecar = {
+        "reference": str(out_file),
+        "model": str(reference_gguf),
+        "corpus": str(corpus),
+        "corpus_sha256": sha256_file(corpus),
+        "corpus_tokens": corpus_tokens,
+        "ctx": actual_ctx,
+        "chunks": actual_chunks,
+        "scored_tokens": actual_chunks * kld_tokens_per_chunk(actual_ctx),
+        "n_vocab": n_vocab,
+        "bytes": size,
+        "command": cmd,
+        "provenance": "ctx and chunks parsed from llama-perplexity output, not from arguments",
+    }
+    sidecar_path(out_file).write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+    logutil.event(
+        log,
+        "kl reference written",
+        ctx=actual_ctx,
+        chunks=actual_chunks,
+        scored_tokens=sidecar["scored_tokens"],
+        gb=round(size / 1e9, 2),
+    )
+
     return KLResult(
         model=str(reference_gguf),
         corpus=str(corpus),
@@ -322,12 +540,18 @@ def measure(
     corpus: str | Path,
     reference: str | Path,
     *,
-    ctx: int = 4096,
+    ctx: int | None = None,
     n_gpu_layers: int = 999,
     chunks: int | None = None,
     timeout: int = 12 * 3600,
 ) -> KLResult:
-    """Measure a candidate against the reference logits. Stage 2, step 2."""
+    """Measure a candidate against the reference logits. Stage 2, step 2.
+
+    ``ctx`` defaults to whatever the reference was actually built at, read from its sidecar.
+    Passing a different value is an error rather than an override: llama.cpp adopts the base
+    file's context without saying so, so a mismatch yields numbers that look fine and are
+    comparable to nothing.
+    """
     exe = find_binary("llama-perplexity")
     reference = Path(reference)
     if not reference.exists():
@@ -336,6 +560,29 @@ def measure(
             f"parent first -- every checkpoint in this project is compared against the "
             f"same reference bytes."
         )
+
+    meta = read_sidecar(reference)
+    if meta is None:
+        raise RuntimeError(
+            f"{reference} has no sidecar ({sidecar_path(reference).name}), so the context "
+            f"and corpus behind it are unknown. llama.cpp adopts the base file's context "
+            f"silently, which makes a mismatch invisible in the result. Rebuild the "
+            f"reference with build_reference()."
+        )
+    ref_ctx = int(meta["ctx"])
+    if ctx is not None and ctx != ref_ctx:
+        raise ValueError(
+            f"reference {reference.name} was built at n_ctx={ref_ctx}, but ctx={ctx} was "
+            f"requested. llama.cpp would quietly use {ref_ctx} and report a KL that is not "
+            f"the one asked for. Pass ctx={ref_ctx}, or rebuild the reference."
+        )
+    ctx = ref_ctx
+    if meta.get("corpus_sha256") and sha256_file(corpus) != meta["corpus_sha256"]:
+        raise ValueError(
+            f"{corpus} is not the corpus the reference was built from "
+            f"({Path(meta['corpus']).name}). KL is only defined over the same tokens."
+        )
+
     cmd = [
         exe,
         "-m", str(gguf),

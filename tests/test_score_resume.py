@@ -75,7 +75,7 @@ def test_resume_reproduces_the_uninterrupted_answer(tmp_path, monkeypatch) -> No
     full, _ = _run(tmp_path, monkeypatch, [1, 2, 3], tmp_path / "a.json")
 
     ckpt = tmp_path / "b.json"
-    _run(tmp_path, monkeypatch, [1, 2], ckpt)  # "crash" after two
+    partial, _ = _run(tmp_path, monkeypatch, [1, 2], ckpt)  # "crash" after two
     resumed, _ = _run(tmp_path, monkeypatch, [1, 2, 3], ckpt)
     assert resumed == full
 

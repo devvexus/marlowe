@@ -233,10 +233,29 @@ class TestQLoRAStack:
         assert grads, "no gradients reached the LoRA parameters"
         assert any(g.abs().sum().item() > 0 for g in grads), "all gradients are zero"
 
-        before = params[0].detach().clone()
+        # Check every parameter that actually received a gradient, not params[0].
+        #
+        # params[0] is lora_A, and at step zero its gradient is zero by construction: the
+        # adapter's output is B(Ax) with B initialised to zero, so dL/dA is proportional to
+        # B. Asserting that lora_A moves tests nothing about learning -- before the adapters
+        # were made bf16 it passed only because AdamW's weight decay nudged it, a change of
+        # ~4.5e-8 that bf16 cannot represent near a 0.045 weight. Pin the real property:
+        # a parameter with a gradient must move.
+        before = {i: p.detach().clone() for i, p in enumerate(params)}
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         optim.step()
-        assert not torch.equal(before, params[0]), "optimizer step did not change the weights"
+
+        moved = {i for i, p in enumerate(params) if not torch.equal(before[i], p)}
+        got_grad = {
+            i for i, p in enumerate(params)
+            if p.grad is not None and p.grad.abs().sum().item() > 0
+        }
+        assert got_grad, "no parameter received a non-zero gradient"
+        stuck = got_grad - moved
+        assert not stuck, (
+            f"{len(stuck)} of {len(got_grad)} parameters had a gradient but did not move; "
+            f"the optimizer step is not reaching the weights"
+        )
 
     def test_gradient_checkpointing_path(self, tiny_model: Path) -> None:
         """Gradient checkpointing is what makes 2048 fit; it must not silently detach."""

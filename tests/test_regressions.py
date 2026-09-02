@@ -2066,3 +2066,124 @@ class TestPagingSamplerActuallySamples:
         assert "UNAVAILABLE" in r.render(), (
             "an unread counter must say so, not render as a clean measurement"
         )
+
+
+class TestAllocatorCapLeavesRoomForTheEmbeddingTransient:
+    """The derived cap OOM'd a configuration that runs fine one notch looser.
+
+    ``embed_tokens`` is offloaded to CPU, but accelerate's hook stages it back onto the
+    device for every forward: a 2.37 GiB transient on top of the steady state. The old
+    derivation, (total - cuda_context_bytes()) / total, reserved WDDM's 1.38 GB
+    per-process figure for a context nvidia-smi measured at 0.25 GB, and the missing
+    gigabyte was precisely what that transient needed. It capped at 14.71 GiB and raised
+    inside the first ``embed_tokens`` call with 1.99 GiB free; 15.35 GiB ran clean.
+    """
+
+    #: The measured post-load state of the 22B probe, in bytes.
+    TOTAL = int(15.99 * 1024**3)
+    RESERVED = int(12.54 * 1024**3)
+    # Measured, not assumed: the 0.92 OOM reported "1.99 GiB is free". An earlier draft of
+    # this test used 3.22 GiB -- a number invented to make reserved+free look sufficient --
+    # and it passed while describing a machine that does not exist.
+    FREE = int(1.99 * 1024**3)
+    #: What the first forward has to place on top of reserved.
+    EMBED_TRANSIENT = 248320 * 5120 * 2
+
+    def _cap(self, monkeypatch, context_bytes):
+        import torch
+
+        from marlowe import gpumem
+
+        applied = {}
+        monkeypatch.delenv("MARLOWE_CUDA_MEMORY_FRACTION", raising=False)
+        monkeypatch.setattr(
+            torch.cuda, "get_device_properties",
+            lambda _i: type("P", (), {"total_memory": self.TOTAL})(),
+        )
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _i: (self.FREE, self.TOTAL))
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _i=0: self.RESERVED)
+        monkeypatch.setattr(
+            torch.cuda, "set_per_process_memory_fraction",
+            lambda f, _i: applied.__setitem__("f", f),
+        )
+        fraction = gpumem.cap_process_memory(context_bytes)
+        assert applied["f"] == fraction
+        return fraction * self.TOTAL
+
+    def test_the_ceiling_admits_the_embedding_transient(self, monkeypatch) -> None:
+        ceiling = self._cap(monkeypatch, context_bytes=int(1.38e9))
+        assert ceiling >= self.RESERVED + self.EMBED_TRANSIENT, (
+            f"capped at {ceiling / 1024**3:.2f} GiB, which cannot fit the "
+            f"{self.EMBED_TRANSIENT / 1024**3:.2f} GiB embedding on top of "
+            f"{self.RESERVED / 1024**3:.2f} GiB reserved -- this is the 0.92 OOM"
+        )
+
+    def test_the_ceiling_stays_on_the_card(self, monkeypatch) -> None:
+        """Above (reserved + free) the driver pages instead of raising, which is the
+        failure mode the cap exists to prevent."""
+        ceiling = self._cap(monkeypatch, context_bytes=int(1.38e9))
+        assert ceiling <= self.RESERVED + self.FREE
+
+    def test_an_overstated_context_no_longer_shrinks_the_cap(self, monkeypatch) -> None:
+        """The whole bug: a context measurement 1 GB too large cost 1 GB of usable VRAM."""
+        honest = self._cap(monkeypatch, context_bytes=int(0.25e9))
+        overstated = self._cap(monkeypatch, context_bytes=int(1.38e9))
+        assert honest == overstated
+
+    def test_the_env_override_still_wins(self, monkeypatch) -> None:
+        import torch
+
+        from marlowe import gpumem
+
+        monkeypatch.setenv("MARLOWE_CUDA_MEMORY_FRACTION", "0.96")
+        monkeypatch.setattr(
+            torch.cuda, "get_device_properties",
+            lambda _i: type("P", (), {"total_memory": self.TOTAL})(),
+        )
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _i=0: self.RESERVED)
+        monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda f, _i: None)
+        assert gpumem.cap_process_memory(None) == 0.96
+
+
+class TestLoRAStepZeroGradients:
+    """Why the optimizer-step test may not assert on ``params[0]``.
+
+    peft registers lora_A before lora_B, so params[0] is lora_A. The adapter computes
+    B(Ax) with B initialised to zero, so dL/dA is proportional to B and is *exactly* zero
+    on the first step. ``test_one_optimizer_step_against_the_real_loss`` asserted that
+    params[0] moves; that passed only while the adapters were fp32, where AdamW's weight
+    decay shifted it by ~4.5e-8. Making the adapters bf16 (to save 0.35 GB) took that
+    below representable resolution and the test began failing -- reporting a broken
+    optimizer when what it had always tested was weight decay.
+
+    Runs on CPU: this is a property of peft's initialisation, not of the 22B.
+    """
+
+    def _adapters(self):
+        import torch.nn as nn
+        from peft import LoraConfig, get_peft_model
+
+        base = nn.Sequential()
+        base.add_module("proj", nn.Linear(64, 64, bias=False))
+        model = get_peft_model(
+            base, LoraConfig(r=8, lora_alpha=16, target_modules=["proj"])
+        )
+        return [(n, p) for n, p in model.named_parameters() if p.requires_grad], model
+
+    def test_first_trainable_parameter_is_lora_a(self) -> None:
+        named, _ = self._adapters()
+        assert "lora_A" in named[0][0], (
+            "params[0] is no longer lora_A; the reasoning in the optimizer-step test "
+            "depends on knowing which parameter comes first"
+        )
+
+    def test_lora_a_has_no_gradient_on_the_first_step(self) -> None:
+        import torch
+
+        named, model = self._adapters()
+        model(torch.randn(4, 64)).sum().backward()
+        grads = {n: p.grad.abs().sum().item() for n, p in named}
+        a = next(v for n, v in grads.items() if "lora_A" in n)
+        b = next(v for n, v in grads.items() if "lora_B" in n)
+        assert a == 0.0, f"lora_A gradient should be exactly zero at step 0, got {a}"
+        assert b > 0.0, "lora_B must receive a gradient, or nothing is learning"

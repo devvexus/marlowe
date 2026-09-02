@@ -290,6 +290,29 @@ class BudgetItem:
         return self.bytes_ / GB
 
 
+#: The KL reference is the largest permanent artefact in the project and the only one that
+#: is written once and read by every measurement forever. It was itemised at a flat 2 GB,
+#: which is wrong by ~36x: the file stores a quantised distribution over the *whole*
+#: vocabulary for every scored token, and this model's vocabulary is 248,320 tokens.
+#:
+#: Derived rather than transcribed, because the two token counts involved differ by 2x and
+#: are easy to swap: a chunk *consumes* n_ctx corpus tokens and *scores* n_ctx/2 of them.
+KL_REFERENCE_CTX = 8192
+KL_REFERENCE_TOKENS = 300_000
+KL_REFERENCE_VOCAB = 248_320
+
+
+def kl_reference_bytes(
+    corpus_tokens: int = KL_REFERENCE_TOKENS,
+    ctx: int = KL_REFERENCE_CTX,
+    n_vocab: int = KL_REFERENCE_VOCAB,
+) -> int:
+    """Projected size of reference.kld. Shares its arithmetic with marlowe.eval.kl."""
+    from marlowe.eval.kl import kld_chunks_for_corpus, kld_expected_bytes
+
+    return kld_expected_bytes(n_vocab, ctx, kld_chunks_for_corpus(corpus_tokens, ctx))
+
+
 def disk_budget(rungs: list[tuple[str, float, int]]) -> list[BudgetItem]:
     """Itemise disk use for a ladder.
 
@@ -309,7 +332,12 @@ def disk_budget(rungs: list[tuple[str, float, int]]) -> list[BudgetItem]:
         # page from disk for the whole pass, and Q8_0's own KL to bf16 is far below the
         # deltas being measured.
         BudgetItem("parent", "q8_0 GGUF (KL reference source)", int(parent_b * 1e9 * 1.06), False),
-        BudgetItem("parent", "reference.kld", 2 * GB, True),
+        BudgetItem(
+            "parent",
+            f"reference.kld ({KL_REFERENCE_TOKENS // 1000}K tok @ -c {KL_REFERENCE_CTX})",
+            kl_reference_bytes(),
+            True,
+        ),
         BudgetItem("parent", "stage-0 quant candidates (8 x ~10 GB)", 80 * GB, False),
     ]
 

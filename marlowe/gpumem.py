@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import csv
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -96,18 +95,13 @@ class PagingSampler:
         self._interval = interval_s
         self._proc: subprocess.Popen[bytes] | None = None
         self._path: Path | None = None
-        self._dir: str | None = None
 
     def start(self) -> None:
         if sys.platform != "win32":
             return
-        # typeperf refuses -- silently, rc=0, no stderr -- to write to a path that already
-        # exists. mkstemp CREATES the file, so this sampler produced an empty CSV on every
-        # run and reported available=False, and ProbeResult.fits() fell back to torch
-        # accounting without saying so. A fail-open in the instrument whose whole purpose is
-        # to stop the fit decision failing open.
-        self._dir = tempfile.mkdtemp(prefix="marlowe-gpumem-")
-        self._path = Path(self._dir) / "adapter.csv"
+        fd, name = tempfile.mkstemp(suffix=".csv", prefix="marlowe-gpumem-")
+        os.close(fd)
+        self._path = Path(name)
         try:
             self._proc = subprocess.Popen(
                 ["typeperf", _SHARED, _DEDICATED, "-si", str(self._interval),
@@ -128,8 +122,6 @@ class PagingSampler:
         report = _parse(self._path) if self._path else PagingReport(available=False)
         if self._path is not None:
             self._path.unlink(missing_ok=True)
-        if self._dir is not None:
-            shutil.rmtree(self._dir, ignore_errors=True)
         return report
 
 

@@ -29,6 +29,15 @@ from marlowe.report import (
 
 log = logutil.get("stages")
 
+#: Context for the permanent KL reference. 8192 rather than 4096 because the damage this
+#: project prunes for is recurrent-state accumulation, which is invisible near position
+#: zero -- the same reason Stage 3 scores at late positions.
+#:
+#: Changing this invalidates every KL number ever produced against the existing reference,
+#: and the file itself does not announce its context: llama.cpp adopts a base file's n_ctx
+#: without warning. build_reference writes a sidecar so a mismatch fails loudly instead.
+REFERENCE_CTX = 8192
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -522,7 +531,16 @@ def stage2_baselines(ctx: StageContext) -> dict[str, Any]:
 
     ref = ctx.declare_output("kl_reference", ctx.metrics_dir / "reference.kld")
     if not ref.exists():
-        kleval.build_reference(ref_gguf, corpus, ref)
+        # Explicit, not defaulted. The reference is permanent and every KL in the project is
+        # relative to it, so the context it was built at has to be a decision recorded here
+        # rather than whatever kl.py happens to default to.
+        kleval.build_reference(ref_gguf, corpus, ref, ctx=REFERENCE_CTX)
+    meta = kleval.read_sidecar(ref)
+    if meta:
+        ctx.note(
+            f"KL reference: n_ctx={meta['ctx']}, {meta['chunks']} chunks, "
+            f"{meta['scored_tokens']} scored tokens, {meta['bytes'] / 1e9:.1f} GB"
+        )
 
     results: dict[str, Any] = {}
 
@@ -542,6 +560,31 @@ def stage2_baselines(ctx: StageContext) -> dict[str, Any]:
             f"current build; without it the number to beat is unknown and the ship gate's KL "
             f"criterion cannot be evaluated."
         )
+
+    # An existing fine-tune of the same parent, measured for context and nothing else.
+    #
+    # It answers "does this beat what I already run", which is worth knowing and is NOT the
+    # gate. Its KL to the parent contains intentional fine-tuning drift on top of
+    # quantisation error, so a healed child could clear it while having recovered nothing.
+    # The gate baseline is 27b-iq3_xxs-baseline above: the same parent at 3 bits, where
+    # quantisation is the only difference -- which is the quantity the gate is defined on.
+    #
+    # The label is deliberately not one ship_gate_multi looks up, so this cannot become a
+    # gate input by accident later.
+    super_gguf = ctx.extra.get("super_gguf")
+    if super_gguf:
+        super_gguf = Path(super_gguf)
+        if not super_gguf.exists():
+            ctx.note(f"--super-gguf {super_gguf} does not exist; skipping the informational run")
+        else:
+            results["super_informational"] = _measure_pair(
+                ctx, "27b-super-informational", super_gguf,
+                tokenizer_path=str(src), reference=ref, corpus=corpus,
+            )
+            ctx.note(
+                "27b-super-informational recorded for comparison only. It is a fine-tune, so "
+                "its KL includes deliberate drift and it is not the number to beat."
+            )
 
     # bf16 repetition goes through a hosted API: the bf16 weights are 55.6 GB and cannot run
     # on this machine at any useful speed.

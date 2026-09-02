@@ -194,7 +194,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     cfg = load_run_config(args.config)
     extra: dict[str, Any] = {}
-    for key in ("iq3_xxs_gguf", "hosted_base_url", "hosted_model", "hosted_api_key",
+    for key in ("iq3_xxs_gguf", "super_gguf", "hosted_base_url", "hosted_model", "hosted_api_key",
                 "child_config", "max_gpu_gb", "score_parent",
                 "allow_missing_bf16_baseline", "allow_cpu_llamacpp",
                 "reference_outtype", "keep_intermediates", "allow_quantized_head"):
@@ -430,6 +430,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--run-dir")
     r.add_argument("--force", action="store_true", help="ignore an up-to-date manifest")
     r.add_argument("--iq3-xxs-gguf", dest="iq3_xxs_gguf", help="the user's current build")
+    r.add_argument("--super-gguf", dest="super_gguf",
+                   help="an existing fine-tune of the same parent, measured for "
+                        "context only -- it is a fine-tune, so its KL carries "
+                        "intentional drift and it is never the gate baseline")
     r.add_argument("--hosted-base-url", dest="hosted_base_url", help="for the bf16 baseline")
     r.add_argument("--hosted-model", dest="hosted_model")
     r.add_argument("--hosted-api-key", dest="hosted_api_key")

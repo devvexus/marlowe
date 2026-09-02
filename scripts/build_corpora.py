@@ -110,6 +110,19 @@ def _stream(spec: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 f"repo is the fix, guessing the names is what broke."
             )
         urls = [f"https://huggingface.co/datasets/{repo}/resolve/main/{n}" for n in sorted(names)]
+    # Held-out sources start reading past whatever the healing corpus consumed. For sources
+    # with an explicit `urls` list the caller does this by constructing different URLs; for
+    # repo-listed sources the names are resolved here, so the offset has to be applied here
+    # too. It was set on the spec and never read, which made the fineweb-edu third of the
+    # "held-out" reference the same shards healing had already trained on -- caught by
+    # assert_disjoint with 112 collisions, which is exactly what that check is for.
+    offset = int(spec.get("_offset", 0))
+    if offset:
+        if offset >= len(urls):
+            raise RuntimeError(
+                f"_offset={offset} skips past all {len(urls)} shards; nothing would be read."
+            )
+        urls = urls[offset:]
     for url in urls:
         try:
             # The generic builder, pointed at the file: proof-pile-2 still ships a loading
@@ -287,8 +300,14 @@ def main() -> int:
                     help="tokenizer source; budgets are in ITS tokens")
     ap.add_argument("--calib", action="store_true")
     ap.add_argument("--heal", action="store_true")
+    ap.add_argument("--kl-reference", action="store_true",
+                    help="build the held-out KL yardstick (disjoint from --heal's output)")
     ap.add_argument("--calib-tokens", type=int, default=1_500_000)
     ap.add_argument("--heal-tokens", type=int, default=35_000_000)
+    # 300K corpus tokens is 36 chunks at -c 8192, and the reference .kld it produces is
+    # ~73 GB: the file stores a distribution over all 248,320 vocabulary entries for every
+    # scored token. Raising this costs 0.24 GB per thousand tokens, permanently.
+    ap.add_argument("--kl-tokens", type=int, default=300_000)
     ap.add_argument("--seq-len", type=int, default=32768)
     ap.add_argument("--books", type=int, default=3)
     ap.add_argument("--max-book-tokens", type=int, default=0,
@@ -321,6 +340,21 @@ def main() -> int:
             out_dir / "heal_corpus.jsonl", tok,
             target_tokens=args.heal_tokens, seed=args.seed,
         )
+    if args.kl_reference:
+        manifest["kl_reference"] = build_kl_reference(
+            out_dir / "kl_reference.jsonl", tok,
+            target_tokens=args.kl_tokens,
+            heal_path=out_dir / "heal_corpus.jsonl", seed=args.seed,
+        )
+        # Its own manifest, separate from the shared one: this file is permanent and every
+        # KL number in the project is relative to it, so its provenance must not be
+        # overwritten the next time an unrelated corpus is rebuilt.
+        kpath = Path(args.run_dir) / "manifests" / "kl_reference.json" if args.run_dir else None
+        if kpath:
+            kpath.parent.mkdir(parents=True, exist_ok=True)
+            kpath.write_text(json.dumps(manifest["kl_reference"], indent=2), encoding="utf-8")
+            print(f"manifest: {kpath}", flush=True)
+
     payload = json.dumps(manifest, indent=2)
     mpath = out_dir / "corpus_manifest.json"
     mpath.write_text(payload, encoding="utf-8")
@@ -335,9 +369,6 @@ def main() -> int:
         print(f"manifest: {rpath}", flush=True)
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())
 
 
 # ---------------------------------------------------------------------------
@@ -411,25 +442,56 @@ def build_kl_reference(
     mix = {"arxiv": 0.35, "open-web-math": 0.15, "algebraic-stack": 0.15, "fineweb-edu": 0.35}
     print(f"KL reference: target {target_tokens / 1e6:.2f}M tokens, held out from {heal_path}",
           flush=True)
+    # An absent healing corpus yields an empty hash set, and assert_disjoint would then pass
+    # on anything. "No collisions" and "nothing to collide with" are indistinguishable
+    # downstream, so the distinction has to be made here.
+    if not Path(heal_path).exists():
+        raise FileNotFoundError(
+            f"{heal_path} does not exist, so disjointness cannot be checked. Building the "
+            f"reference now would produce a file that only appears held out."
+        )
     heal_hashes = heal_document_hashes(heal_path)
+    if not heal_hashes:
+        raise RuntimeError(
+            f"{heal_path} yielded no document hashes. Refusing to certify disjointness "
+            f"against an empty set."
+        )
     print(f"  healing corpus documents to exclude: {len(heal_hashes)}", flush=True)
 
     rows: list[dict[str, Any]] = []
     actual: dict[str, int] = {}
+    # What each source was ACTUALLY read from, recorded per source as the build applies it.
+    #
+    # Transcribing HELDOUT_SHARD_OFFSET into the manifest instead described the intent rather
+    # than the act: fineweb-edu's offset is set on the spec here, not in that table, so the
+    # manifest reported `fineweb-edu: None` for the one source that had 112 collisions. The
+    # manifest is the only durable statement of what was excluded, so it has to be written
+    # from the values that were used.
+    effective: dict[str, Any] = {}
     for name, frac in mix.items():
         spec = dict(SOURCES[name])
         off = HELDOUT_SHARD_OFFSET.get(name)
         if name == "algebraic-stack":
             spec["urls"] = [f"{PP2}/algebraic-stack/train/{n}.jsonl.zst"
                             for n in HELDOUT_ALGEBRAIC]
+            effective[name] = {"mode": "explicit files", "files": list(HELDOUT_ALGEBRAIC)}
         elif name == "fineweb-edu":
             spec = dict(spec)
             spec["_offset"] = 20
+            effective[name] = {"mode": "shard index offset into repo listing",
+                               "offset": 20, "prefix": spec.get("prefix")}
         elif off:
             spec["urls"] = [f"{PP2}/{name}/train/"
                             + (f"arXiv_{i:03d}.jsonl.zst" if name == "arxiv"
                                else f"shard-{i:04d}.jsonl.zst")
                             for i in range(off, off + 6)]
+            effective[name] = {"mode": "explicit shard URLs", "offset": off,
+                               "shards": [u.rsplit("/", 1)[-1] for u in spec["urls"]]}
+        else:
+            # No holdout applied. Recorded rather than omitted: a source with no offset is
+            # reading the same shards healing did, and that must be visible in the manifest
+            # instead of inferred from a missing key.
+            effective[name] = {"mode": "NO OFFSET APPLIED", "offset": 0}
         SOURCES[f"_heldout_{name}"] = spec
         docs, got = take_tokens(f"_heldout_{name}", int(target_tokens * frac), tok, seed=seed)
         for d in docs:
@@ -453,10 +515,14 @@ def build_kl_reference(
         "documents": len(rows),
         "composition": actual,
         "requested_mix": mix,
-        "shard_offsets": {**HELDOUT_SHARD_OFFSET, "algebraic_files": list(HELDOUT_ALGEBRAIC)},
+        "shard_offsets_declared": {**HELDOUT_SHARD_OFFSET,
+                                   "algebraic_files": list(HELDOUT_ALGEBRAIC)},
+        "shards_actually_read": effective,
         "held_out_from": str(heal_path),
         "heal_documents_excluded": len(heal_hashes),
         "warning": "This file is the project's KL yardstick. Once a reference .kld is built "
                    "from it, it must never change -- every child measurement is relative to "
                    "these exact bytes.",
     }
+if __name__ == "__main__":
+    sys.exit(main())

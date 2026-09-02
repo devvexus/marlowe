@@ -9,27 +9,79 @@
     "pg19": "public domain (Project Gutenberg, pre-1919)"
   },
   "commercial_use": "proof-pile-2 and fineweb-edu are ODC-By; attribution travels with the shipped model. AlgebraicStack derives from the-stack -- keep the permissive-license filter on if extending with more code.",
-  "heal_corpus": {
-    "target_tokens": 35000000,
-    "tokens": 35008654,
-    "documents": 16138,
+  "kl_reference": {
+    "path": "data\\kl_reference.jsonl",
+    "sha256": "395b4b3983dbce55397c8495c4646ae430ebd39451a9ede2f5b62221d6866651",
+    "tokens": 312147,
+    "documents": 151,
+    "composition": {
+      "arxiv": 113960,
+      "open-web-math": 47061,
+      "algebraic-stack": 45411,
+      "fineweb-edu": 105715
+    },
     "requested_mix": {
       "arxiv": 0.35,
       "open-web-math": 0.15,
       "algebraic-stack": 0.15,
       "fineweb-edu": 0.35
     },
-    "actual_mix": {
-      "arxiv": 0.35,
-      "open-web-math": 0.1501,
-      "algebraic-stack": 0.15,
-      "fineweb-edu": 0.3499
+    "shard_offsets_declared": {
+      "arxiv": 20,
+      "open-web-math": 20,
+      "algebraic-stack": 0,
+      "fineweb-edu": null,
+      "algebraic_files": [
+        "python0001",
+        "c0001",
+        "haskell0001",
+        "lean0001",
+        "matlab0001"
+      ]
     },
-    "composition": {
-      "arxiv": 12253600,
-      "open-web-math": 5254153,
-      "algebraic-stack": 5250467,
-      "fineweb-edu": 12250434
-    }
+    "shards_actually_read": {
+      "arxiv": {
+        "mode": "explicit shard URLs",
+        "offset": 20,
+        "shards": [
+          "arXiv_020.jsonl.zst",
+          "arXiv_021.jsonl.zst",
+          "arXiv_022.jsonl.zst",
+          "arXiv_023.jsonl.zst",
+          "arXiv_024.jsonl.zst",
+          "arXiv_025.jsonl.zst"
+        ]
+      },
+      "open-web-math": {
+        "mode": "explicit shard URLs",
+        "offset": 20,
+        "shards": [
+          "shard-0020.jsonl.zst",
+          "shard-0021.jsonl.zst",
+          "shard-0022.jsonl.zst",
+          "shard-0023.jsonl.zst",
+          "shard-0024.jsonl.zst",
+          "shard-0025.jsonl.zst"
+        ]
+      },
+      "algebraic-stack": {
+        "mode": "explicit files",
+        "files": [
+          "python0001",
+          "c0001",
+          "haskell0001",
+          "lean0001",
+          "matlab0001"
+        ]
+      },
+      "fineweb-edu": {
+        "mode": "shard index offset into repo listing",
+        "offset": 20,
+        "prefix": "data/CC-MAIN-2025-18/"
+      }
+    },
+    "held_out_from": "data\\heal_corpus.jsonl",
+    "heal_documents_excluded": 16138,
+    "warning": "This file is the project's KL yardstick. Once a reference .kld is built from it, it must never change -- every child measurement is relative to these exact bytes."
   }
 }
