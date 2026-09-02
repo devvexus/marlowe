@@ -299,6 +299,54 @@ complete recovery of the pruning damage, with the width contributing almost noth
 fails at IQ3_M is the *expected* intermediate state, not a failure of the approach. Do not
 retune the recipe on the strength of an IQ3_M miss alone.
 
+### The mixer-protected mix is larger and worse. The FFN is not the tolerant part
+
+Measured on the **unhealed** child, against `reference.kld`:
+
+| | size | bpw | kl_mean | top-p agree |
+| --- | --- | --- | --- | --- |
+| child IQ3_M | 10.495 GB | 3.7656 | **0.451331** | 77.98% |
+| child mixer-q5 | 10.951 GB | 3.9293 | 0.467476 | 77.51% |
+
+More bits, higher KL, lower agreement. That comparison does not depend on matching bases --
+the mix is a strictly larger file and it lost -- so it stands on its own.
+
+The mix is **not** "IQ3_M with protected mixers". Its base is `iq3_xxs`, so relative to IQ3_M
+it trades the FFN *down* (156 tensors, ~62% of parameters) to buy the mixers *up* (244
+tensors to q5_K). The FFN loss outweighed the mixer gain.
+
+`stage0_recipes` described the FFN as "62% of parameters and the most tolerant of them".
+**That claim is now contradicted by measurement** on this architecture. Whatever the FFN is
+doing in a gated-DeltaNet hybrid, it does not absorb quantisation error the way the comment
+assumed.
+
+**Missing control:** child `iq3_xxs`, which would separate "mixer protection helps but not
+enough" from "mixer protection buys nothing". Not built. Do not carry the mix into Stage 7
+without it -- the three outcomes lead to different decisions, and only one of them keeps the
+recipe.
+
+### No hosted endpoint: what is substituted, and what that costs
+
+Stage 2 step 3 is **no longer endpoint-blocked**. Everything that needed OpenRouter has a
+local stand-in, and each one is recorded as a proxy rather than as the thing it replaces.
+
+* **bf16 controls -> parent Q8_0.** It is already the KL reference, its own KL to bf16 is
+  under 0.001, and bf16 is 56 GB against 32 GB of RAM. Partial offload at `-ngl 30`.
+* **bf16 repetition baseline -> the same Q8_0, locally.** ~14 h for 200 completions under
+  partial offload. One-time, and only Stage 7 needs it, so it runs after healing when the GPU
+  is free. **The manifest must record `Q8_0-as-proxy`**, not bf16: a baseline whose
+  provenance is wrong is worse than a missing one, because it will be quoted.
+* **Phase A traces -> the IQ3_M parent via llama-server**, 4 slots, pp=0.0, thinking preset,
+  ~137 tok/s aggregate. 14M raw tokens targeted to net ~10M after filtering. **Record that
+  traces come from IQ3_M, not bf16.** The teacher is itself quantised, so the student's
+  ceiling is the quantised parent's behaviour, not the bf16 parent's -- that is a real cost
+  and it must not be discovered later from a puzzling KL.
+* **Phase B stays blocked** on the endpoint, which costs nothing: it runs after Stage 7.
+
+Trace filter, applied at generation: drop when `rep8` exceeds the parent's own baseline, drop
+on cap-hit without a stop token, drop under 1,500 tokens. **Log the yield** -- the filter
+rate is the honest measure of how much the quantised teacher is costing.
+
 ### Stage 3 was one-shot, so cut interaction was never measured
 
 Ablation KL was scored one layer at a time against the full model. The cut list removes

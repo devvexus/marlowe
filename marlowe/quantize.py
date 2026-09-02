@@ -552,12 +552,23 @@ def mixer_protected_types(
     The goal for the child is maximum knowledge transfer from the parent, measured as KL.
     The mixers are where the parent's learned routing lives -- what attends to what, and what
     the recurrent state carries forward -- so quantisation error there changes *which*
-    information reaches the residual stream. FFN error is additive over a much wider tensor
-    and averages out; the FFN is also ~62% of parameters, which is what makes the trade
+    information reaches the residual stream. FFN error was assumed additive over a much wider
+    tensor and therefore tolerable, with the FFN's ~62% of parameters making the trade
     affordable at a fixed budget.
 
     Embeddings are kept at Q4_K rather than dropped to the base type because the vocabulary
     is 248,320 entries: a large, low-redundancy table where the error has nowhere to average.
+
+    **Measured on the unhealed child, the FFN assumption is wrong.** Against IQ3_M this mix is
+    both larger and worse -- 10.951 GB vs 10.495, kl_mean 0.467476 vs 0.451331, top-p
+    agreement 77.51% vs 77.98%. Relative to IQ3_M it trades the FFN down to iq3_xxs to buy the
+    mixers up to q5_K, and the FFN loss outweighed the mixer gain. Whatever the FFN does in a
+    gated-DeltaNet hybrid, it does not absorb quantisation error the way that reasoning
+    assumed.
+
+    The control that separates "mixer protection helps but not enough" from "mixer protection
+    buys nothing" is child ``iq3_xxs`` at this mix's own base, and it has not been built. Do
+    not ship this recipe on the strength of the hypothesis alone.
     """
     types = dict.fromkeys(MIXER_WEIGHTS, mixer)
     types.update(dict.fromkeys(FFN_WEIGHTS, ffn))
