@@ -479,6 +479,11 @@ def quantize(
     if imatrix and not Path(imatrix).exists():
         raise FileNotFoundError(f"imatrix {imatrix} does not exist")
 
+    if recipe.tensor_types:
+        counts = assert_patterns_match(src_gguf, recipe.tensor_types)
+        logutil.event(log, "tensor-type patterns matched", recipe=recipe.name,
+                      **{k: v for k, v in counts.items()})
+
     cmd = [exe]
     if imatrix:
         cmd += ["--imatrix", str(imatrix)]
@@ -520,6 +525,92 @@ def bits_per_weight(gguf_path: str | Path, n_params: int) -> float:
 # ---------------------------------------------------------------------------
 
 
+#: Tensor-name patterns, in GGUF naming, anchored on ``\.weight``.
+#:
+#: Anchored because llama-quantize matches with ``regex_search``: bare ``attn_q`` also selects
+#: ``attn_qkv.weight``, which is a different tensor in a different set of layers. Verified
+#: with ``llama-quantize --dry-run``, which prints every override it applies.
+#:
+#: This architecture is a hybrid: 16 full-attention layers carry ``attn_q/k/v/output``, and
+#: 36 linear-attention layers carry ``attn_qkv``, ``attn_gate`` and the ``ssm_*`` path.
+#: A pattern set that names only one family silently protects a quarter of the model.
+MIXER_WEIGHTS: tuple[str, ...] = (
+    # full attention (16 layers)
+    r"attn_q\.weight", r"attn_k\.weight", r"attn_v\.weight", r"attn_output\.weight",
+    # linear attention / gated DeltaNet (36 layers)
+    r"attn_qkv\.weight", r"attn_gate\.weight",
+    r"ssm_out\.weight", r"ssm_alpha\.weight", r"ssm_beta\.weight",
+)
+FFN_WEIGHTS: tuple[str, ...] = (r"ffn_down\.weight", r"ffn_gate\.weight", r"ffn_up\.weight")
+
+
+def mixer_protected_types(
+    mixer: str = "q5_K", ffn: str = "iq3_xxs", embedding: str = "q4_K"
+) -> dict[str, str]:
+    """Spend the budget on the token-mixing projections, take it out of the FFN.
+
+    The goal for the child is maximum knowledge transfer from the parent, measured as KL.
+    The mixers are where the parent's learned routing lives -- what attends to what, and what
+    the recurrent state carries forward -- so quantisation error there changes *which*
+    information reaches the residual stream. FFN error is additive over a much wider tensor
+    and averages out; the FFN is also ~62% of parameters, which is what makes the trade
+    affordable at a fixed budget.
+
+    Embeddings are kept at Q4_K rather than dropped to the base type because the vocabulary
+    is 248,320 entries: a large, low-redundancy table where the error has nowhere to average.
+    """
+    types = dict.fromkeys(MIXER_WEIGHTS, mixer)
+    types.update(dict.fromkeys(FFN_WEIGHTS, ffn))
+    types[r"token_embd\.weight"] = embedding
+    return types
+
+
+def gguf_tensor_names(src_gguf: str | Path) -> list[str]:
+    """Every tensor name in a GGUF, for validating tensor-type patterns against reality."""
+    from gguf import GGUFReader
+
+    return [t.name for t in GGUFReader(str(src_gguf)).tensors]
+
+
+def assert_patterns_match(src_gguf: str | Path, tensor_types: dict[str, str]) -> dict[str, int]:
+    """Refuse a custom mix whose patterns do not match the model's tensor names.
+
+    llama-quantize matches ``--tensor-type NAME=TYPE`` with a case-insensitive
+    ``std::regex_search`` against the GGUF tensor name, and **silently ignores a pattern that
+    matches nothing**. A mix built on names that do not exist therefore produces a file
+    byte-identical to its base type, under a name claiming it is something else.
+
+    That had happened. ``stage0_recipes`` used the HF safetensors names ``q_proj`` and
+    ``linear_attn.*``; this architecture's GGUF calls them ``attn_q`` / ``attn_qkv`` and
+    ``ssm_*``. All three custom mixes -- the arm Stage 0 exists to test -- would have been
+    reported as distinct data points while being plain iq3_xxs and plain iq3_s.
+
+    Over-matching is the same hazard from the other side: because the match is a *search*,
+    ``attn_q`` also hits ``attn_qkv.weight``. Patterns are anchored with ``\\.weight`` for
+    that reason, and the per-pattern counts are returned so a caller can see what was really
+    selected instead of trusting the intent.
+    """
+    names = gguf_tensor_names(src_gguf)
+    counts: dict[str, int] = {}
+    empty: list[str] = []
+    for pattern in tensor_types:
+        rx = re.compile(pattern, re.IGNORECASE)
+        n = sum(1 for name in names if rx.search(name))
+        counts[pattern] = n
+        if n == 0:
+            empty.append(pattern)
+    if empty:
+        stems = sorted({re.sub(r"^blk\.\d+\.", "", n) for n in names})
+        raise ValueError(
+            f"tensor-type pattern(s) {empty} match no tensor in {Path(src_gguf).name}. "
+            f"llama-quantize ignores a pattern that matches nothing, so this mix would be "
+            f"byte-identical to its base type while being recorded as a distinct recipe.\n"
+            f"GGUF tensor names in this model (block index stripped):\n  "
+            + "\n  ".join(stems)
+        )
+    return counts
+
+
 def stage0_recipes(target_gb: float = 10.2) -> list[QuantConfig]:
     """The bit-width threshold sweep. Stage 0, decision-critical.
 
@@ -532,16 +623,11 @@ def stage0_recipes(target_gb: float = 10.2) -> list[QuantConfig]:
     without pruning at all, and the compression project becomes a speed and headroom play
     rather than a rescue.
     """
-    gate_and_recurrent = {
-        # The multiplicative output gate fused into q_proj: [12288, 5120] rather than
-        # [6144, 5120]. Multiplicative error compounds; additive error averages out.
-        "q_proj": "q5_K",
-        # The recurrent path. Error accumulates along the sequence, which is why
-        # mamba_ssm_dtype is float32 upstream.
-        "linear_attn.*": "q5_K",
-        # 62% of parameters and the most tolerant of them.
-        "ffn_.*": "iq3_xxs",
-    }
+    # These were written in HF safetensors naming ("q_proj", "linear_attn.*"), which matches
+    # nothing in a GGUF. llama-quantize ignores an unmatched pattern, so all three custom
+    # mixes below were plain iq3_xxs / iq3_s under three different names. assert_patterns_match
+    # now refuses that; the names here are the GGUF ones, anchored.
+    gate_and_recurrent = mixer_protected_types(mixer="q5_K", ffn="iq3_xxs", embedding="q4_K")
     return [
         QuantConfig(name="iq3_xxs", base_type="iq3_xxs", target_gb=target_gb),
         QuantConfig(name="iq3_s", base_type="iq3_s", target_gb=target_gb),
@@ -557,13 +643,15 @@ def stage0_recipes(target_gb: float = 10.2) -> list[QuantConfig]:
         QuantConfig(
             name="mix_gate_q6",
             base_type="iq3_xxs",
-            tensor_types={**gate_and_recurrent, "q_proj": "q6_K", "linear_attn.*": "q6_K"},
+            tensor_types=mixer_protected_types(mixer="q6_K", ffn="iq3_xxs", embedding="q4_K"),
             target_gb=target_gb,
         ),
         QuantConfig(
             name="mix_recurrent_only",
             base_type="iq3_s",
-            tensor_types={"linear_attn.*": "q5_K"},
+            tensor_types=dict.fromkeys(
+                (r"attn_qkv\.weight", r"attn_gate\.weight", r"ssm_out\.weight",
+                 r"ssm_alpha\.weight", r"ssm_beta\.weight"), "q5_K"),
             target_gb=target_gb,
         ),
     ]
@@ -592,7 +680,7 @@ def ship_recipes(target_gb: float = 10.2) -> list[QuantConfig]:
         QuantConfig(
             name="mix_gate_q5",
             base_type="iq3_xxs",
-            tensor_types={"q_proj": "q5_K", "linear_attn.*": "q5_K", "ffn_.*": "iq3_xxs"},
+            tensor_types=mixer_protected_types(),
             target_gb=target_gb,
         )
     )
