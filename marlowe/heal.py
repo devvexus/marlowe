@@ -29,7 +29,12 @@ Two cost quality, and are taken only if needed, in this order (see :data:`MEMORY
 
 :func:`search_memory_plan` measures each candidate rather than trusting arithmetic -- sizing
 by hand gets the order of magnitude right and the last gigabyte wrong, and the last gigabyte
-is the entire question. Stage 6 runs it before spending the budget.
+is the entire question.
+
+**Stage 5 runs it, not Stage 6.** The search can select a shorter sequence length, and the
+teacher cache is built at one fixed length whose distributions are position-aligned. Deciding
+after the cache is built means discovering at the start of Stage 6 that six hours of caching
+cannot be used.
 
 Two operational rules from the brief, both enforced here:
 
@@ -1047,14 +1052,16 @@ MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
     # the last decimal -- for 127.7 tok/s against 160.9. It bounds a transient the peak does
     # not fall on, so it buys nothing and costs 21% throughput. It stays fixed at 256, with
     # the CPU embeddings, as a saving every candidate keeps.
-    MemoryCandidate(
-        name="rank8-chunk256",
-        quantize_lm_head=False,
-        optimizer_8bit=True,
-        lora_rank=8,
-        loss_chunk=256,
-        rationale="last rung before the loss target is touched",
-    ),
+    # rank8 is NOT a rung. It was one, ahead of seq768, and it does not pay for itself:
+    # the measured 32 -> 16 step saved 0.14 GB, so 16 -> 8 buys roughly 0.07 GB -- less than
+    # the deficit it would be spent on -- while halving what remains of the adapter's
+    # capacity to re-express the parent. seq768 saves ~0.25 GB for throughput alone and
+    # touches neither adapter capacity nor the loss target.
+    #
+    # Sequence length costs schedule; rank costs the model. If rank 8 is ever reinstated it
+    # goes AFTER seq768 and behind an explicit decision, never on tuple order alone -- which
+    # is how it came to be tried first, back when it and seq768 both claimed to be "the last
+    # rung before the loss target is touched".
     MemoryCandidate(
         name="rank16-seq768",
         quantize_lm_head=False,
@@ -1062,7 +1069,7 @@ MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
         lora_rank=16,
         loss_chunk=256,
         seq_len=768,
-        rationale="shorter sequence: the last rung before the loss target is touched",
+        rationale="shorter sequence, adapter capacity and loss target intact",
     ),
     # --- everything below quantises the head and needs an explicit decision -------------
     MemoryCandidate(

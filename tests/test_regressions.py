@@ -839,18 +839,20 @@ class TestMemoryPlanSearch:
         from marlowe.heal import MEMORY_CANDIDATES
 
         base = HealConfig(seq_len=1024)
-        # Rank is the axis the full-sequence rungs spend. The final rung switches axis --
-        # it shortens the sequence and restores rank 16 -- so it is excluded here and
-        # covered by test_sequence_length_is_the_last_resort_and_never_increases.
+        # Every fp16 rung, with no exclusion. This used to skip the sequence rung, because
+        # the ladder ran rank 8 after it and rank therefore rose again at the end -- the
+        # test was scoped around the exception instead of the exception being removed. With
+        # rank 8 gone the ladder is monotonic across its whole unquantised length.
         ranks = [
-            c.apply(base).lora_rank
-            for c in MEMORY_CANDIDATES
-            if not c.quantize_lm_head and c.apply(base).seq_len == base.seq_len
+            c.apply(base).lora_rank for c in MEMORY_CANDIDATES if not c.quantize_lm_head
         ]
         assert ranks == sorted(ranks, reverse=True), (
             "the fp16 ladder must give up adapter capacity gradually"
         )
-        assert ranks == [32, 16, 8]
+        # Spelled out, because the ladder's shape is a decision and not an implementation
+        # detail: capacity is spent once, then the last rung spends sequence instead of
+        # spending capacity a second time.
+        assert ranks == [32, 16, 16]
 
     def test_sequence_length_is_the_last_resort_and_never_increases(self) -> None:
         """seq_len is mostly a throughput choice, and only the final rung spends it.
@@ -1325,11 +1327,29 @@ class TestLongContextAnnealRefusal:
 
 class TestSequenceLengthLadder:
     def test_rank_rungs_are_ordered_most_capacity_first(self) -> None:
+        """Adapter capacity is spent monotonically, across the whole unquantised ladder.
+
+        Stated over every fp16 rung rather than over two named ones. The named form passed
+        while the ladder tried rank 8 ahead of seq768 -- an ordering nothing had chosen,
+        inherited from tuple position when both rungs claimed to be the last one.
+
+        rank 8 is not in the ladder: the measured 32 -> 16 step saved 0.14 GB, so 16 -> 8
+        buys about 0.07 GB, less than the deficit it would be spent closing, in exchange for
+        half the remaining adapter capacity. If it ever returns it belongs after seq768 and
+        behind an explicit decision -- and this assertion will hold for it either way.
+        """
+        from marlowe.config import HealConfig
         from marlowe.heal import MEMORY_CANDIDATES
 
-        names = [c.name for c in MEMORY_CANDIDATES]
-        assert names.index("rank32-chunk256") < names.index("rank16-chunk256")
-        assert names.index("rank16-chunk256") < names.index("rank8-chunk256")
+        base = HealConfig(lora_rank=32)
+        fp16 = [c for c in MEMORY_CANDIDATES if not c.quantize_lm_head]
+        assert all(c.apply(base).lora_rank <= base.lora_rank for c in fp16), (
+            "no rung may ask for more adapter capacity than the config allows"
+        )
+        assert "rank8-chunk256" not in [c.name for c in fp16], (
+            "rank 8 saves ~0.07 GB against a 0.14 GB measured 32->16 step -- less than the "
+            "deficit -- for half the remaining adapter capacity. It is not a rung."
+        )
 
     def test_all_fp16_candidates_precede_every_nf4_one(self) -> None:
         """Shortening context is a real cost; corrupting the loss target is a worse one."""
