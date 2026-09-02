@@ -778,6 +778,29 @@ class TestGgufProbeUsesRealNaming:
         assert mask != real, "fixture must differ or the test proves nothing"
 
 
+def _RESIDENT():
+    """A driver report that actually saw the run and saw no spill."""
+    from marlowe.gpumem import PagingReport
+
+    return PagingReport(available=True, paged_bytes=0, samples=8,
+                        shared_peak_bytes=90_000_000,
+                        shared_floor_bytes=90_000_000)
+
+
+def _PAGED(gb: float = 7.51):
+    """A driver report showing a real spill: the new meaning of "does not fit".
+
+    Simulating non-fit with a large peak_vram_gb no longer works, and should not:
+    rank32-seq1024 peaked at 17.06 GB of 17.17 and torch called that 0.11 GB of
+    headroom, while the driver showed 7.51 GB spilled. Peak is not residency.
+    """
+    from marlowe.gpumem import PagingReport
+
+    return PagingReport(available=True, paged_bytes=int(gb * 1e9), samples=8,
+                        shared_peak_bytes=int(gb * 1e9) + 90_000_000,
+                        shared_floor_bytes=90_000_000)
+
+
 def _stub_model_plumbing(monkeypatch) -> None:
     """Stub the base load and LoRA wrap for search tests.
 
@@ -785,10 +808,20 @@ def _stub_model_plumbing(monkeypatch) -> None:
     plumbing. Without this they would try to load safetensors from a fake path.
     """
     from marlowe import heal
+    from marlowe.gpumem import PagingReport
 
     monkeypatch.setattr(heal, "load_student", lambda *a, **k: object())
     monkeypatch.setattr(heal, "attach_lora", lambda base, cfg: _StubWrapped())
     monkeypatch.setattr(heal, "_free_cuda", lambda: None)
+    # The fit verdict is driver spill, and an unvalidated counter is no verdict rather than a
+    # pass -- so a selection test has to stand in for the validation it is not exercising.
+    # Stubbed here rather than defaulted in ProbeResult, because defaulting it would make
+    # every un-populated probe report "resident", which is the failure the gate exists to
+    # prevent.
+    monkeypatch.setattr(
+        heal, "sampler_validation",
+        lambda: PagingReport(available=True, paged_bytes=3_000_000_000, samples=8),
+    )
 
 
 class _StubWrapped:
@@ -912,10 +945,13 @@ class TestMemoryPlanSearch:
 
         def fake_probe(path, cfg, *, n_steps=8, max_gpu_gb=None, base=None):
             calls.append(cfg.quantize_lm_head)
-            headroom = 0.2 if not cfg.quantize_lm_head else 2.0
+            # fp16 rungs spill; the gated NF4 rung would not. Expressed as paging,
+            # because paging is the gate -- headroom no longer decides anything.
+            paging = _RESIDENT() if cfg.quantize_lm_head else _PAGED()
             return heal.ProbeResult(
-                tok_s=180.0, peak_vram_gb=16.0 - headroom, total_vram_gb=16.0,
-                step_s=1.0, seq_len=cfg.seq_len, n_steps=n_steps, lora_params=176_000_000,
+                tok_s=180.0, peak_vram_gb=15.8, total_vram_gb=16.0,
+                step_s=1.0, seq_len=cfg.seq_len, n_steps=n_steps,
+                lora_params=176_000_000, paging=paging,
             )
 
         monkeypatch.setattr(heal, "probe_training", fake_probe)
@@ -944,7 +980,7 @@ class TestMemoryPlanSearch:
             heal, "probe_training",
             lambda p, c, **k: heal.ProbeResult(
                 tok_s=150.0, peak_vram_gb=13.0, total_vram_gb=16.0, step_s=1.0,
-                seq_len=c.seq_len, n_steps=4, lora_params=1,
+                seq_len=c.seq_len, n_steps=4, lora_params=1, paging=_RESIDENT(),
             ),
         )
         _stub_model_plumbing(monkeypatch)
@@ -961,7 +997,7 @@ class TestMemoryPlanSearch:
                 raise RuntimeError("CUDA out of memory. Tried to allocate 2.50 GiB")
             return heal.ProbeResult(
                 tok_s=200.0, peak_vram_gb=13.0, total_vram_gb=16.0, step_s=1.0,
-                seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+                seq_len=cfg.seq_len, n_steps=4, lora_params=1, paging=_RESIDENT(),
             )
 
         monkeypatch.setattr(heal, "probe_training", fake_probe)
@@ -992,7 +1028,7 @@ class TestMemoryPlanSearch:
             heal, "probe_training",
             lambda p, c, **k: heal.ProbeResult(
                 tok_s=1.0, peak_vram_gb=15.9, total_vram_gb=16.0, step_s=1.0,
-                seq_len=c.seq_len, n_steps=1, lora_params=1,
+                seq_len=c.seq_len, n_steps=1, lora_params=1, paging=_PAGED(),
             ),
         )
         _stub_model_plumbing(monkeypatch)
@@ -1385,7 +1421,7 @@ class TestSequenceLengthLadder:
             seen.append(cfg.seq_len)
             return heal.ProbeResult(
                 tok_s=100.0, peak_vram_gb=10.0, total_vram_gb=17.17, step_s=1.0,
-                seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+                seq_len=cfg.seq_len, n_steps=4, lora_params=1, paging=_RESIDENT(),
             )
 
         monkeypatch.setattr(heal, "probe_training", fake)
@@ -1409,13 +1445,20 @@ class TestSequenceLengthLadder:
 class TestQuantizedHeadNeedsApproval:
     """The fp16 ladder exhausting is a decision point, not the next rung down."""
 
-    def _tight(self, headroom: float):
+    def _tight(self, headroom: float, *, pages: bool = True):
+        """A probe that does not fit. ``headroom`` is now cosmetic; paging decides.
+
+        Kept as a parameter because the callers read better with it, and because it documents
+        the point: rank32-seq1024 had 0.11 GB of headroom and spilled 7.51 GB, so the number
+        that used to mean "tight" carries no verdict at all.
+        """
         from marlowe import heal
 
         def probe(path, cfg, **k):
             return heal.ProbeResult(
                 tok_s=120.0, peak_vram_gb=17.17 - headroom, total_vram_gb=17.17,
                 step_s=1.0, seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+                paging=_PAGED() if pages else _RESIDENT(),
             )
 
         return probe
@@ -1468,7 +1511,7 @@ class TestQuantizedHeadNeedsApproval:
             seen.append(cfg.quantize_lm_head)
             return heal.ProbeResult(
                 tok_s=1.0, peak_vram_gb=16.7, total_vram_gb=17.17, step_s=1.0,
-                seq_len=cfg.seq_len, n_steps=1, lora_params=1,
+                seq_len=cfg.seq_len, n_steps=1, lora_params=1, paging=_RESIDENT(),
             )
 
         monkeypatch.setattr(heal, "probe_training", probe)
@@ -1481,10 +1524,10 @@ class TestQuantizedHeadNeedsApproval:
         from marlowe.config import HealConfig
 
         def probe(path, cfg, **k):
-            headroom = 2.0 if cfg.quantize_lm_head else 0.5
+            paging = _RESIDENT() if cfg.quantize_lm_head else _PAGED()
             return heal.ProbeResult(
-                tok_s=120.0, peak_vram_gb=17.17 - headroom, total_vram_gb=17.17,
-                step_s=1.0, seq_len=cfg.seq_len, n_steps=4, lora_params=1,
+                tok_s=120.0, peak_vram_gb=16.0, total_vram_gb=17.17,
+                step_s=1.0, seq_len=cfg.seq_len, n_steps=4, lora_params=1, paging=paging,
             )
 
         monkeypatch.setattr(heal, "probe_training", probe)
@@ -1562,7 +1605,7 @@ class TestNoTorchAccountingInFitDecisions:
 
         r = ProbeResult(
             tok_s=1.0, peak_vram_gb=16.0, total_vram_gb=17.0, step_s=1.0,
-            seq_len=1024, n_steps=1, lora_params=1,
+            seq_len=1024, n_steps=1, lora_params=1, paging=_RESIDENT(),
             torch_allocated_gb=13.0, torch_reserved_gb=14.0,
         )
         # headroom must come from the device figure, not either torch figure
@@ -1623,7 +1666,7 @@ class TestMemoryPlanPersistence:
             config=chosen,
             probe=ProbeResult(
                 tok_s=1.0, peak_vram_gb=15.0, total_vram_gb=17.17, step_s=1.0,
-                seq_len=1024, n_steps=4, lora_params=1,
+                seq_len=1024, n_steps=4, lora_params=1, paging=_RESIDENT(),
             ),
         )
         path = tmp_path / "memory_plan.json"

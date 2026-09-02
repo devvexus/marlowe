@@ -191,6 +191,96 @@ def _parse_rows(lines: list[str]) -> PagingReport:
     return best or PagingReport(available=False)
 
 
+
+
+# ---------------------------------------------------------------------------
+# proving the instrument works, in this session, before trusting its verdict
+# ---------------------------------------------------------------------------
+
+#: Torch device headroom, in GB, below which a configuration is *reported* as tight.
+#:
+#: **Advisory. Not a gate.** It replaced a 1.0 GB hard rule that had to go: torch accounting
+#: reported 0.11 GB of "headroom" for rank32-seq1024, a configuration the driver counter
+#: showed spilling 7.51 GB to host at 216 tok/s -- the fastest rung measured. Headroom and
+#: paging can disagree completely, and only one of them saw that.
+ADVISORY_HEADROOM_GB = 0.3
+
+#: Set by :func:`validate_sampler` when the counter has demonstrably detected a real spill in
+#: this process. Deliberately session-scoped and not persisted: a sampler that worked
+#: yesterday, on a different driver or a different desktop composition, is not evidence.
+_VALIDATION: PagingReport | None = None
+
+
+class SamplerNotValidated(RuntimeError):
+    """The paging gate was asked for a verdict before the counter proved it can see."""
+
+
+def sampler_validation() -> PagingReport | None:
+    return _VALIDATION
+
+
+def validate_sampler(over_commit_bytes: int = 2_000_000_000, settle_s: float = 6.0) -> PagingReport:
+    """Force a real spill and confirm the counter reports it. Returns the proof.
+
+    A detector only ever run against configurations that do not page has not been shown to
+    detect anything, and this one has twice been believed working while returning nothing.
+    So the gate requires evidence from the current session rather than from the code's
+    reputation.
+
+    The known-positive is deliberate over-commitment: on WDDM, allocating past VRAM does not
+    raise -- the driver backs the excess with host memory, which is precisely the condition
+    being detected. Costs seconds and needs no model, unlike the other known-positive
+    (``MARLOWE_CPU_GATHER_EMBED=0``, which restages a 2.54 GB embedding table every forward
+    and reported 11.585 GB spilled across 103 samples).
+    """
+    global _VALIDATION
+    import time
+
+    import torch
+
+    sampler = PagingSampler(interval_s=1)
+    sampler.start()
+    time.sleep(settle_s / 3)
+    free, _ = torch.cuda.mem_get_info(0)
+    n = (free + over_commit_bytes) // 2
+    hog = None
+    try:
+        hog = torch.empty(int(n), dtype=torch.float16, device="cuda")
+        hog.fill_(0)
+        torch.cuda.synchronize()
+        time.sleep(settle_s)
+    except (RuntimeError, torch.OutOfMemoryError):
+        # The allocator refused instead of the driver spilling -- which is what the cap is
+        # for, and means this box does not reproduce the condition by over-commitment.
+        pass
+    finally:
+        del hog
+        torch.cuda.empty_cache()
+    report = sampler.stop()
+
+    if not report.available:
+        raise SamplerNotValidated(
+            "the paging counter returned no samples during validation, so it cannot be "
+            "trusted to report a clean run either. Check that typeperf runs and that "
+            r"'\GPU Adapter Memory(*)\Shared Usage' exists on this machine."
+        )
+    if not report.paging:
+        raise SamplerNotValidated(
+            f"validation over-committed VRAM by {over_commit_bytes / 1e9:.1f} GB and the "
+            f"counter reported only {report.paged_bytes / 1e6:.0f} MB spilled. A counter that "
+            f"cannot see a deliberate spill cannot certify that a training config is "
+            f"resident. Verdicts from it would be no-verdicts wearing a pass."
+        )
+    _VALIDATION = report
+    logutil.event(
+        log,
+        "paging sampler validated",
+        paged_gb=round(report.paged_bytes / 1e9, 2),
+        samples=report.samples,
+    )
+    return report
+
+
 #: Cap torch's allocator at the VRAM that physically exists, so over-commitment raises
 #: instead of silently paging.
 #:
@@ -214,6 +304,17 @@ def cap_process_memory(context_bytes: int | None = None) -> float | None:
     """
     import torch
 
+    # Opt-OUT, not opt-in.
+    #
+    # It was opt-in, which meant the safety net existed and was not deployed: every probe in
+    # this project ran with MARLOWE_CUDA_MEMORY_FRACTION unset, so cap_process_memory returned
+    # None and never applied. rank32-seq1024 then paged 7.51 GB while torch reported 0.11 GB
+    # of headroom. A mechanism that is present but inactive by default is the same defect
+    # class as a guard that fails open.
+    #
+    # Cap and counter are belt and braces, and they see different things: the cap makes torch
+    # over-commitment raise instead of silently paging, and the counter catches the spill the
+    # cap cannot see -- host-backed memory the driver hands out below torch's own ceiling.
     raw = os.environ.get(_MEMORY_FRACTION_ENV)
     if raw is not None:
         try:
@@ -222,11 +323,15 @@ def cap_process_memory(context_bytes: int | None = None) -> float | None:
             log.warning("%s=%r is not a float; ignoring", _MEMORY_FRACTION_ENV, raw)
             return None
         if fraction <= 0:
+            log.warning("%s=%s disables the allocator cap explicitly", _MEMORY_FRACTION_ENV, raw)
             return None
     else:
-        if context_bytes is None:
-            return None
         total = torch.cuda.get_device_properties(0).total_memory
+        if context_bytes is None:
+            # Nobody measured the context, so derive it: whatever is already gone from a card
+            # this process has not allocated on is context plus other tenants.
+            free_now, _ = torch.cuda.mem_get_info(0)
+            context_bytes = max(0, total - free_now - torch.cuda.memory_reserved(0))
         fraction = max(0.5, (total - context_bytes) / total)
 
     total_bytes = torch.cuda.get_device_properties(0).total_memory

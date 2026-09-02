@@ -61,7 +61,15 @@ import torch
 
 from marlowe import logutil, preflight
 from marlowe.config import HealConfig
-from marlowe.gpumem import PagingReport, PagingSampler, cap_process_memory
+from marlowe.gpumem import (
+    ADVISORY_HEADROOM_GB,
+    PagingReport,
+    PagingSampler,
+    SamplerNotValidated,
+    cap_process_memory,
+    sampler_validation,
+    validate_sampler,
+)
 
 log = logutil.get("heal")
 
@@ -78,7 +86,13 @@ log = logutil.get("heal")
 #:
 #: Measured device-level (total minus free from the driver), not from torch accounting --
 #: see :func:`probe_training` for why that distinction is load-bearing.
-FIT_MARGIN_GB = 1.0
+#: Retained only so existing call sites keep working. It is ADVISORY: the fit verdict is
+#: driver spill, not headroom. See ProbeResult.fits and gpumem.ADVISORY_HEADROOM_GB.
+#:
+#: It was 1.0 GB and gated. Torch reported 0.11 GB headroom for rank32-seq1024 while
+#: the driver counter showed 7.51 GB spilled, so the two disagree completely and only
+#: one of them was measuring residency.
+FIT_MARGIN_GB = ADVISORY_HEADROOM_GB
 
 #: Bytes resident on the device before this process loads anything: CUDA context, driver
 #: allocations, any other process. Measured ONCE, on first use, while torch holds nothing.
@@ -1085,17 +1099,48 @@ class ProbeResult:
         return self.total_vram_gb - self.peak_vram_gb
 
     def fits(self, margin_gb: float = 0.0) -> bool:
-        """Did this configuration stay on the card?
+        """Did this configuration stay on the card? Driver spill is the only gate.
 
-        The gate is the driver's spill counter. Throughput is not a fit signal: a probe
-        measured 74.5 tok/s at seq 2048 while 6.8 GB over the card, and paging cost depends
-        on which pages get evicted, so an over-committed run can look fast for a few steps.
-        Torch accounting stays as the diagnostic and as the fallback when the counter is
-        unavailable, where the old headroom rule applies.
+        **Primary and sole criterion: driver Shared Usage over the idle floor, <= 250 MB.**
+        Throughput is not a fit signal and neither is torch accounting. Both have now been
+        caught: a probe measured 74.5 tok/s at seq 2048 while 6.8 GB over the card, and torch
+        reported 0.11 GB of headroom for rank32-seq1024 while the driver showed it spilling
+        **7.51 GB** -- at 216 tok/s, the fastest rung measured. Under the old 1.0 GB headroom
+        rule that configuration was merely "tight". It was paging half the model.
+
+        ``margin_gb`` is advisory and does not gate; see :data:`gpumem.ADVISORY_HEADROOM_GB`.
+
+        **An unvalidated sampler is no verdict, not a pass.** The counter has twice been
+        believed working while silently returning nothing, so :func:`gpumem.validate_sampler`
+        must have proved it against a real spill *in this session* before its silence means
+        anything. Without that, this raises rather than guessing.
         """
         if not self.paging.available:
-            return self.headroom_gb() >= margin_gb
+            raise SamplerNotValidated(
+                "the driver paging counter returned nothing for this probe, so there is no "
+                "fit verdict to give. Falling back to torch headroom is what the previous "
+                "rule did, and torch reported 0.11 GB headroom on a configuration paging "
+                "7.51 GB. Fix the sampler rather than accepting its silence."
+            )
+        if sampler_validation() is None:
+            raise SamplerNotValidated(
+                "the paging counter has not been validated in this session, so a 'resident' "
+                "reading is indistinguishable from a broken counter. Call "
+                "gpumem.validate_sampler() first -- it forces a real spill and confirms the "
+                "counter sees it, in a few seconds and without loading a model."
+            )
         return not self.paging.paging
+
+    def advisory_headroom_note(self) -> str | None:
+        """Torch headroom, reported and never gated. Returns None when it is comfortable."""
+        h = self.headroom_gb()
+        if h >= ADVISORY_HEADROOM_GB:
+            return None
+        return (
+            f"advisory: {h:.2f} GB torch device headroom, below the "
+            f"{ADVISORY_HEADROOM_GB:.1f} GB comfort line. Not a gate -- the driver counter "
+            f"decides -- but worth knowing before a multi-day run."
+        )
 
     def projected_hours(self, tokens: int) -> float:
         return tokens / self.tok_s / 3600
