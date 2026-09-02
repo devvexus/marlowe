@@ -14,6 +14,28 @@ exactly the DeltaNet layers that must not be cut: a linear-attention layer's per
 delta can be small while its contribution to state maintenance across 100K tokens is large.
 Short calibration cannot see the second thing.
 
+**`calib.jsonl` OVERLAPS `heal_corpus.jsonl` and is NOT a held-out set.** Both are built by
+`scripts/build_corpora.py` streaming the same proof-pile-2 arXiv shards from index 0, so the
+calibration set's arXiv content is a subset of the healing corpus by construction (6 rows are
+byte-identical). That is harmless for its actual jobs -- Stage 3 measures parent behaviour
+under ablation, and the importance matrix measures weight importance; neither is a
+generalisation claim. **Do not use it to evaluate a healed model.** For that,
+`kl_reference.jsonl` exists.
+
+## `kl_reference.jsonl` -- the KL yardstick, held out from healing
+
+Same composition as `heal_corpus.jsonl` (~65% proof-pile-2, ~35% fineweb-edu) so KL is
+measured on the deployment distribution, but drawn from shards the healing corpus never read
+via an explicit `HELDOUT_SHARD_OFFSET`. ~300K tokens.
+
+`assert_disjoint` **fails the build** if any document hash collides with the healing corpus.
+A reference that is 99% held out is not held out: every healing checkpoint is scored against
+this file, so a shared document means the ship gate is partly measuring memorisation.
+
+**Once a reference `.kld` has been built from it, this file must never change.** Every child
+measurement is relative to those exact bytes. Its sha256, token count, shard offsets and the
+`-c 8192` context are recorded in `runs/<name>/manifests/kl_reference.json`.
+
 ## `heal_corpus.jsonl` -- Stage 5 teacher cache, Stage 6 healing
 
 Same format. In-domain data where available. At this compression ratio there is no obligation

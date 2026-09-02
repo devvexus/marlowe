@@ -179,6 +179,60 @@ informative than a curve with structure. If real triggers arrive,
 note Stage 0 deletes its candidates on *successful* completion: the five GGUFs are on disk
 only because the run was stopped early.
 
+## 1c. Stage 4 is running; the KL reference is the thing to get right
+
+**In flight** (background agent): surgery on the Stage 3 cut list -> GGUF convert -> child
+imatrix -> IQ3_M -> Q4_K_M. Surgery is streaming safetensors on CPU (`safe_open` per tensor,
+no `from_pretrained`); nothing in this path makes the 27B resident in bf16.
+
+Note `stage4_surgery`'s docstring says the unhealed checkpoint "gets measured". **It does
+not** -- the code runs surgery and asserts the parameter count, nothing else. The floor KL is
+separate work, done through llama.cpp only.
+
+### The KL reference must be held out from healing, and nothing else must be
+
+Established here, because it is easy to over- or under-apply:
+
+- **`data/calib.jsonl` overlaps `data/heal_corpus.jsonl`, and that is fine.** Both are built
+  by `scripts/build_corpora.py` streaming the same proof-pile-2 arXiv shards from index 0, so
+  the calibration set's arXiv content is a subset of the healing corpus *by construction* (6
+  rows are byte-identical). It does not matter: Stage 3 measures parent behaviour under
+  ablation and the imatrix measures weight importance. Neither is a generalisation claim.
+  **Stage 3's result stands.**
+- **The KL reference is different.** Every healing checkpoint is scored against it, so any
+  shared document means the ship gate is partly measuring memorisation.
+
+`data/kl_reference.jsonl` is therefore a third corpus:
+
+- same composition as healing (~65% proof-pile-2 / ~35% fineweb-edu) so the KL is measured on
+  the deployment distribution;
+- drawn from shards healing never read, via an explicit `HELDOUT_SHARD_OFFSET` recorded in the
+  manifest -- "which shards" is the only durable statement of what was excluded;
+- ~300K tokens, enough for a stable per-token KL;
+- **`assert_disjoint` fails the build** if the document-hash intersection with the healing
+  corpus is non-empty. A reference that is 99% held out is not held out;
+- sha256 recorded. **Once the reference `.kld` is built from it, the file must never change** --
+  every child measurement is relative to those exact bytes.
+
+### The reference pass, and the parameter that must never drift
+
+```
+model    runs/marlowe-22b/gguf/parent-q8_0.gguf   (28.6 GB, partial offload, slow, correct)
+corpus   data/kl_reference.jsonl
+context  -c 8192
+```
+
+Q8_0 with partial offload is the right reference rather than a smaller quant that fits: as
+close to lossless as the machine allows, and hours once is the correct trade.
+
+**`-c 8192` is load-bearing.** Every later `--kl-divergence` run must use the same context or
+the chunking differs and the numbers are not comparable. It is recorded in
+`runs/marlowe-22b/manifests/kl_reference.json` next to the corpus hash for exactly that
+reason.
+
+There is currently **no `.kld` on disk** -- it is a Stage 2 artefact and Stage 2 has never
+run. It does not need the OpenRouter endpoint, which gates only the *repetition* baseline.
+
 ## 2. Decisions, and why
 
 These do not survive in code. They are the expensive part of this document.

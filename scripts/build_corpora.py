@@ -338,3 +338,125 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------------------------------------------------------------------------
+# held-out KL reference
+# ---------------------------------------------------------------------------
+
+#: Where the held-out reference starts reading, per source.
+#:
+#: The healing corpus streams each source from index 0 and stops when its budget is met, so
+#: anything it touched lives at the start. Offsetting past that is what makes the reference
+#: held out by construction rather than by luck -- and the offsets are recorded in the
+#: manifest because "which shards" is the only durable statement of what was excluded.
+HELDOUT_SHARD_OFFSET = {
+    "arxiv": 20,
+    "open-web-math": 20,
+    "algebraic-stack": 0,  # named files, not indexed; a different set is used below
+    "fineweb-edu": None,   # resolved from the repo listing, offset applied there
+}
+
+#: AlgebraicStack files the healing corpus did not read (it used *0000 of each language).
+HELDOUT_ALGEBRAIC = ("python0001", "c0001", "haskell0001", "lean0001", "matlab0001")
+
+
+def _doc_hash(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def heal_document_hashes(path: str | Path) -> set[str]:
+    """Every document in the healing corpus, by content hash."""
+    out: set[str] = set()
+    p = Path(path)
+    if not p.exists():
+        return out
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.add(_doc_hash(json.loads(line).get("text", "")))
+    return out
+
+
+def assert_disjoint(rows: list[dict[str, Any]], heal_hashes: set[str]) -> None:
+    """Refuse to write a reference that shares any document with the training corpus.
+
+    This is the whole point of the file. Every healing checkpoint is scored against it, so a
+    single shared document means the ship gate is partly measuring memorisation. Checked
+    before anything is written, and fatal -- a reference that is 99% held out is not held out.
+    """
+    collisions = [r for r in rows if _doc_hash(r["text"]) in heal_hashes]
+    if collisions:
+        raise RuntimeError(
+            f"KL reference shares {len(collisions)} document(s) with the healing corpus. "
+            f"The reference must be disjoint or the ship gate scores memorisation. "
+            f"Increase HELDOUT_SHARD_OFFSET so the reference reads shards healing never "
+            f"touched."
+        )
+
+
+def build_kl_reference(
+    out_path: Path, tok: Any, *, target_tokens: int, heal_path: Path, seed: int
+) -> dict[str, Any]:
+    """A held-out yardstick with the healing corpus's composition.
+
+    Same mix as healing (~65% proof-pile-2, ~35% fineweb-edu) so the KL is measured on the
+    distribution the model is meant to serve, but drawn from shards healing never read.
+    """
+    import hashlib
+
+    mix = {"arxiv": 0.35, "open-web-math": 0.15, "algebraic-stack": 0.15, "fineweb-edu": 0.35}
+    print(f"KL reference: target {target_tokens / 1e6:.2f}M tokens, held out from {heal_path}",
+          flush=True)
+    heal_hashes = heal_document_hashes(heal_path)
+    print(f"  healing corpus documents to exclude: {len(heal_hashes)}", flush=True)
+
+    rows: list[dict[str, Any]] = []
+    actual: dict[str, int] = {}
+    for name, frac in mix.items():
+        spec = dict(SOURCES[name])
+        off = HELDOUT_SHARD_OFFSET.get(name)
+        if name == "algebraic-stack":
+            spec["urls"] = [f"{PP2}/algebraic-stack/train/{n}.jsonl.zst"
+                            for n in HELDOUT_ALGEBRAIC]
+        elif name == "fineweb-edu":
+            spec = dict(spec)
+            spec["_offset"] = 20
+        elif off:
+            spec["urls"] = [f"{PP2}/{name}/train/"
+                            + (f"arXiv_{i:03d}.jsonl.zst" if name == "arxiv"
+                               else f"shard-{i:04d}.jsonl.zst")
+                            for i in range(off, off + 6)]
+        SOURCES[f"_heldout_{name}"] = spec
+        docs, got = take_tokens(f"_heldout_{name}", int(target_tokens * frac), tok, seed=seed)
+        for d in docs:
+            d["source"] = name
+        rows.extend(docs)
+        actual[name] = got
+
+    assert_disjoint(rows, heal_hashes)
+    print("  disjointness verified: 0 shared documents with the healing corpus", flush=True)
+
+    rng = random.Random(seed)
+    rng.shuffle(rows)
+    _write(out_path, rows)
+    digest = hashlib.sha256(out_path.read_bytes()).hexdigest()
+    total = sum(actual.values())
+    print(f"  sha256: {digest}", flush=True)
+    return {
+        "path": str(out_path),
+        "sha256": digest,
+        "tokens": total,
+        "documents": len(rows),
+        "composition": actual,
+        "requested_mix": mix,
+        "shard_offsets": {**HELDOUT_SHARD_OFFSET, "algebraic_files": list(HELDOUT_ALGEBRAIC)},
+        "held_out_from": str(heal_path),
+        "heal_documents_excluded": len(heal_hashes),
+        "warning": "This file is the project's KL yardstick. Once a reference .kld is built "
+                   "from it, it must never change -- every child measurement is relative to "
+                   "these exact bytes.",
+    }
