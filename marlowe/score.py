@@ -68,15 +68,49 @@ def make_identity(returns_tuple: bool) -> Any:
 
 
 def detect_return_style(layers: Any, hidden_size: int, device: Any, dtype: Any) -> bool:
-    """Probe once whether a decoder block returns a tuple."""
+    """Does a decoder block return a tuple, or a bare tensor?
+
+    Read from the layer's own return annotation first, and only probe if that is absent.
+    The probe alone was not enough and failed silently in the wrong direction: it called the
+    layer with hidden states only, but ``Qwen3_5DecoderLayer.forward`` takes
+    ``position_embeddings`` as a required positional argument, so the call always raised and
+    the handler assumed ``True``.
+
+    That guess is wrong for this architecture -- the signature says ``-> torch.FloatTensor``
+    and the caller does ``hidden_states = decoder_layer(...)`` -- so every ablated layer
+    returned ``(hidden,)`` and the *next* real layer called ``input_layernorm`` on a tuple.
+    Stage 3 ran the whole reference pass, then died on its first ablated candidate with
+    "'tuple' object has no attribute 'float'", eight minutes in.
+
+    An annotation cannot be wrong about its own return type in the way a probe can be wrong
+    about why it raised.
+    """
+    import inspect
+
     import torch
+
+    try:
+        ann = inspect.signature(type(layers[0]).forward).return_annotation
+        text = str(ann)
+        if ann is not inspect.Signature.empty and text != "None":
+            is_tuple = "tuple" in text.lower()
+            logutil.event(
+                log, "return style from annotation", annotation=text[:60], tuple=is_tuple
+            )
+            return is_tuple
+    except (ValueError, TypeError, AttributeError):
+        pass
 
     with torch.no_grad():
         try:
             out = layers[0](torch.zeros(1, 4, hidden_size, dtype=dtype, device=device))
-        except Exception:  # noqa: BLE001 - probing; a signature mismatch means "assume tuple"
-            logutil.event_at(log, logging.WARNING, "return-style probe failed, assuming tuple")
-            return True
+        except Exception:  # noqa: BLE001 - probing; fall through to the documented default
+            logutil.event_at(
+                log, logging.WARNING,
+                "return-style probe failed and there is no annotation; assuming a bare "
+                "tensor, which is what current transformers decoder layers return",
+            )
+            return False
     return isinstance(out, tuple)
 
 
