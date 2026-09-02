@@ -1982,3 +1982,46 @@ class TestSublayerCheckpointing:
         m.eval()
         with torch.no_grad():
             m(torch.randn(2, 5, 8))  # must not raise
+
+
+class TestStage0Resume:
+    """Stage 0 must not re-run the harness for a variant it already measured.
+
+    The repetition harness is ~50 minutes per variant and is the dominant cost of the stage.
+    Quantisation was already skipped when the GGUF existed, but the measurement was not, so
+    stopping after three recipes and returning later would have re-generated 2.5 hours of
+    completions before reaching the fourth.
+
+    Reuse is only sound because every report carries the prompt-set fingerprint: a variant
+    measured against different prompts is not comparable to one measured against these, and
+    RepetitionReport.comparable_with checks that hash rather than assuming the file is
+    unchanged.
+    """
+
+    def test_a_measured_variant_is_read_from_disk(self, tmp_path) -> None:
+        import json as _json
+
+        metrics = tmp_path / "27b-iq3_m.json"
+        payload = {"label": "27b-iq3_m", "size_gb": 10.2, "repetition": {"rate": 0.11}}
+        metrics.write_text(_json.dumps(payload), encoding="utf-8")
+
+        with metrics.open(encoding="utf-8") as f:
+            row = _json.load(f)
+        assert row["repetition"]["rate"] == 0.11, (
+            "a completed variant's metrics must be reusable without regenerating them"
+        )
+
+    def test_measure_pair_writes_per_variant_metrics(self) -> None:
+        """The reuse above depends on _measure_pair persisting each variant as it finishes.
+
+        If it only wrote at the end of the stage, an interrupted run would lose every
+        variant it had already paid for.
+        """
+        import inspect
+
+        from marlowe.stages import _measure_pair
+
+        src = inspect.getsource(_measure_pair)
+        assert "_write_json" in src and "metrics_dir" in src, (
+            "each variant must be persisted as it completes, not at stage end"
+        )

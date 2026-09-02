@@ -319,14 +319,32 @@ def stage0_bitwidth(ctx: StageContext) -> dict[str, Any]:
         if not path.exists():
             q.quantize(base, path, recipe, imatrix=imat)
         bpw = q.bits_per_weight(path, n_params)
-        row = _measure_pair(
-            ctx,
-            f"27b-{recipe.name}",
-            path,
-            tokenizer_path=str(src),
-            reference=None,  # KL reference belongs to Stage 2; this stage is repetition-only
-            corpus=Path(ctx.cfg.score.calib_path),
-        )
+        label = f"27b-{recipe.name}"
+        # Reuse a variant already measured. The harness is ~50 minutes per variant -- the
+        # dominant cost of this stage -- and quantisation was already skipped when the GGUF
+        # existed, so re-running the generation was the one thing standing between "stop
+        # after three recipes and come back" and "start over".
+        #
+        # Safe only because the prompt set is fingerprinted into every report: a measurement
+        # taken against different prompts is not comparable, and comparable_with() checks
+        # that hash rather than trusting the file to be unchanged.
+        cached = ctx.metrics_dir / f"{label}.json"
+        if cached.exists():
+            with cached.open(encoding="utf-8") as f:
+                row = json.load(f)
+            logutil.event(
+                log, "variant already measured", recipe=recipe.name, path=str(cached)
+            )
+        else:
+            row = _measure_pair(
+                ctx,
+                label,
+                path,
+                tokenizer_path=str(src),
+                # KL reference belongs to Stage 2; this stage is repetition-only
+                reference=None,
+                corpus=Path(ctx.cfg.score.calib_path),
+            )
         row.update(
             {
                 "recipe": recipe.name,
