@@ -143,6 +143,42 @@ support, and an itemised disk budget. Run it first.
 
 ---
 
+## 1b. Stage 0 result so far: the parent's bpw curve is flat
+
+Five of eight variants measured (the three custom mixes are not run). `runs/` is gitignored,
+so these numbers live here or nowhere.
+
+```
+recipe         GB   bpw     rep8    rep32   loop  cap_hit
+iq3_xxs     11.19  3.27   0.0423   0.0029  0.000    0.995
+iq3_s       12.42  3.63   0.0434   0.0042  0.000    1.000
+iq3_m       12.58  3.67   0.0410   0.0037  0.000    1.000
+iq4_xs      15.08  4.41   0.0386   0.0029  0.000    1.000
+q4_k_s      15.59  4.55   0.0390   0.0033  0.000    0.995
+```
+
+**Read this cautiously.** Across 3.27-4.55 bpw, rep8 moves 0.0386-0.0434 and is **not
+monotonic** -- `iq3_s` is the worst despite being wider than `iq3_xxs`. Zero hard loops
+anywhere. The spread is plausibly inside the noise of 200 completions (95% CI at p=0.04 is
+about +/- 2.7pp, far wider than the 0.5pp of observed spread).
+
+Two reasons not to conclude "quantisation does not cause circling":
+
+- **The prompt set is synthetic** and contains no confirmed trigger (§2). This measures that
+  these nine prompts do not provoke circling at any width.
+- **`cap_hit_rate` is ~1.000.** Effectively every completion hit the 2048-token ceiling
+  rather than finishing. Circling develops over length, so anything emerging past 2048 tokens
+  is invisible at this `repetition.max_tokens`. That is a plausible explanation for both the
+  flat curve and the zero loop rate, and it is a harness limitation rather than a model
+  result.
+
+The curve can still do its declared job -- a baseline to subtract, so repetition in a healed
+child can be attributed to healing debt rather than quantisation -- it is simply far less
+informative than a curve with structure. If real triggers arrive,
+`marlowe repetition --gguf <quant> --prompts <file>` re-measures without re-quantising, but
+note Stage 0 deletes its candidates on *successful* completion: the five GGUFs are on disk
+only because the run was stopped early.
+
 ## 2. Decisions, and why
 
 These do not survive in code. They are the expensive part of this document.
