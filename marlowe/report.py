@@ -299,10 +299,24 @@ class MultiGateResult:
         return "\n".join(lines)
 
 
+#: The only phase the KL ship gate is defined on.
+#:
+#: Phase A heals the student toward the parent, so "KL to the parent, strictly below the
+#: iq3_xxs baseline" is exactly the objective. Phase B trains the merged checkpoint on traces
+#: from stronger teachers, and **KL to the parent goes up by design** -- the student reasons
+#: in ways the 27B does not, which is the point. Running this gate on a Phase B checkpoint
+#: would reject the better model for succeeding at its objective.
+#:
+#: Phase B is measured by benchmarks and anchor interpolation, plus repetition sanity that
+#: must not regress from the Phase A checkpoint. See docs/TRANSFER_PLAN.md.
+GATE_PHASE = "A"
+
+
 def ship_gate_multi(
     candidates: dict[str, CheckpointRecord],
     *,
     required_widths: Sequence[str],
+    phase: str = GATE_PHASE,
     iq3_xxs_baseline: CheckpointRecord,
     bf16_baseline: CheckpointRecord,
 ) -> MultiGateResult:
@@ -312,7 +326,20 @@ def ship_gate_multi(
     proves nothing on its own: under-healed weights carry larger activation outliers and
     degrade unevenly across quantisation schemes. A width that was never built counts as a
     failure, not as an absence.
+
+    **Phase A only.** See :data:`GATE_PHASE`.
     """
+    if phase != GATE_PHASE:
+        raise ValueError(
+            f"the KL ship gate is defined on Phase {GATE_PHASE} only, and was asked to "
+            f"evaluate Phase {phase!r}.\n\n"
+            f"Phase A heals toward the parent, so KL below the iq3_xxs baseline is the "
+            f"objective. Phase B trains on traces from stronger teachers and KL to the "
+            f"parent RISES BY DESIGN -- the student reasons in ways the 27B does not. This "
+            f"gate would read that as failure and reject the better model.\n\n"
+            f"Measure Phase B by benchmarks and anchor interpolation, plus repetition sanity "
+            f"that must not regress from the Phase A checkpoint. See docs/TRANSFER_PLAN.md."
+        )
     per_width: dict[str, GateResult] = {}
     missing: list[str] = []
     for width in required_widths:

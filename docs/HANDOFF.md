@@ -17,6 +17,22 @@ The deliverable is **a base that quantises well**, not a checkpoint that fits on
 
 ## 0. What to do first
 
+**Read `docs/TRANSFER_PLAN.md` first.** It is required, not background. This document
+describes *how the pipeline runs*; that one describes *what it is for*, and the two-phase
+structure it defines changes how several results here should be read:
+
+* **Phase A** is healing -- KL to the 27B, everything the stages below implement. The KL ship
+  gate applies here **and only here**.
+* **Phase B** is uplift past the parent: after Phase A ships, a fresh rank-32 LoRA on the
+  merged model, SFT on reasoning traces from stronger teachers. **KL to the 27B goes up by
+  design.** A rising KL after Phase B is the objective succeeding. `ship_gate_multi` raises if
+  handed a non-A phase rather than reporting a failure, because a gate that does not know
+  this rejects the better model for working.
+* The phases **cannot run together** -- "be the 27B" and "reason like Flash-Next" fight when
+  combined, and compose when sequenced.
+* **Both ship**, under different names and different claims. The 18B rung cuts from the
+  **Phase A** 22B, because the ladder wants a parent-faithful intermediate.
+
 Ordered. Do not infer priority from the rest of this document.
 
 1. **Run Stage 4. It is the next thing, and everything it needs is on disk.**

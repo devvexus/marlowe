@@ -106,3 +106,47 @@ def test_a_fully_matching_mix_passes_and_reports_counts(gguf) -> None:
     counts = assert_patterns_match(gguf, mixer_protected_types())
     assert all(v > 0 for v in counts.values())
     assert sum(counts.values()) == 401
+
+
+class TestTheGateIsPhaseAOnly:
+    """Phase B raises KL to the parent on purpose; the gate must not read that as failure.
+
+    Phase A heals toward the 27B, so "KL below the iq3_xxs baseline" is the objective. Phase B
+    trains the merged checkpoint on traces from stronger teachers, and the student then
+    reasons in ways the 27B does not -- KL rises, and that is the goal succeeding. A gate
+    applied there rejects the better model. See docs/TRANSFER_PLAN.md.
+    """
+
+    def _args(self):
+        from marlowe.report import CheckpointRecord
+
+        return {
+            "candidates": {},
+            "required_widths": (),
+            "iq3_xxs_baseline": CheckpointRecord("iq3_xxs"),
+            "bf16_baseline": CheckpointRecord("bf16"),
+        }
+
+    def test_phase_b_is_refused_rather_than_failed(self) -> None:
+        from marlowe.report import ship_gate_multi
+
+        with pytest.raises(ValueError, match=r"Phase A only|defined on Phase A"):
+            ship_gate_multi(**self._args(), phase="B")
+
+    def test_the_refusal_says_what_to_measure_instead(self) -> None:
+        from marlowe.report import ship_gate_multi
+
+        with pytest.raises(ValueError) as exc:
+            ship_gate_multi(**self._args(), phase="B")
+        text = str(exc.value)
+        assert "RISES BY DESIGN" in text
+        assert "benchmarks" in text and "TRANSFER_PLAN" in text
+
+    def test_phase_a_is_the_default_and_evaluates_rather_than_raising(self) -> None:
+        """It returns a verdict. `passed` is False here because no width was built, which is
+        the gate's own rule -- a width never built is a failure, not an absence."""
+        from marlowe.report import ship_gate_multi
+
+        result = ship_gate_multi(**self._args())
+        assert result.passed is False
+        assert result.per_width == {}
