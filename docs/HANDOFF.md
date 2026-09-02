@@ -145,11 +145,15 @@ These do not survive in code. They are the expensive part of this document.
 
 `heal.MEMORY_CANDIDATES`, best-quality-first:
 
+**Rewritten. It used to spend sequence length; it now spends adapter capacity** -- seq_len
+moved the measured peak by 0.04 GB across a 2x change, so the old ladder was tuning the one
+parameter that did not matter (§3a).
+
 ```
-fp16-head-2048         fp16 head, seq 2048, rank 32
-fp16-head-1536         fp16 head, seq 1536, rank 32
-fp16-head-1024         fp16 head, seq 1024, rank 32
-fp16-head-1024-rank16  fp16 head, seq 1024, rank 16
+rank32-chunk256   full adapter capacity, nothing given up
+rank16-chunk256   half the adapter, loss target intact
+rank8-chunk256    last rung before the loss target is touched
+rank16-seq768     shorter sequence: the operator's fallback, unmeasured
 --- approval required below ---
 nf4-head-adamw32       NF4 head, fp32 Adam
 nf4-head-adamw8        NF4 head, 8-bit Adam
@@ -520,49 +524,33 @@ should replace it with its own logged rate.**
 
 ---
 
-## 5. The measurement in flight
+## 5. Runtimes: measure them, the declared ones are guesses
 
-`marlowe fitcheck --model <sizing-22b> --config configs/marlowe-22b.yaml`
+Every stage carries `estimated_hours=` in its `@register`. **Both numbers that have now been
+tested were wrong, in opposite directions**, and nothing in the codebase had ever checked
+them. Treat the declaration as a placeholder until a stage has run once.
 
-**No usable peak numbers yet.** The first run's measurements were taken with the saturating
-metric (§3) and are void — every candidate reported 17.17 GB / 0.00 GB headroom. The
-16.64 GB figure quoted earlier came from `nvidia-smi` mid-run and is an upper bound on
-`fp16-head-2048`, not a probe result.
+| stage | declared | measured | how |
+|---|---|---|---|
+| imatrix (parent) | -- | **86 min** | 6 segments, 415 chunks, full 1.7M-token corpus |
+| `stage0-bitwidth` | 4.0 h | **~8.0 h** | 50 min harness + 11 min quantise, per variant, x8 |
+| `stage3-score` | 8.0 h | **~3.5 h** | 301 s per candidate (75 s per forward) x 42 |
 
-Throughput from that run **is** valid (it does not depend on the memory metric):
+**Stage 0.** The harness is the cost, not the quantisation: 200 completions x 2048 tokens per
+variant at ~137 tok/s aggregate across 4 llama-server slots. The 4.0 h declaration appears to
+describe one variant, not the sweep of eight. Note `eval/kl.py` assumes `GPU_DECODE_TOK_S =
+40`, which is single-stream; `repetition.parallel: 4` buys ~3.4x, so the code's own estimator
+says 23 h and is also wrong.
 
-```
-fp16 head, seq 2048, rank 32, AdamW8bit    44.3 tok/s
-fp16 head, seq 1024, rank 32, AdamW8bit    73.5 tok/s
-nf4  head, seq 2048, rank 32, AdamW fp32    9.8 tok/s   <- note the collapse
-```
+**Stage 3.** Work is exactly `(42 eligible candidates + 1 reference) x n_seqs` forwards over
+`score.seq_len` tokens -- 172 forwards at the shipped config. That count is solid, so the only
+unknown is seconds per forward, and everything follows by multiplication. The reference pass
+runs slower per forward (134 s) than the candidates (75 s) because of first-pass warm-up;
+project from candidate intervals, not from the reference.
 
-The NF4 + fp32-Adam candidate is ~4.5x slower than the fp16 equivalent. That is a further
-argument against the gated candidates beyond the quality one, and worth confirming.
-
-The search now caches the NF4 base per head precision instead of reloading 45 GB of
-safetensors per candidate — quantisation is deterministic and the frozen base does not
-change between candidates, only sequence length, rank and optimizer do.
-
-The estimator, calibrated against that measurement, predicts:
-
-```
-seq 1024   est peak 16.03 GB   est headroom 1.14 GB   fits
-seq 1536   est peak 16.30 GB   est headroom 0.87 GB   marginal — measurement decides
-seq 2048   est peak 16.58 GB   est headroom 0.59 GB   REJECT (measured 16.64)
-```
-
-Pre-committed calibration bands, agreed before the number arrived:
-
-- measured 1024 ≤ **16.15 GB** → calibration holds, probe 1536 next
-- measured 1024 > **16.3 GB** → context term still under-calibrated; skip 1536, probe
-  `fp16-head-1024-rank16`, and re-derive `_EST_CUDA_CONTEXT_GB` from two points
-- measured 1024 near **8 GB** → memory model wrong by 7 GB; stop and investigate before
-  Stage 5
-
-If the fp16 ladder exhausts entirely, **stop and ask** rather than taking an NF4 head.
-
----
+To measure a stage in flight rather than waiting for it: Stage 0 exposes decode progress via
+llama-server's `/slots` (`next_token[0].n_decoded`, which resets per completion -- count the
+resets), and Stage 3 logs `candidate scored` per candidate.
 
 ## 6. Do not re-litigate
 
