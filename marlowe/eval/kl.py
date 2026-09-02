@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -239,11 +240,38 @@ def parse_output(text: str) -> dict[str, float]:
 # the reference file: how big it is, and what it certifies about itself
 # ---------------------------------------------------------------------------
 
-#: What llama-perplexity itself prints when it starts a --kl-divergence-base pass.
-#: This is the only trustworthy source for the context and chunk count actually used:
-#: the Python argument records what was *asked for*, and the two can differ. A sidecar
-#: written from the argument would certify a value nothing verified.
-_RUN_SHAPE = re.compile(r"computing over\s+(\d+)\s+chunks,\s*n_ctx\s*=\s*(\d+)", re.I)
+#: What llama-perplexity prints when it starts a pass.
+#:
+#: Two phrasings, and the binary contains both: ``--kl-divergence-base`` runs the perplexity
+#: path and prints "calculating perplexity over N chunks", while ``--kl-divergence`` prints
+#: "computing over N chunks". Matching only the second one rejected a perfectly good 77 GB
+#: reference after a 19-minute run -- a guard that fails closed still has to be right about
+#: what it is guarding.
+_RUN_SHAPE = re.compile(
+    r"(?:calculating perplexity|computing)\s+over\s+(\d+)\s+chunks,\s*n_ctx\s*=\s*(\d+)",
+    re.I,
+)
+
+#: ``_logits_`` magic, then n_ctx, n_vocab and n_chunk as little-endian uint32.
+_KLD_MAGIC = b"_logits_"
+
+
+def read_kld_header(path: str | Path) -> dict[str, int]:
+    """Read what a .kld file says about itself.
+
+    Better provenance than parsing stdout: llama.cpp writes these three numbers *into the
+    artefact*, so they survive a lost log, and they describe the file rather than the run
+    that was supposed to produce it. stdout is still parsed, as a cross-check.
+    """
+    path = Path(path)
+    with path.open("rb") as f:
+        magic = f.read(8)
+        if magic != _KLD_MAGIC:
+            raise RuntimeError(
+                f"{path} does not start with {_KLD_MAGIC!r}; it is not a .kld reference."
+            )
+        n_ctx, n_vocab, n_chunk = struct.unpack("<III", f.read(12))
+    return {"ctx": n_ctx, "n_vocab": n_vocab, "chunks": n_chunk}
 
 
 def kld_tokens_per_chunk(ctx: int) -> int:
@@ -390,6 +418,101 @@ def _parse_run_shape(text: str) -> tuple[int | None, int | None]:
     return int(m.group(1)), int(m.group(2))
 
 
+def certify_reference(
+    out_file: str | Path,
+    reference_gguf: str | Path,
+    corpus: str | Path,
+    *,
+    expected_ctx: int,
+    corpus_tokens: int | None = None,
+    stdout_text: str = "",
+    command: list[str] | None = None,
+) -> dict[str, Any]:
+    """Validate a finished .kld against what was asked for, and write its sidecar.
+
+    Split out of :func:`build_reference` so a reference that completed can be certified
+    without re-running the pass. A 77 GB write costs ~19 minutes; a guard that can only be
+    satisfied by redoing that is a guard that will get switched off.
+
+    The .kld header is the authority here, not stdout. llama.cpp writes n_ctx, n_vocab and
+    n_chunk *into the artefact*, so they describe the file itself and survive a lost log.
+    stdout is a cross-check when available: if it disagrees with the header, something is
+    wrong that neither number alone would reveal.
+    """
+    out_file = Path(out_file)
+    header = read_kld_header(out_file)
+    n_vocab, actual_ctx, actual_chunks = header["n_vocab"], header["ctx"], header["chunks"]
+
+    printed_chunks, printed_ctx = _parse_run_shape(stdout_text)
+    if printed_ctx is not None and (printed_ctx, printed_chunks) != (actual_ctx, actual_chunks):
+        raise RuntimeError(
+            f"{out_file} header says {actual_chunks} chunks at n_ctx={actual_ctx}, but "
+            f"llama-perplexity printed {printed_chunks} at n_ctx={printed_ctx}. The file and "
+            f"the run that made it disagree; do not trust either."
+        )
+
+    if actual_ctx != expected_ctx:
+        raise RuntimeError(
+            f"asked for -c {expected_ctx} but {out_file} was built at n_ctx={actual_ctx}. "
+            f"llama.cpp adopts a base file's context silently, so every measurement against "
+            f"this file would run at {actual_ctx} without saying so. Delete it."
+        )
+
+    if corpus_tokens is None:
+        corpus_tokens = count_corpus_tokens(reference_gguf, corpus)
+    planned = kld_chunks_for_corpus(corpus_tokens, actual_ctx)
+    # The stop condition is "what it produced disagrees with what we computed", not a list of
+    # values known to be wrong. `planned` is the exact llama-tokenize count divided by ctx,
+    # so any disagreement means the tokenizer, the context or the chunking is not what the
+    # disk projection and the corpus manifest were built on -- whatever the number happens to
+    # be. Enumerating specific wrong values only catches the mistakes already imagined.
+    if actual_chunks != planned:
+        raise RuntimeError(
+            f"{out_file} covers {actual_chunks} chunks; {planned} were predicted from an "
+            f"exact llama-tokenize count of {corpus_tokens} tokens divided by -c "
+            f"{actual_ctx}. The reference does not cover the corpus the manifest describes; "
+            f"delete it and resolve the disagreement before rebuilding."
+        )
+
+    size = out_file.stat().st_size
+    predicted = kld_expected_bytes(n_vocab, actual_ctx, actual_chunks)
+    if abs(size - predicted) > max(1 << 20, predicted // 100):
+        raise RuntimeError(
+            f"{out_file} is {size / 1e9:.3f} GB but the file format predicts "
+            f"{predicted / 1e9:.3f} GB for {actual_chunks} chunks at n_ctx={actual_ctx}, "
+            f"n_vocab={n_vocab}. One of those is wrong, and the disk projection that sized "
+            f"this run rests on the same arithmetic."
+        )
+
+    sidecar = {
+        "reference": str(out_file),
+        "model": str(reference_gguf),
+        "corpus": str(corpus),
+        "corpus_sha256": sha256_file(corpus),
+        "corpus_tokens": corpus_tokens,
+        "ctx": actual_ctx,
+        "ctx_requested": expected_ctx,
+        "chunks": actual_chunks,
+        "chunks_predicted": planned,
+        "scored_tokens": actual_chunks * kld_tokens_per_chunk(actual_ctx),
+        "n_vocab": n_vocab,
+        "bytes": size,
+        "command": command or [],
+        "provenance": "ctx, n_vocab and chunks read from the .kld header; stdout cross-checked",
+        "ppl": parse_output(stdout_text).get("ppl"),
+    }
+    sidecar_path(out_file).write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+    logutil.event(
+        log,
+        "kl reference certified",
+        ctx=actual_ctx,
+        chunks=actual_chunks,
+        scored_tokens=sidecar["scored_tokens"],
+        gb=round(size / 1e9, 2),
+    )
+    return sidecar
+
+
 def build_reference(
     reference_gguf: str | Path,
     corpus: str | Path,
@@ -477,68 +600,9 @@ def build_reference(
             f"llama-perplexity --kl-divergence-base failed (rc={rc}).\n{text[-3000:]}"
         )
 
-    actual_chunks, actual_ctx = _parse_run_shape(text)
-    if actual_ctx is None or actual_chunks is None:
-        raise RuntimeError(
-            "llama-perplexity did not print its chunk count and context, so the reference "
-            "cannot certify what it is. Refusing to write a sidecar from the requested "
-            f"values.\n{text[-2000:]}"
-        )
-    if actual_ctx != ctx:
-        raise RuntimeError(
-            f"asked for -c {ctx} but llama-perplexity computed at n_ctx={actual_ctx}. The "
-            f"file at {out_file} is not the reference that was requested; delete it."
-        )
-    # The stop condition is "what it printed disagrees with what we computed", not a list of
-    # values known to be wrong. `planned` is the exact llama-tokenize count divided by ctx,
-    # so any disagreement means the tokenizer, the context, or the chunking is not what the
-    # disk projection and the corpus manifest were built on -- whatever the number happens
-    # to be. Enumerating specific wrong values only catches the mistakes already imagined.
-    if actual_chunks != planned:
-        raise RuntimeError(
-            f"llama-perplexity computed over {actual_chunks} chunks; {planned} were predicted "
-            f"from an exact llama-tokenize count of {corpus_tokens} tokens divided by "
-            f"-c {ctx}. The reference at {out_file} does not cover the corpus the manifest "
-            f"describes; delete it and resolve the disagreement before rebuilding."
-        )
-
-    size = out_file.stat().st_size
-    predicted = kld_expected_bytes(n_vocab, actual_ctx, actual_chunks)
-    if abs(size - predicted) > max(1 << 20, predicted // 100):
-        raise RuntimeError(
-            f"{out_file} is {size / 1e9:.3f} GB but the file format predicts "
-            f"{predicted / 1e9:.3f} GB for {actual_chunks} chunks at n_ctx={actual_ctx}, "
-            f"n_vocab={n_vocab}. One of those is wrong, and the disk projection that sized "
-            f"this run rests on the same arithmetic."
-        )
-
-    sidecar = {
-        "reference": str(out_file),
-        "model": str(reference_gguf),
-        "corpus": str(corpus),
-        "corpus_sha256": sha256_file(corpus),
-        "corpus_tokens": corpus_tokens,
-        "ctx": actual_ctx,
-        "ctx_requested": ctx,
-        "chunks": actual_chunks,
-        # Both sides of the stop condition, so a later reader can check the reference against
-        # the corpus without re-deriving either. predicted_chunks is corpus_tokens // ctx.
-        "chunks_predicted": planned,
-        "chunks_available": available,
-        "scored_tokens": actual_chunks * kld_tokens_per_chunk(actual_ctx),
-        "n_vocab": n_vocab,
-        "bytes": size,
-        "command": cmd,
-        "provenance": "ctx and chunks parsed from llama-perplexity output, not from arguments",
-    }
-    sidecar_path(out_file).write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
-    logutil.event(
-        log,
-        "kl reference written",
-        ctx=actual_ctx,
-        chunks=actual_chunks,
-        scored_tokens=sidecar["scored_tokens"],
-        gb=round(size / 1e9, 2),
+    certify_reference(
+        out_file, reference_gguf, corpus,
+        expected_ctx=ctx, corpus_tokens=corpus_tokens, stdout_text=text, command=cmd,
     )
 
     return KLResult(
