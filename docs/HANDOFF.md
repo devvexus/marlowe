@@ -212,6 +212,45 @@ against the mean's 3.1x, which says the damage is **diffuse rather than concentr
 tail** -- the case LoRA recovers well. Record this as the floor; it is the number healing has
 to close.
 
+### The collapse mode is a lock, not a decay
+
+Measured on the unhealed child at IQ3_M, thinking preset, prompt `core-equations-ai`
+("What are the core equations in AI"), 3072 max tokens:
+
+| | rep8 | rep32 | longest repeated run | stop |
+| --- | --- | --- | --- | --- |
+| control, `presence_penalty=0.0` | 0.3424 | 0.2935 | **435 tokens** | length |
+| `presence_penalty=1.5` | **0.0000** | **0.0000** | **0** | length |
+
+The output does **not** degrade into noise. It stays coherent, reaches the ambiguity in the
+prompt's own phrasing, begins quoting the term back to itself, and then locks:
+`"AI" in "AI" (AI) "AI" in "AI" (AI) ...` for 435 tokens, never terminating. The quoted token
+becomes its own highest-probability continuation and the distribution has nothing sharp
+enough to escape it.
+
+**This distinction sets what healing has to do.** A decay would mean the output distribution
+was destroyed and has to be rebuilt. A lock means the distribution is still broadly right --
+the model knows what it is doing until it reaches a fork it can no longer resolve -- and is
+merely too flat to break a self-reinforcing cycle. **Healing has to sharpen a blurry
+distribution, not reconstruct one.** That is the cheaper of the two problems, and it is
+consistent with the diffuse damage signature (median moved 6.7x against the mean's 3.1x).
+
+### The ship gate stays at `presence_penalty=0.0`
+
+`THINKING` is `presence_penalty=0.0, repeat_penalty=1.0`, and that is how the model actually
+runs. The gate is measured there. Do not quietly move the gate to a penalised preset because
+the numbers look better: that would be measuring a configuration the deployment does not use.
+
+`presence_penalty=1.5` is the **documented fallback**, and it **works but is not free**. A
+presence penalty suppresses tokens because they have already appeared, with no notion of
+whether repeating them is correct. In reasoning traces -- which restate the problem, re-derive
+intermediate results, and name the same variables repeatedly -- that is exactly the behaviour
+being penalised. It buys termination at the cost of reasoning quality, and the cost is not
+measured anywhere in this project.
+
+**The target is a model that does not need it, like bf16.** Treat `pp=1.5` as an operational
+escape hatch for a shipped build that still circles, not as a fix and not as a gate setting.
+
 ### The gate is tight at IQ3_M, and that is a width problem, not a healing problem
 
 The comparison is not symmetric, and it is easy to read it as though it were:
