@@ -159,10 +159,26 @@ support, and an itemised disk budget. Run it first.
 
 ---
 
-## 1b. Stage 0 result so far: the parent's bpw curve is flat
+## 1b. Stage 0 (token-level only): the parent's bpw curve is flat
 
-Five of eight variants measured (the three custom mixes are not run). `runs/` is gitignored,
-so these numbers live here or nowhere.
+Five of eight variants measured. `runs/` is gitignored, so these numbers live here or
+nowhere.
+
+**Token-level only.** These `rep8`/`rep32` columns are n-gram repetition at `pp=0.0`, and
+nothing more is planned: the semantic repetition harness is **dropped**. The objective is
+transfer from the parent, measured by KL, and Stage 0 is a control curve on the *parent* --
+it says where quantisation alone starts to hurt, which is context for reading Stage 7, not a
+gate.
+
+**The three custom mixes were never run, and as written they would not have been mixes.**
+Their patterns used HF safetensors names (`q_proj`, `linear_attn.*`) against GGUFs that call
+those `attn_q` / `attn_qkv` / `ssm_*`; llama-quantize ignores an unmatched pattern, so all
+three would have produced plain `iq3_xxs` or plain `iq3_s` under three different names.
+Fixed, with `assert_patterns_match` refusing a mix whose patterns match nothing -- see §3.
+
+**Do not resume Stage 0 until `repetition.max_tokens` is raised above the observed circling
+length.** Every completion so far hit the 2048 cap (`cap_hit` ~1.0), so the remaining
+variants would add three more points measured at a ceiling rather than at a collapse.
 
 ```
 recipe         GB   bpw     rep8    rep32   loop  cap_hit
@@ -529,8 +545,24 @@ activation outliers and degrade unevenly across quantisation schemes, so passing
 width proves nothing about the others. A width that was **never built counts as a failure**,
 not an absence — otherwise a missing measurement reads as a pass.
 
-Both gate criteria, per width: KL to the parent strictly below the user's IQ3_XXS build, and
-repetition at or below the bf16 baseline.
+**The gate is KL-first.** The objective is maximum knowledge transfer from the 27B into the
+22B, and KL to the reference is the direct measure of it. Repetition is a sanity check, not a
+second fidelity criterion.
+
+* **Primary — KL to `reference.kld` at each width, strictly below the iq3_xxs parent
+  baseline** (0.144219). This is the gate. It is a Phase A criterion only; see
+  `docs/TRANSFER_PLAN.md` and `report.GATE_PHASE`.
+* **Sanity — token-level `rep8` / `rep32` at 2K tokens, `presence_penalty=0.0`.** A
+  degenerate model fails; a healthy one passes. It is a floor, not a gradient: do not read a
+  small rep improvement as better transfer, and do not trade KL for it.
+
+Two things this deliberately is **not**:
+
+* Not a fix for the 27B's own circling. The parent circles; that is not this project's
+  problem to solve, and a child that circles exactly as much as its parent has lost nothing.
+* Not a semantic repetition measure. **The semantic harness is dropped from the plan.**
+  Token-level n-gram repetition at `pp=0.0` is the whole of it. Building a semantic
+  circling detector would be measuring a property the objective does not target.
 
 ### KL reference is Q8_0, not bf16
 
