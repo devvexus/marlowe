@@ -489,6 +489,18 @@ def build_reference(
             f"asked for -c {ctx} but llama-perplexity computed at n_ctx={actual_ctx}. The "
             f"file at {out_file} is not the reference that was requested; delete it."
         )
+    # The stop condition is "what it printed disagrees with what we computed", not a list of
+    # values known to be wrong. `planned` is the exact llama-tokenize count divided by ctx,
+    # so any disagreement means the tokenizer, the context, or the chunking is not what the
+    # disk projection and the corpus manifest were built on -- whatever the number happens
+    # to be. Enumerating specific wrong values only catches the mistakes already imagined.
+    if actual_chunks != planned:
+        raise RuntimeError(
+            f"llama-perplexity computed over {actual_chunks} chunks; {planned} were predicted "
+            f"from an exact llama-tokenize count of {corpus_tokens} tokens divided by "
+            f"-c {ctx}. The reference at {out_file} does not cover the corpus the manifest "
+            f"describes; delete it and resolve the disagreement before rebuilding."
+        )
 
     size = out_file.stat().st_size
     predicted = kld_expected_bytes(n_vocab, actual_ctx, actual_chunks)
@@ -507,7 +519,12 @@ def build_reference(
         "corpus_sha256": sha256_file(corpus),
         "corpus_tokens": corpus_tokens,
         "ctx": actual_ctx,
+        "ctx_requested": ctx,
         "chunks": actual_chunks,
+        # Both sides of the stop condition, so a later reader can check the reference against
+        # the corpus without re-deriving either. predicted_chunks is corpus_tokens // ctx.
+        "chunks_predicted": planned,
+        "chunks_available": available,
         "scored_tokens": actual_chunks * kld_tokens_per_chunk(actual_ctx),
         "n_vocab": n_vocab,
         "bytes": size,
