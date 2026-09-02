@@ -806,6 +806,62 @@ Steam) render on the discrete GPU, costing 1.38-1.52 GB and *drifting* by ~0.15 
 runs. That is larger than the remaining deficit, and it is invisible to torch — one more
 reason the driver's Shared Usage counter is the gate.
 
+### The fit rule changed: torch headroom said 0.11 GB on a config paging 7.51 GB
+
+The old rule was `FIT_MARGIN_GB = 1.0` — a configuration fit if torch reported at least a
+gigabyte of device headroom. Two runs of the same four rungs, one with the paging counter
+broken and one with it working, show why that had to go:
+
+```
+                  BLIND (torch headroom)        WITH THE COUNTER
+rank32-seq1024    0.11 GB, 201 tok/s            PAGES  7.51 GB, 216 tok/s
+rank32-seq768     0.43 GB, 167 tok/s            FITS   0.09 GB, 183 tok/s
+rank16-seq1024    0.12 GB, 198 tok/s            PAGES  0.66 GB, 210 tok/s
+rank16-seq768     0.64 GB, 169 tok/s            FITS   0.22 GB, 108 tok/s
+```
+
+`rank32-seq1024` was the **fastest** rung measured and it was spilling **7.51 GB** to host.
+Torch called that 0.11 GB of headroom, which under the old rule read as "tight" rather than
+"disqualified". Headroom and residency are not the same measurement and here they disagreed
+by three orders of magnitude.
+
+**The rule now:**
+
+* **Primary, and the only gate: driver Shared Usage over the idle floor ≤ 250 MB.**
+* **Secondary, advisory, logged and never gated: torch device headroom ≥ 0.3 GB.**
+* **Soak: 500 steps on the selected rung — paged bytes at the floor throughout, and trapped
+  fragmentation growth < 50 MB per 1000 steps after warm-up.**
+* **A restart supervisor built and exercised before Stage 6 begins.**
+
+### An unvalidated counter is no verdict, not a pass
+
+`ProbeResult.fits()` now raises `SamplerNotValidated` when the counter returned nothing, or
+when nothing has proved *in this session* that it can see a spill. The old behaviour — fall
+back to torch headroom when the counter is unavailable — is exactly the measure that missed
+7.51 GB, so the fallback was worse than the failure.
+
+This matters because the counter has been believed working, twice, while returning nothing.
+`typeperf` buffers into its `-o` file: measured, the file is **0 bytes while typeperf is
+still running** and 0 bytes after `terminate()`. Reading its stdout on a drainer thread is
+what fixed it.
+
+`validate_sampler()` supplies the proof in seconds and without a model: it over-commits VRAM
+by 2 GB, which on WDDM the driver backs with host memory rather than refusing, and confirms
+the counter reports the spill. Measured 1.34–1.42 GB detected. The heavyweight
+known-positive remains `MARLOWE_CPU_GATHER_EMBED=0`, which restages the 2.54 GB embedding
+table every forward: 11.585 GB across 103 samples.
+
+### The allocator cap is opt-out now, because opt-in meant off
+
+`cap_process_memory` returned `None` unless `MARLOWE_CUDA_MEMORY_FRACTION` was set, and it
+was never set. **Every probe in this project ran with the cap inactive.** The safety net
+existed, was documented, was tested, and was not deployed — the same defect class as a guard
+that fails open, applied to the thing meant to catch the guard failing.
+
+Cap and counter are belt and braces and they see different things. The cap makes torch
+over-commitment *raise* instead of silently paging. The counter catches host-backed memory
+the driver hands out *below* torch's own ceiling, which the cap cannot see at all.
+
 ## 3b. Schedule — the brief's estimate was 3-4x optimistic
 
 The brief assumed ~200 tok/s, which came from an Unsloth-based estimate. This stack is plain
