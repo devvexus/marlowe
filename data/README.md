@@ -25,12 +25,23 @@ generalisation claim. **Do not use it to evaluate a healed model.** For that,
 ## `kl_reference.jsonl` -- the KL yardstick, held out from healing
 
 Same composition as `heal_corpus.jsonl` (~65% proof-pile-2, ~35% fineweb-edu) so KL is
-measured on the deployment distribution, but drawn from shards the healing corpus never read
-via an explicit `HELDOUT_SHARD_OFFSET`. ~300K tokens.
+measured on the deployment distribution, but drawn from shards the healing corpus never read.
+312,147 tokens = 38 chunks at `-c 8192`.
+
+Two holdout mechanisms, because the sources resolve their shards differently: proof-pile-2
+sources get explicit URLs built from `HELDOUT_SHARD_OFFSET`, while fineweb-edu lists its
+shards from the repo at stream time and is offset inside `_stream`. The manifest records
+`shards_actually_read`, not the declared table -- they were once different.
 
 `assert_disjoint` **fails the build** if any document hash collides with the healing corpus.
 A reference that is 99% held out is not held out: every healing checkpoint is scored against
 this file, so a shared document means the ship gate is partly measuring memorisation.
+
+This is not theoretical. On its first real run the check failed with **112 collisions**:
+`_offset` was set on the fineweb-edu spec and `_stream` never read it, so a third of the
+"held-out" reference was the exact shards healing trains on. Nothing else would have caught
+it -- the file looked correct and the manifest claimed a holdout that had not been applied.
+Do not weaken this check into a warning.
 
 **Once a reference `.kld` has been built from it, this file must never change.** Every child
 measurement is relative to those exact bytes. Its sha256, token count, shard offsets and the
