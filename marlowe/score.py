@@ -504,6 +504,8 @@ def load_4bit(
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+    from marlowe.heal import embedding_module_name
+
     preflight.check_bitsandbytes()
 
     qcfg = BitsAndBytesConfig(
@@ -512,10 +514,32 @@ def load_4bit(
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
         llm_int8_skip_modules=[] if quantize_lm_head else ["lm_head"],
+        # Required whenever accelerate spills anything to CPU, which device_map="auto" does
+        # as soon as the model does not fit outright: the 27B parent at NF4 is ~15.2 GB
+        # against ~15.8 GB usable, so a single spilled module is enough. Without this,
+        # bitsandbytes refuses the load entirely -- "Some modules are dispatched on the CPU
+        # or the disk" -- 26 seconds in, which is how Stage 3 died on its first attempt.
+        #
+        # The flag name says int8; it gates 4-bit offload too. heal.load_student has carried
+        # this since it was written, and this loader did not: the same wrong assumption in
+        # two places, fixed in one.
+        llm_int8_enable_fp32_cpu_offload=True,
     )
     kwargs: dict[str, Any] = {
         "quantization_config": qcfg,
-        "device_map": "auto",
+        # Explicit placement, not device_map="auto".
+        #
+        # heal.load_student learned this and this loader had not: letting accelerate choose
+        # what to spill picks Linear4bit modules, and attaching its execution hooks to an
+        # offloaded 4-bit module reads quant_state.offset.item() on a meta tensor. On this
+        # stack that is not an exception -- it is a segmentation fault during load, with the
+        # log ending mid-sentence and no traceback to read.
+        #
+        # Naming the one module to offload avoids it entirely. embed_tokens is not a Linear,
+        # so NF4 was never going to touch it, and at 248320 x 5120 it is ~2.5 GB -- which is
+        # also what brings the 27B parent from ~15.2 GB (against ~15.8 GB usable) down to a
+        # comfortable fit rather than a knife-edge one.
+        "device_map": {"": 0, embedding_module_name(model_path): "cpu"},
         "trust_remote_code": True,
         "dtype": torch.bfloat16,
     }
