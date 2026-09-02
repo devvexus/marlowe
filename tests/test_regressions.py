@@ -849,38 +849,52 @@ class TestMemoryPlanSearch:
         assert ranks == sorted(ranks, reverse=True), (
             "the fp16 ladder must give up adapter capacity gradually"
         )
-        # Spelled out, because the ladder's shape is a decision and not an implementation
-        # detail: capacity is spent once, then the last rung spends sequence instead of
-        # spending capacity a second time.
-        assert ranks == [32, 16, 16]
+        # Spelled out, because the ladder's shape is a decision, not an implementation
+        # detail: rank 32 is tried at BOTH lengths before rank drops. Measured -- 32->16
+        # at seq 1024 buys 0.01 GB while 1024->768 buys 0.32 GB, so rank is nearly free
+        # and sequence is the whole lever. Spending rank first would trade the model to
+        # save the calendar.
+        assert ranks == [32, 32, 16, 16]
 
-    def test_sequence_length_is_the_last_resort_and_never_increases(self) -> None:
-        """seq_len is mostly a throughput choice, and only the final rung spends it.
+    def test_sequence_is_spent_within_a_rank_never_ahead_of_one(self) -> None:
+        """Rank first, then length -- and no rung may lengthen either.
 
-        It was measured as no fit lever at all -- 25.31 GB at 512 against 25.33 GB at 1024 --
-        but that was with an fp32 residual stream, where the weights so dominated that
-        activations were invisible. With the stream in bf16 the backward transient that sets
-        the peak does scale with sequence, so one short rung sits at the bottom of the
-        unquantised ladder. It must never be reached before the rank rungs, and no candidate
-        may ask for a *longer* sequence than the config.
+        This replaces test_sequence_length_is_the_last_resort_and_never_increases, which
+        encoded the opposite policy: that seq_len was the final rung, reached only after the
+        rank rungs. Measurement inverted it. With the embedding transient gone, 32 -> 16 at
+        seq 1024 frees 0.01 GB and 1024 -> 768 frees 0.32 GB, so rank costs almost no memory
+        and buys permanent model capacity, while sequence costs schedule and nothing the
+        long-context anneal cannot recover.
+
+        The ladder is therefore grouped by rank, descending, and within each group by
+        sequence, descending.
         """
         from marlowe.config import HealConfig
         from marlowe.heal import MEMORY_CANDIDATES
 
-        base = HealConfig(seq_len=1024)
-        fp16 = [c for c in MEMORY_CANDIDATES if not c.quantize_lm_head]
-        lengths = [c.apply(base).seq_len for c in fp16]
-        assert all(v <= base.seq_len for v in lengths), "no rung may lengthen the sequence"
-        assert lengths == sorted(lengths, reverse=True), "sequence is spent monotonically"
-        shortened = [c.name for c in fp16 if c.apply(base).seq_len < base.seq_len]
-        assert shortened == [fp16[-1].name], "only the final unquantised rung shortens it"
+        base = HealConfig(seq_len=1024, lora_rank=32)
+        fp16 = [c.apply(base) for c in MEMORY_CANDIDATES if not c.quantize_lm_head]
+        assert all(t.seq_len <= base.seq_len for t in fp16), "no rung may lengthen the sequence"
+        assert all(t.lora_rank <= base.lora_rank for t in fp16), "no rung may raise the rank"
+
+        ranks = [t.lora_rank for t in fp16]
+        assert ranks == sorted(ranks, reverse=True), "rank is spent monotonically"
+
+        by_rank: dict[int, list[int]] = {}
+        for t in fp16:
+            by_rank.setdefault(t.lora_rank, []).append(t.seq_len)
+        for rank, lengths in by_rank.items():
+            assert lengths == sorted(lengths, reverse=True), (
+                f"within rank {rank}, sequence must be spent longest-first, got {lengths}"
+            )
+        assert len(by_rank[32]) > 1, "rank 32 must be tried at more than one length first"
 
     def test_shortening_the_sequence_is_preferred_over_quantising_the_head(self) -> None:
         """Halving context is a real cost; corrupting the loss target is a worse one."""
         from marlowe.heal import MEMORY_CANDIDATES
 
         names = [c.name for c in MEMORY_CANDIDATES]
-        assert names.index("rank16-chunk256") < names.index("nf4-head-adamw32")
+        assert names.index("rank16-seq1024") < names.index("nf4-head-adamw32")
 
     def test_apply_does_not_mutate_the_original(self) -> None:
         from marlowe.config import HealConfig
@@ -935,7 +949,7 @@ class TestMemoryPlanSearch:
         )
         _stub_model_plumbing(monkeypatch)
         res = heal.search_memory_plan("x", HealConfig(), margin_gb=0.8)
-        assert res.chosen is not None and res.chosen.name == "rank32-chunk256"
+        assert res.chosen is not None and res.chosen.name == "rank32-seq1024"
         assert res.config is not None and res.config.quantize_lm_head is False
 
     def test_oom_is_treated_as_does_not_fit(self, monkeypatch) -> None:
@@ -1381,7 +1395,7 @@ class TestSequenceLengthLadder:
             "x", HealConfig(), probe_all=True, allow_quantized_head=True
         )
         assert len(seen) == len(heal.MEMORY_CANDIDATES)
-        assert res.chosen is not None and res.chosen.name == "rank32-chunk256"
+        assert res.chosen is not None and res.chosen.name == "rank32-seq1024"
         assert len(res.attempts) == len(heal.MEMORY_CANDIDATES)
 
         # Without approval, probe_all still walks the fp16 ladder but never measures a
@@ -1411,13 +1425,13 @@ class TestQuantizedHeadNeedsApproval:
 
         names = [c.name for c in MEMORY_CANDIDATES]
         first_nf4 = min(i for i, c in enumerate(MEMORY_CANDIDATES) if c.quantize_lm_head)
-        assert names.index("rank16-chunk256") < first_nf4
+        assert names.index("rank16-seq1024") < first_nf4
 
     def test_rank16_halves_the_adapter_not_the_target(self) -> None:
         from marlowe.config import HealConfig
         from marlowe.heal import MEMORY_CANDIDATES
 
-        cand = next(c for c in MEMORY_CANDIDATES if c.name == "rank16-chunk256")
+        cand = next(c for c in MEMORY_CANDIDATES if c.name == "rank16-seq1024")
         cfg = cand.apply(HealConfig(lora_rank=32))
         assert cfg.lora_rank == 16
         assert cfg.quantize_lm_head is False, "the loss target must stay intact"
@@ -1601,7 +1615,7 @@ class TestMemoryPlanPersistence:
             save_memory_plan,
         )
 
-        cand = next(c for c in MEMORY_CANDIDATES if c.name == "rank16-chunk256")
+        cand = next(c for c in MEMORY_CANDIDATES if c.name == "rank16-seq1024")
         base = HealConfig(lora_rank=32, seq_len=2048)
         chosen = cand.apply(base)
         search = SearchResult(
@@ -2050,31 +2064,109 @@ class TestStage0Resume:
 class TestPagingSamplerActuallySamples:
     """The fit gate must not fail open when its instrument is broken.
 
-    typeperf refuses -- silently, rc=0, empty stderr -- to write to an output path that
-    already exists. PagingSampler used tempfile.mkstemp, which CREATES the file, so it
-    produced an empty CSV on every run, reported available=False, and ProbeResult.fits()
-    quietly fell back to torch accounting. The instrument built to stop the fit decision
-    failing open was itself failing open, and every paging number reported during its first
-    day came from a separate shell script rather than from this code.
+    Two diagnoses, and the first was wrong. It was believed that typeperf refuses to write to
+    an output path that already exists, and that ``tempfile.mkstemp`` creating the file was
+    the bug. Fixing that changed nothing: measured, the ``-o`` file is **0 bytes while
+    typeperf is still running** and 0 bytes after ``terminate()``. typeperf buffers into it,
+    and terminate kills the process before any flush.
+
+    So the sampler had never returned a single sample. Every probe reported
+    ``available=False`` and ``ProbeResult.fits()`` fell back to torch accounting -- the
+    instrument built to stop the fit decision failing open was itself failing open, and the
+    fallback is the measure already known to be insufficient, since a configuration 6.8 GB
+    over the card ran at 74.5 tok/s and looked fine.
+
+    It now reads typeperf's stdout on a drainer thread. stdout is line-buffered, so samples
+    collected before termination survive it.
     """
 
-    def test_start_does_not_pre_create_the_output_file(self) -> None:
+    def test_it_collects_samples_from_a_live_run(self) -> None:
+        """The claim that matters, and the one that was false for the module's whole life."""
         import sys
+        import time
 
         if sys.platform != "win32":
             pytest.skip("typeperf is Windows-only")
         from marlowe.gpumem import PagingSampler
 
-        s = PagingSampler()
+        s = PagingSampler(interval_s=1)
         s.start()
-        try:
-            # The path must not exist before typeperf opens it, or typeperf writes nothing.
-            assert s._path is not None
-            # After start, typeperf owns it; what matters is that WE did not create it empty
-            # ahead of the process. The directory is ours; the file is typeperf's.
-            assert s._path.parent.exists(), "sampler needs a writable directory"
-        finally:
-            s.stop()
+        time.sleep(4)
+        report = s.stop()
+        assert report.available, "the sampler returned no usable rows from a live 4s run"
+        assert report.samples > 0, f"available but {report.samples} samples"
+
+    def test_it_asks_typeperf_for_stdout_not_a_file(self, monkeypatch) -> None:
+        """A regression guard on the mechanism, not just the outcome.
+
+        Reverting to ``-o`` would restore a sampler that reports available=False forever,
+        which reads as "no GPU counter on this machine" rather than as a defect. Asserted on
+        the argv actually passed to Popen, because the string "-o" appears in the docstring
+        explaining why it is not used.
+        """
+        import subprocess as sp
+        import sys
+
+        from marlowe import gpumem
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        seen: dict[str, object] = {}
+
+        class _FakeProc:
+            stdout = iter(())
+
+            def terminate(self) -> None: ...
+            def wait(self, timeout: int | None = None) -> int:
+                return 0
+
+        def fake_popen(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["kwargs"] = kwargs
+            return _FakeProc()
+
+        monkeypatch.setattr(sp, "Popen", fake_popen)
+        s = gpumem.PagingSampler(interval_s=1)
+        s.start()
+        s.stop()
+
+        cmd = seen["cmd"]
+        assert "-o" not in cmd, f"typeperf buffers into -o; read stdout instead: {cmd}"
+        assert seen["kwargs"].get("stdout") is sp.PIPE
+        assert any("Shared Usage" in str(a) for a in cmd)
+        assert any("Dedicated Usage" in str(a) for a in cmd)
+
+    def test_parsing_pairs_counters_by_adapter_and_uses_the_busiest(self) -> None:
+        """Two adapters are present on this box; the one holding the model is the subject."""
+        from marlowe.gpumem import _parse_rows
+
+        def col(luid: str, counter: str) -> str:
+            return '"\\\\HOST\\GPU Adapter Memory(' + luid + ')\\' + counter + '"'
+
+        header = ",".join([
+            '"(PDH-CSV 4.0)"',
+            col("luid_A", "Shared Usage"), col("luid_A", "Dedicated Usage"),
+            col("luid_B", "Shared Usage"), col("luid_B", "Dedicated Usage"),
+        ])
+        rows = [
+            header,
+            '"t1","1000","500000000","90000000","1000"',
+            '"t2","3000000000","900000000","91000000","1200"',
+        ]
+        r = _parse_rows(rows)
+        assert r.available
+        assert r.samples == 2
+        # luid_A holds the model (dedicated 0.9 GB vs 1200 bytes), so it is the subject.
+        assert r.dedicated_peak_bytes == 900000000
+        assert r.paged_bytes == 3000000000 - 1000
+        assert r.paging is True
+
+    def test_parsing_a_header_only_capture_is_unavailable_not_clean(self) -> None:
+        from marlowe.gpumem import _parse_rows
+
+        header = '"(PDH-CSV 4.0)","\\\\HOST\\GPU Adapter Memory(A)\\Shared Usage"'
+        r = _parse_rows([header])
+        assert r.available is False
+        assert r.paging is False
 
     def test_an_unavailable_report_never_claims_no_paging(self) -> None:
         """available=False must not read as 'the driver saw nothing'."""
@@ -2088,26 +2180,113 @@ class TestPagingSamplerActuallySamples:
         )
 
 
-class TestAllocatorCapLeavesRoomForTheEmbeddingTransient:
-    """The derived cap OOM'd a configuration that runs fine one notch looser.
+class TestTheEmbeddingTransientIsBoundedBySequenceNotVocabulary:
+    """The cap was being asked to absorb a transient that should never have existed.
 
-    ``embed_tokens`` is offloaded to CPU, but accelerate's hook stages it back onto the
-    device for every forward: a 2.37 GiB transient on top of the steady state. The old
-    derivation, (total - cuda_context_bytes()) / total, reserved WDDM's 1.38 GB
-    per-process figure for a context nvidia-smi measured at 0.25 GB, and the missing
-    gigabyte was precisely what that transient needed. It capped at 14.71 GiB and raised
-    inside the first ``embed_tokens`` call with 1.99 GiB free; 15.35 GiB ran clean.
+    ``embed_tokens`` is offloaded to CPU, and accelerate's ``AlignDevicesHook`` stages the
+    **entire table** onto the device before every forward -- 248,320 x 5,120 x 2 = 2.54 GB.
+    So the offload saved nothing: the memory was paid anyway, as a per-forward transient on
+    top of a full card, plus the fragmentation of allocating and releasing it every step.
+    Measured at seq 768: 2.49 GB free against a 2.54 GB need. Fifty megabytes, and every rung
+    of the memory ladder died on that line before anything the ladder varies was allocated.
+
+    These tests previously specified a *larger cap* so the 2.54 GB transient would fit. That
+    was treating the symptom: the right size for that transient is not "accommodated", it is
+    "absent". :class:`~marlowe.heal.CpuGatherEmbedding` gathers on the host and moves only
+    ``[batch, seq, hidden]``, so the invariant is now about sequence length and the
+    vocabulary does not appear in it at all.
+
+    Validated end to end, not just asserted: with ``MARLOWE_CPU_GATHER_EMBED=0`` restoring the
+    hook, the driver counter reports 11.585 GB spilled to host.
     """
 
-    #: The measured post-load state of the 22B probe, in bytes.
+    HIDDEN = 5120
+    VOCAB = 248320
+    BYTES = 2
+
+    def transient(self, seq: int) -> int:
+        return seq * self.HIDDEN * self.BYTES
+
+    def test_the_transient_no_longer_scales_with_the_vocabulary(self) -> None:
+        from marlowe.heal import EMBED_TABLE_BYTES
+
+        assert EMBED_TABLE_BYTES == self.VOCAB * self.HIDDEN * self.BYTES
+        # The whole point: what crosses the bus is bounded by seq, not by vocab.
+        assert self.transient(768) < EMBED_TABLE_BYTES / 100
+
+    def test_the_gather_is_three_hundred_times_smaller_at_the_selected_length(self) -> None:
+        from marlowe.heal import EMBED_TABLE_BYTES
+
+        ratio = EMBED_TABLE_BYTES / self.transient(768)
+        assert ratio > 300, f"expected ~320x, got {ratio:.0f}x"
+
+    def test_the_transient_fits_the_headroom_that_the_hook_path_missed(self) -> None:
+        """2.49 GB free was 50 MB short of the hook's need. It is not short of the gather's."""
+        measured_free_bytes = int(2.49 * 1e9)
+        assert self.transient(1024) < measured_free_bytes
+        assert self.transient(768) < measured_free_bytes
+
+    def test_the_weight_is_not_a_buffer_so_module_to_cannot_move_it(self) -> None:
+        """register_buffer reinstates the bug silently: buffers are walked by Module.to().
+
+        Measured when it was one -- allocated went 12.78 -> 15.33 GB, which is the table,
+        exactly. A bare Tensor lands in __dict__ where no device walk reaches it.
+        """
+        import torch
+
+        from marlowe.heal import CpuGatherEmbedding
+
+        w = torch.zeros(8, 4)
+        m = CpuGatherEmbedding(w, torch.device("cpu"), None)
+        assert "weight" not in m._buffers
+        assert "weight" not in m._parameters
+        assert "weight" in m.__dict__
+
+    def test_the_gathered_output_requires_grad(self) -> None:
+        """This path bypasses accelerate's hook, so it bypasses enable_input_require_grads.
+
+        Gradient checkpointing needs an input that requires grad; without it the LoRA layers
+        below receive nothing and the run trains no adapter while looking healthy.
+        """
+        import torch
+
+        from marlowe.heal import CpuGatherEmbedding
+
+        m = CpuGatherEmbedding(torch.randn(16, 4), torch.device("cpu"), None)
+        out = m(torch.tensor([[1, 2, 3]]))
+        assert out.shape == (1, 3, 4)
+        assert out.requires_grad
+
+    def test_the_gather_returns_the_right_rows(self) -> None:
+        """Correctness, not just size: a fast lookup of the wrong rows is worse than slow."""
+        import torch
+
+        from marlowe.heal import CpuGatherEmbedding
+
+        w = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        m = CpuGatherEmbedding(w, torch.device("cpu"), None)
+        ids = torch.tensor([[4, 0, 2]])
+        assert torch.equal(m(ids).detach(), w[torch.tensor([4, 0, 2])].unsqueeze(0))
+
+
+class TestTheAllocatorCapRespectsItsEnvOverride:
+    """What survives of the cap tests.
+
+    The three that specified a *larger* cap -- so a 2.54 GB per-forward embedding
+    transient would fit -- are gone. They were right about the diagnosis and wrong about
+    the remedy: the right size for that transient is not "accommodated" but "absent", and
+    CpuGatherEmbedding makes it 7.9 MB. Their invariant now lives in
+    TestTheEmbeddingTransientIsBoundedBySequenceNotVocabulary, green rather than xfail.
+    (The cap's own derivation is still (total - context_bytes) / total; with the transient
+    gone that is a throughput question, not a fit one.)
+ The cap's derivation is a separate question from
+    the embedding transient, and with the transient gone it is no longer urgent -- but the
+    override is load-bearing for anyone debugging a fit, so it stays covered.
+    """
+
     TOTAL = int(15.99 * 1024**3)
     RESERVED = int(12.54 * 1024**3)
-    # Measured, not assumed: the 0.92 OOM reported "1.99 GiB is free". An earlier draft of
-    # this test used 3.22 GiB -- a number invented to make reserved+free look sufficient --
-    # and it passed while describing a machine that does not exist.
     FREE = int(1.99 * 1024**3)
-    #: What the first forward has to place on top of reserved.
-    EMBED_TRANSIENT = 248320 * 5120 * 2
 
     def _cap(self, monkeypatch, context_bytes):
         import torch
@@ -2130,67 +2309,8 @@ class TestAllocatorCapLeavesRoomForTheEmbeddingTransient:
         assert applied["f"] == fraction
         return fraction * self.TOTAL
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Spec ahead of implementation, not an environment limit: this runs anywhere, "
-            "with torch.cuda fully monkeypatched and no GPU touched. cap_process_memory "
-            "still derives its fraction as (total - context_bytes) / total; this states "
-            "what it should do instead -- size the cap from what the device reports free, "
-            "so a context measurement 1 GB too large stops costing 1 GB of usable VRAM. "
-            "Not fixed alongside Stage 4: three of this project's four memory-metric "
-            "defects were introduced while fixing the previous one, and Stage 6 (the only "
-            "consumer) is blocked on the fit regardless. strict=True, so implementing the "
-            "fix fails here and forces the marker off."
-        ),
-    )
-    def test_the_ceiling_admits_the_embedding_transient(self, monkeypatch) -> None:
-        ceiling = self._cap(monkeypatch, context_bytes=int(1.38e9))
-        assert ceiling >= self.RESERVED + self.EMBED_TRANSIENT, (
-            f"capped at {ceiling / 1024**3:.2f} GiB, which cannot fit the "
-            f"{self.EMBED_TRANSIENT / 1024**3:.2f} GiB embedding on top of "
-            f"{self.RESERVED / 1024**3:.2f} GiB reserved -- this is the 0.92 OOM"
-        )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Spec ahead of implementation, not an environment limit: this runs anywhere, "
-            "with torch.cuda fully monkeypatched and no GPU touched. cap_process_memory "
-            "still derives its fraction as (total - context_bytes) / total; this states "
-            "what it should do instead -- size the cap from what the device reports free, "
-            "so a context measurement 1 GB too large stops costing 1 GB of usable VRAM. "
-            "Not fixed alongside Stage 4: three of this project's four memory-metric "
-            "defects were introduced while fixing the previous one, and Stage 6 (the only "
-            "consumer) is blocked on the fit regardless. strict=True, so implementing the "
-            "fix fails here and forces the marker off."
-        ),
-    )
-    def test_the_ceiling_stays_on_the_card(self, monkeypatch) -> None:
-        """Above (reserved + free) the driver pages instead of raising, which is the
-        failure mode the cap exists to prevent."""
-        ceiling = self._cap(monkeypatch, context_bytes=int(1.38e9))
-        assert ceiling <= self.RESERVED + self.FREE
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Spec ahead of implementation, not an environment limit: this runs anywhere, "
-            "with torch.cuda fully monkeypatched and no GPU touched. cap_process_memory "
-            "still derives its fraction as (total - context_bytes) / total; this states "
-            "what it should do instead -- size the cap from what the device reports free, "
-            "so a context measurement 1 GB too large stops costing 1 GB of usable VRAM. "
-            "Not fixed alongside Stage 4: three of this project's four memory-metric "
-            "defects were introduced while fixing the previous one, and Stage 6 (the only "
-            "consumer) is blocked on the fit regardless. strict=True, so implementing the "
-            "fix fails here and forces the marker off."
-        ),
-    )
-    def test_an_overstated_context_no_longer_shrinks_the_cap(self, monkeypatch) -> None:
-        """The whole bug: a context measurement 1 GB too large cost 1 GB of usable VRAM."""
-        honest = self._cap(monkeypatch, context_bytes=int(0.25e9))
-        overstated = self._cap(monkeypatch, context_bytes=int(1.38e9))
-        assert honest == overstated
 
     def test_the_env_override_still_wins(self, monkeypatch) -> None:
         import torch
