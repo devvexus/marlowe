@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from marlowe.supervisor import (
     Progress,
     restart_interval_from_slope,
@@ -181,3 +183,64 @@ def test_a_rising_slope_becomes_a_restart_interval() -> None:
     per_step = 50_000_000 / 1000
     interval = restart_interval_from_slope(per_step, headroom_bytes=300_000_000)
     assert interval == 3000
+
+
+class TestASearchIsACandidateNotASelection:
+    """8 steps cannot see per-step accumulation, so a search verdict cannot select a rung.
+
+    rank32-seq768 measured 0.09 GB paged over 8 steps and 11.5 GB over 500 -- about 23 MB a
+    step, with torch reporting flat fragmentation and 0.53 GB of headroom the whole time. An
+    idle control put desktop noise at 33 MB per three minutes, so the growth was real.
+    """
+
+    def _soak(self, **kw):
+        from marlowe.heal import SoakResult
+
+        base = dict(candidate="rank32-seq768", steps=500, paged_bytes=0,
+                    paging_verdict=False, trapped_slope_bytes_per_step=0.0, tok_s=190.0)
+        base.update(kw)
+        return SoakResult(**base)
+
+    def test_the_cache_refuses_a_plan_with_no_soak(self, tmp_path) -> None:
+        import json
+
+        from marlowe.heal import NotSelected, require_selected
+
+        plan = tmp_path / "memory_plan.json"
+        plan.write_text(json.dumps({"config": {"seq_len": 768}}), encoding="utf-8")
+        with pytest.raises(NotSelected, match="CANDIDATE"):
+            require_selected(plan)
+
+    def test_a_paging_soak_cannot_promote_a_candidate(self, tmp_path) -> None:
+        from marlowe.heal import NotSelected, select_from_soak
+
+        soak = self._soak(paged_bytes=11_547_000_000, paging_verdict=True)
+        assert not soak.passed
+        assert "11.55 GB" in (soak.why_not() or "")
+        with pytest.raises(NotSelected, match="did not pass its soak"):
+            select_from_soak(tmp_path / "memory_plan.json", soak)
+
+    def test_growing_fragmentation_cannot_promote_a_candidate(self, tmp_path) -> None:
+        from marlowe.heal import NotSelected, select_from_soak
+
+        soak = self._soak(trapped_slope_bytes_per_step=80e6 / 1000)
+        assert not soak.passed
+        assert "per 1000 steps" in (soak.why_not() or "")
+        with pytest.raises(NotSelected):
+            select_from_soak(tmp_path / "memory_plan.json", soak)
+
+    def test_a_passed_soak_promotes_and_the_cache_then_accepts(self, tmp_path) -> None:
+        from marlowe.heal import require_selected, select_from_soak
+
+        plan = tmp_path / "memory_plan.json"
+        select_from_soak(plan, self._soak())
+        selected = require_selected(plan)
+        assert selected["candidate"] == "rank32-seq768"
+        assert selected["steps"] == 500
+
+    def test_a_search_result_never_reads_as_final(self) -> None:
+        from marlowe.heal import MEMORY_CANDIDATES, SearchResult
+
+        res = SearchResult(chosen=MEMORY_CANDIDATES[0], config=None, probe=None)
+        assert res.is_provisional is True
+        assert res.candidate is MEMORY_CANDIDATES[0]

@@ -33,7 +33,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from marlowe import logutil
@@ -67,6 +67,54 @@ class PagingReport:
     #: default, every probe built without a sampler would pass the fit gate.
     available: bool = False
 
+    #: Every sample, in order. The shape is the measurement -- see :meth:`saturation`.
+    shared_series_bytes: list[int] = field(default_factory=list)
+
+    def saturation(self, warmup_frac: float = 0.4) -> dict[str, float] | None:
+        """Does host backing settle, or keep growing? The latter is the failure.
+
+        ``paged_bytes`` (peak over floor) turned out to answer the wrong question. The
+        platform provisions roughly 7.5 GB of host-backed memory once, on the first sustained
+        training workload in a process, and then leaves it there: cold, untouched, costing
+        nothing. Measured the same rung two ways --
+
+            rank32-seq768 probed 2nd in a warm process   0.09 GB
+            rank32-seq768 probed 1st in a fresh process  7.59 GB
+            rank32-seq1024 probed 1st in a fresh process 7.51 GB
+
+        -- so the only variable was running first, not the configuration. A peak-over-floor
+        gate reads that provisioning as a 7.5 GB spill and rejects a rung training at full
+        speed, which is the mirror of accepting one at 216 tok/s while genuinely paging.
+
+        What distinguishes cold provisioning from real paging is **growth after warm-up**.
+        Provisioning is a step change followed by a flat line. Real pressure keeps climbing.
+        """
+        n = len(self.shared_series_bytes)
+        if n < 5:
+            return None
+        start = int(n * warmup_frac)
+        tail = self.shared_series_bytes[start:]
+        if len(tail) < 3:
+            return None
+        xs = list(range(len(tail)))
+        mx = sum(xs) / len(xs)
+        my = sum(tail) / len(tail)
+        den = sum((x - mx) ** 2 for x in xs)
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, tail)) / den if den else 0.0
+        return {
+            "saturated_level_bytes": float(min(tail)),
+            "growth_after_warmup_bytes": float(max(tail) - min(tail)),
+            "slope_bytes_per_sample": slope,
+            "samples_after_warmup": float(len(tail)),
+        }
+
+    def is_saturated(self, growth_limit_bytes: int = PAGING_THRESHOLD_BYTES) -> bool | None:
+        """True when host backing settled. None when there is not enough data to say."""
+        s = self.saturation()
+        if s is None:
+            return None
+        return s["growth_after_warmup_bytes"] <= growth_limit_bytes
+
     @property
     def paging(self) -> bool:
         return self.available and self.paged_bytes > PAGING_THRESHOLD_BYTES
@@ -81,6 +129,48 @@ class PagingReport:
             f"{self.shared_floor_bytes / 1e9:.2f} GB floor, dedicated "
             f"{self.dedicated_peak_bytes / 1e9:.2f} GB peak, {self.samples} samples)"
         )
+
+
+#: Seconds to wait for driver host backing to drain after a model load before the floor is
+#: taken. Measured: after loading the 22B, shared usage sits at 9.07 GB and falls at roughly
+#: 0.6 GB/s to 0.09 GB over about fifteen seconds. A sampler that starts inside that window
+#: records the drain as a 7.5-9 GB spill.
+#:
+#: That single artefact produced every confusing paging number in this project: rung 1 of the
+#: memory search read 7.51 GB and rungs 2-4 read 0.09-0.66 GB purely because rung 1 ran first,
+#: and standalone soaks of the *same* rung read 7.5-11.5 GB because each started fresh. The
+#: rung was never paging.
+DRAIN_SETTLE_SECONDS = 25.0
+
+
+def wait_for_drain(
+    timeout_s: float = DRAIN_SETTLE_SECONDS, interval_s: float = 2.0, tolerance_bytes: int = 100_000_000
+) -> int | None:
+    """Block until driver host backing stops falling. Returns the settled level.
+
+    Call after loading a model and before starting the sampler whose floor decides a fit
+    verdict. Cheap -- a few seconds of polling against a run measured in hours -- and it
+    removes the one artefact that has made every paging measurement here ambiguous.
+    """
+    import time
+
+    last: int | None = None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        sampler = PagingSampler(interval_s=1)
+        sampler.start()
+        time.sleep(interval_s)
+        report = sampler.stop()
+        if not report.available:
+            return None
+        level = report.shared_peak_bytes
+        if last is not None and abs(last - level) <= tolerance_bytes:
+            logutil.event(log, "host backing settled", level_gb=round(level / 1e9, 2))
+            return level
+        last = level
+    logutil.event(log, "host backing still draining at timeout", level_gb=
+                  round(last / 1e9, 2) if last else None)
+    return last
 
 
 class PagingSampler:
@@ -184,6 +274,7 @@ def _parse_rows(lines: list[str]) -> PagingReport:
             dedicated_peak_bytes=int(max(ded)),
             samples=len(sh),
             available=True,
+            shared_series_bytes=[int(v) for v in sh],
         )
         # The adapter under test is the one that actually held the model.
         if best is None or cand.dedicated_peak_bytes > best.dedicated_peak_bytes:

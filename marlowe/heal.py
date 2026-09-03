@@ -1292,12 +1292,34 @@ MEMORY_CANDIDATES: tuple[MemoryCandidate, ...] = (
 
 @dataclass
 class SearchResult:
+    """What the ladder search produces: a **candidate**, never a selection.
+
+    The search probes 8 steps per rung, which cannot see per-step accumulation. Measured:
+    rank32-seq768 reported 0.09 GB paged over 8 steps and **11.5 GB over 500** -- roughly
+    23 MB per step, invisible to torch, which showed flat fragmentation and 0.53 GB of
+    headroom throughout. An idle control ruled out desktop contamination at 33 MB per three
+    minutes, so the growth is real.
+
+    So a search verdict is provisional by construction. Only a passed soak selects a rung,
+    and :func:`select_from_soak` is the only thing that produces one.
+    """
+
     chosen: MemoryCandidate | None
     config: HealConfig | None
     probe: ProbeResult | None
     attempts: list[tuple[str, str]] = field(default_factory=list)
     #: Candidates skipped because they need an explicit decision, not because they failed.
     blocked: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def candidate(self) -> MemoryCandidate | None:
+        """The rung the search nominates. Not a selection -- see the class docstring."""
+        return self.chosen
+
+    @property
+    def is_provisional(self) -> bool:
+        """Always True. Named so calling code cannot treat a search as a decision."""
+        return True
 
     @property
     def exhausted_without_approval(self) -> bool:
@@ -1440,6 +1462,93 @@ def _candidate_override_fields() -> tuple[str, ...]:
     return tuple(
         f.name for f in dataclasses.fields(MemoryCandidate) if f.name not in fixed
     )
+
+
+
+
+#: Marker written into the memory plan by a passed soak, and required by the teacher cache.
+#:
+#: The distinction is not bookkeeping. The search probes 8 steps and cannot see per-step
+#: accumulation; rank32-seq768 read 0.09 GB paged over 8 steps and 11.5 GB over 500. A cache
+#: built at a length the search nominated but the soak never confirmed is six hours spent on
+#: a number nobody stood behind.
+SELECTION_KEY = "selected_by_soak"
+
+
+@dataclass
+class SoakResult:
+    """A long run's verdict on a candidate. This is what selects a rung."""
+
+    candidate: str
+    steps: int
+    paged_bytes: int
+    paging_verdict: bool
+    trapped_slope_bytes_per_step: float
+    tok_s: float
+    #: (step, paged_bytes) over the run. The endpoint alone hides when growth began.
+    paged_trace: list[tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return not self.paging_verdict and self.trapped_slope_bytes_per_step * 1000 < 50e6
+
+    def why_not(self) -> str | None:
+        if self.paging_verdict:
+            return (
+                f"paged {self.paged_bytes / 1e9:.2f} GB over {self.steps} steps; the gate is "
+                f"250 MB. Torch cannot see this -- it reported flat fragmentation on the run "
+                f"that produced 11.5 GB."
+            )
+        slope_per_1k = self.trapped_slope_bytes_per_step * 1000
+        if slope_per_1k >= 50e6:
+            return (
+                f"trapped fragmentation grows {slope_per_1k / 1e6:.0f} MB per 1000 steps, "
+                f"above the 50 MB limit. Set a restart interval or fix the growth."
+            )
+        return None
+
+
+class NotSelected(RuntimeError):
+    """Something asked to build from a rung that no soak has confirmed."""
+
+
+def select_from_soak(path: str | Path, soak: SoakResult) -> Path:
+    """Promote a candidate to selected, or refuse. The only route to a usable plan."""
+    path = Path(path)
+    plan = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if not soak.passed:
+        raise NotSelected(
+            f"{soak.candidate} did not pass its soak: {soak.why_not()}\n"
+            f"The search's verdict on it was provisional -- 8 steps cannot see per-step "
+            f"accumulation. Fix the cause or soak a different rung; do not build a cache "
+            f"from a candidate."
+        )
+    plan[SELECTION_KEY] = {
+        "candidate": soak.candidate,
+        "steps": soak.steps,
+        "paged_bytes": soak.paged_bytes,
+        "trapped_slope_mb_per_1k": round(soak.trapped_slope_bytes_per_step * 1000 / 1e6, 2),
+        "tok_s": soak.tok_s,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    logutil.event(log, "rung selected by soak", **plan[SELECTION_KEY])
+    return path
+
+
+def require_selected(path: str | Path) -> dict[str, Any]:
+    """Read the soak-confirmed selection, or refuse to proceed."""
+    path = Path(path)
+    plan = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    selected = plan.get(SELECTION_KEY)
+    if not selected:
+        raise NotSelected(
+            f"{path} carries no soak-confirmed selection. The memory search emits a "
+            f"CANDIDATE: it probes 8 steps, and rank32-seq768 measured 0.09 GB paged over 8 "
+            f"steps against 11.5 GB over 500. Run the soak and call select_from_soak() "
+            f"before building anything at this sequence length."
+        )
+    return selected
 
 
 def save_memory_plan(path: str | Path, search: SearchResult) -> Path:

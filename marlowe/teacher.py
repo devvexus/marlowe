@@ -128,8 +128,25 @@ def build_cache(
     *,
     max_gpu_gb: float | None = None,
     resume: bool = True,
+    memory_plan_path: str | Path | None = None,
 ) -> CacheIndex:
-    """Write the top-K cache. Resumable at shard granularity."""
+    """Write the top-K cache. Resumable at shard granularity.
+
+    ``memory_plan_path`` must name a plan carrying a **soak-confirmed** selection. The cache
+    is built at one fixed sequence length whose distributions are position-aligned, so the
+    length has to be right before the first shard is written, not discovered afterwards.
+
+    The memory search alone is not enough to authorise that. It probes 8 steps, and
+    rank32-seq768 measured 0.09 GB paged over 8 steps against 11.5 GB over 500 -- growth
+    torch could not see at all, reporting flat fragmentation and 0.53 GB of headroom
+    throughout. A cache built from a candidate is hours spent on a number nobody stood
+    behind, and it is discovered at the start of Stage 6, when it is most expensive.
+    """
+    if memory_plan_path is not None:
+        from marlowe.heal import require_selected
+
+        selected = require_selected(memory_plan_path)
+        logutil.event(log, "cache building from soak-selected rung", **selected)
     import numpy as np
     import torch
 
