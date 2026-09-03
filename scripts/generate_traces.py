@@ -35,6 +35,46 @@ THINKING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
             "presence_penalty": 0.0, "repeat_penalty": 1.0}
 
 
+
+def _wait_healthy(base_url: str, timeout_s: int) -> bool:
+    """Block until the server responds, so a cold start is not read as failure.
+
+    Probes /v1/models before /health: llama-server serves both, Ollama serves only the first.
+    Polling /health alone against Ollama waits out the entire timeout on a 404 while the
+    server is up and idle -- which is exactly what it did.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            for path in ("/v1/models", "/health"):
+                try:
+                    with urllib.request.urlopen(f"{base_url}{path}", timeout=5) as r:
+                        if r.status == 200:
+                            return True
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    continue
+        except Exception:
+            pass
+        time.sleep(5)
+    return False
+
+
+def _retrying(fn, attempts: int = 5, base_delay: float = 4.0):
+    """Retry a 503 with backoff instead of consuming the prompt.
+
+    llama-server answers 503 when a request cannot be placed in a slot. Treating that as a
+    permanent failure burned 2988 prompts in seconds.
+    """
+    last: dict[str, Any] = {}
+    for i in range(attempts):
+        last = fn()
+        err = last.get("error", "")
+        if "503" not in err and "500" not in err and "10061" not in err:
+            return last
+        time.sleep(base_delay * (i + 1))
+    return last
+
+
 def generate_one(base_url: str, model: str, prompt: str, max_tokens: int,
                  seed: int, timeout: int) -> dict[str, Any]:
     payload = {
@@ -103,7 +143,12 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--timeout-ready", type=int, default=900)
     args = ap.parse_args()
+
+    if not _wait_healthy(args.base_url, args.timeout_ready):
+        print(f"server at {args.base_url} never became healthy; refusing to start", flush=True)
+        return 1
 
     prompts = [json.loads(x) for x in Path(args.prompts).read_text(encoding="utf-8").splitlines() if x.strip()]
     if args.limit:
@@ -111,12 +156,30 @@ def main() -> int:
 
     out_path = Path(args.out)
     done: set[str] = set()
+    failed = 0
     if out_path.exists():
+        kept: list[str] = []
         with out_path.open(encoding="utf-8") as f:
             for line in f:
-                if line.strip():
-                    done.add(json.loads(line)["id"])
-        print(f"resuming: {len(done)} traces already on disk", flush=True)
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                # A failed attempt is NOT done. Counting error rows as completed marked 2988
+                # prompts as attempted in seconds -- the server was rejecting every request
+                # because max_tokens plus the prompt exceeded its 4096-token slot -- and a
+                # resume would then have skipped all of them, silently generating a corpus
+                # 1% the intended size.
+                if "error" in row:
+                    failed += 1
+                    continue
+                done.add(row["id"])
+                kept.append(line.rstrip("\n"))
+        if failed:
+            body = "\n".join(kept)
+            out_path.write_text(body + ("\n" if kept else ""), encoding="utf-8")
+            print(f"dropped {failed} failed attempts from {out_path}; they will be retried",
+                  flush=True)
+        print(f"resuming: {len(done)} completed traces on disk", flush=True)
     todo = [p for p in prompts if p["id"] not in done]
     print(f"{len(todo)} prompts to generate from {args.model} ({args.quant}), "
           f"cap {args.max_tokens}, {args.workers} workers", flush=True)
@@ -134,8 +197,9 @@ def main() -> int:
                 p = q.get_nowait()
             except queue.Empty:
                 return
-            r = generate_one(args.base_url, args.model, p["prompt"],
-                             args.max_tokens, args.seed, args.timeout)
+            r = _retrying(lambda: generate_one(
+                args.base_url, args.model, p["prompt"],
+                args.max_tokens, args.seed, args.timeout))
             row = {"id": p["id"], "kind": p["kind"], "prompt": p["prompt"], **r}
             if "error" not in r:
                 row["metrics"] = measure(r, args.max_tokens)

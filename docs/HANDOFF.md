@@ -1032,6 +1032,73 @@ time rising.
 
 ## 5c. Claims this document made that turned out to be wrong
 
+### The paging sampler was correct in every reading. The interpretation was wrong
+
+Not a broken instrument. Every number it returned was the true value of
+`\GPU Adapter Memory\Shared Usage` at the moment it was sampled. What was wrong was the
+assumption wrapped around it: that the sampling window covered a **steady state**, when it
+in fact covered a **transient**.
+
+After loading the 22B, driver host backing sits at 9.07 GB and falls monotonically at about
+0.6 GB/s to 0.09 GB over roughly fifteen seconds, then stays flat for the rest of the run.
+Measured at one-second resolution across a 60-step probe:
+
+```
+pre-training   9.07 9.07 9.07 9.07 9.07 9.07 9.07 8.98
+training 1-10  8.28 7.66 7.02 6.44 5.78 5.18 4.54 3.89 3.24 2.58
+then           0.09 ... 0.09      (~250 samples, ~4 minutes, flat, 191 tok/s)
+```
+
+`paged = max(shared) - min(shared)` is a sound definition -- the counter is a genuine
+instantaneous gauge, confirmed by allocating 18.79 GB against 15.79 GB free and watching it
+rise to 2.43 GB and fall back to 0.15 GB on release. But `max - min` over a window that
+*contains a decay* returns the height of the decay, not the height of any spill during
+training.
+
+**One artefact produced every confusing paging number in this project:**
+
+| reading | why |
+| --- | --- |
+| rung 1 `rank32-seq1024` 7.51 GB "PAGES" | probed first, immediately after the base load |
+| rungs 2-4 0.09-0.66 GB "FITS" | probed later, after the drain had finished |
+| standalone soaks 7.5-11.5 GB | each started a fresh process, so each caught its own drain |
+| 100-step and 500-step soaks **identical to 11.547 GB** | the tell: a fixed event, not accumulation |
+
+**`rank32-seq1024`'s PAGES verdict was this drain, not a spill.** The rung was never paging,
+and neither was `rank32-seq768`, which reported 0.09 GB when probed second and 7.59 GB when
+probed first -- the same rung, differing only in running order.
+
+Two things nearly hid it. Byte-identical results at two run lengths is not a physical
+measurement, and that is what forced the question. And an idle control -- three minutes with
+no GPU work, showing 33 MB of desktop noise -- correctly cleared *other tenants* as the
+cause, which made the number look confirmed when it had only been narrowed. Ruling out one
+explanation is not establishing another.
+
+The fix is `wait_for_drain()`, called before the measurement window opens, with the settling
+time recorded on `ProbeResult.drain_seconds`. It is `None` when the model was loaded inside
+the window, which marks that paging figure as not a training number rather than leaving it to
+be read as one.
+
+**A superseded intermediate is worth recording too.** `PagingReport.saturation()` was added
+between these findings, on the theory that the platform provisions host backing once and
+holds it. It returns the right verdict on the real series, but only because its warm-up
+fraction happens to skip the decay -- right answer, wrong reason. It was deleted rather than
+kept: two overlapping notions of the same thing, one of which works by coincidence, is worse
+than one that works because the transient is waited out.
+
+### "Pinning barely matters" was about bandwidth, and the failure was not about bandwidth
+
+The judgement that pinning the 2.54 GB embedding table "barely matters at 7.9 MB per forward"
+was correct *as a bandwidth claim* and was then used to dismiss a mechanism nobody had
+measured. What actually happened is worse than immaterial: `pin_memory()` on 2.54 GB raised a
+raw `CUDA error: out of memory` from `cudaHostAlloc` on this 32 GB host and left the context
+unusable, so the next tiny `randint` failed. Not pinning is right here, for a reason that has
+nothing to do with the reason given.
+
+The related trap, when a small pinned staging buffer is eventually wanted: it must be sized
+`seq x hidden`, not `vocab x hidden`. Pinning the table is what fails; pinning 7.9 MB does not.
+
+
 Recorded because a handoff that only accumulates conclusions teaches the next reader to
 trust it more than it deserves.
 

@@ -109,6 +109,63 @@ that matter most. Check whether the provider exposes it; do not assume.
 **Provenance:** prompt source, model string, sampling params, generation date, and the
 prompt-hash manifest all recorded alongside the traces.
 
+### Round 2 trace generation: budget by tokens, not by prompts
+
+Round 1 capped every trace at 4096 tokens. The cap was set as a guard against the parent
+circling at depth, and never sized against the distribution it was meant to bound. It landed
+in the middle of the mass rather than out on the tail:
+
+```
+round 1, cap 4096:   p50 = p90 = max = 4096
+                     86% hit the cap, 76% contain a thinking block and no answer
+```
+
+A probe at a 24576 cap measured what a trace actually needs. Completed traces — the ones that
+stopped because the model finished, not because the budget ran out:
+
+```
+12 prompts at cap 24576: 9 completed (75%)
+completed tokens: min 3,619   p50 7,233   p90 16,507   max 16,507
+```
+
+| kind | completed | tokens |
+| --- | --- | --- |
+| arXiv | 3 of 3 | 3,996 · 6,978 · 8,838 |
+| PI | 3 of 3 | 7,233 · 10,472 · 16,507 |
+| tool | 2 of 3 | 3,619 · 4,659 · **>24,576** |
+| math | 1 of 3 | 15,137 · **>24,576** · **>24,576** |
+
+The 4096 cap sat below *every completed trace in the probe* -- the shortest was 3,619. It was
+2-6x under for arXiv and PI, and for math it is not clear even 24576 suffices.
+
+`tool` is the surprise: two traces near 4K and one beyond 24,576. It cannot be treated as a
+uniformly short kind, so it needs the same 32K headroom as PI rather than a small budget.
+
+**Budget by tokens, not prompts.** Math traces run roughly 3x the length of the others, so an
+even prompt mix silently over-weights math in the corpus that actually results. Round 1's mix
+was chosen in prompts (1229 arXiv / 945 PI / 526 math / 300 tool) and the token split it
+produces is not that ratio.
+
+Round 2:
+
+* **32K cap for arXiv, PI and tool.** Comfortably above the measured completion range
+  (max 16,507) with room for the tool tail.
+* **64K cap for math, with a smaller prompt count.** Two of three math prompts did not
+  conclude within 24,576, so the upper tail is still unmeasured; 64K is chosen to be clearly
+  above it rather than near it, which is the mistake round 1 made. Fewer math prompts,
+  because at ~3x the tokens each they would otherwise dominate the token split.
+* **Anything that still truncates keeps `complete: false`.** The rule does not change with
+  the cap -- a trace that ran out of budget at 64K is exactly as unusable for Phase B's hard
+  labels as one that ran out at 4096.
+* **Prompt counts derived from the intended token split**, not chosen directly. Pick the
+  target ratio in tokens, divide by the measured mean tokens-per-trace for each kind, and let
+  that determine how many prompts of each kind to generate.
+
+Note the second-order cost: a 32K cap needs 32K of slot context, so slots x context has to
+fit VRAM. Round 1 ran `-np 4` at 5120 per slot; 32K per slot means fewer concurrent slots and
+lower aggregate throughput. That trade is worth making — a truncated trace has no answer to
+learn from — but it should be planned rather than discovered.
+
 ### 2. Top-K from 16 to 64 — free
 
 The top-16 captures most probability mass on confident tokens but as little as 60% on

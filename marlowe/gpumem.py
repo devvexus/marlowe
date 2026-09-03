@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,53 +68,15 @@ class PagingReport:
     #: default, every probe built without a sampler would pass the fit gate.
     available: bool = False
 
-    #: Every sample, in order. The shape is the measurement -- see :meth:`saturation`.
+    #: Every sample, in order. Kept for diagnosis and for the drain trace; the fit
+    #: verdict does not read it. An earlier saturation() analysis over this series was
+    #: deleted: it returned the right answer on the real data only because its warm-up
+    #: fraction happened to skip the load's decay. Waiting the transient out is the
+    #: fix; a second notion of the same thing that works by coincidence is not.
     shared_series_bytes: list[int] = field(default_factory=list)
-
-    def saturation(self, warmup_frac: float = 0.4) -> dict[str, float] | None:
-        """Does host backing settle, or keep growing? The latter is the failure.
-
-        ``paged_bytes`` (peak over floor) turned out to answer the wrong question. The
-        platform provisions roughly 7.5 GB of host-backed memory once, on the first sustained
-        training workload in a process, and then leaves it there: cold, untouched, costing
-        nothing. Measured the same rung two ways --
-
-            rank32-seq768 probed 2nd in a warm process   0.09 GB
-            rank32-seq768 probed 1st in a fresh process  7.59 GB
-            rank32-seq1024 probed 1st in a fresh process 7.51 GB
-
-        -- so the only variable was running first, not the configuration. A peak-over-floor
-        gate reads that provisioning as a 7.5 GB spill and rejects a rung training at full
-        speed, which is the mirror of accepting one at 216 tok/s while genuinely paging.
-
-        What distinguishes cold provisioning from real paging is **growth after warm-up**.
-        Provisioning is a step change followed by a flat line. Real pressure keeps climbing.
-        """
-        n = len(self.shared_series_bytes)
-        if n < 5:
-            return None
-        start = int(n * warmup_frac)
-        tail = self.shared_series_bytes[start:]
-        if len(tail) < 3:
-            return None
-        xs = list(range(len(tail)))
-        mx = sum(xs) / len(xs)
-        my = sum(tail) / len(tail)
-        den = sum((x - mx) ** 2 for x in xs)
-        slope = sum((x - mx) * (y - my) for x, y in zip(xs, tail)) / den if den else 0.0
-        return {
-            "saturated_level_bytes": float(min(tail)),
-            "growth_after_warmup_bytes": float(max(tail) - min(tail)),
-            "slope_bytes_per_sample": slope,
-            "samples_after_warmup": float(len(tail)),
-        }
-
-    def is_saturated(self, growth_limit_bytes: int = PAGING_THRESHOLD_BYTES) -> bool | None:
-        """True when host backing settled. None when there is not enough data to say."""
-        s = self.saturation()
-        if s is None:
-            return None
-        return s["growth_after_warmup_bytes"] <= growth_limit_bytes
+    #: Which adapter these readings came from. Comparing two reports with
+    #: different instances compares different hardware.
+    instance: str | None = None
 
     @property
     def paging(self) -> bool:
@@ -189,8 +152,9 @@ class PagingSampler:
     samples already collected survive termination.
     """
 
-    def __init__(self, interval_s: int = 2) -> None:
+    def __init__(self, interval_s: int = 2, instance: str | None = None) -> None:
         self._interval = interval_s
+        self._instance = instance
         self._proc: subprocess.Popen[str] | None = None
         self._lines: list[str] = []
         self._thread: threading.Thread | None = None
@@ -225,11 +189,81 @@ class PagingSampler:
             self._proc.kill()
         if self._thread is not None:
             self._thread.join(timeout=5)
-        return _parse_rows(self._lines)
+        return _parse_rows(self._lines, self._instance)
 
 
-def _parse_rows(lines: list[str]) -> PagingReport:
-    """Reduce typeperf CSV lines to one adapter's peak spill above its own floor."""
+
+def discrete_adapter_instance(probe_bytes: int = 2_000_000_000, settle_s: float = 4.0) -> str | None:
+    """Identify the compute GPU by making it move, not by guessing.
+
+    Allocates on the CUDA device and returns the adapter instance whose *dedicated* usage
+    rises. Picking "the adapter with the most dedicated usage" works only while a model is
+    already resident; at idle it selects the integrated GPU, and a floor read from one adapter
+    against a level read from another is not a measurement.
+    """
+    import torch
+
+    before = PagingSampler(interval_s=1)
+    before.start()
+    time.sleep(settle_s)
+    rows_before = list(before._lines)
+    before.stop()
+
+    hog = torch.empty(int(probe_bytes // 2), dtype=torch.float16, device="cuda")
+    hog.fill_(0)
+    torch.cuda.synchronize()
+    after = PagingSampler(interval_s=1)
+    after.start()
+    time.sleep(settle_s)
+    rows_after = list(after._lines)
+    after.stop()
+    del hog
+    torch.cuda.empty_cache()
+
+    def dedicated_by_instance(lines: list[str]) -> dict[str, float]:
+        rows = [r for r in csv.reader(lines) if r]
+        if len(rows) < 2:
+            return {}
+        out: dict[str, float] = {}
+        for i, col in enumerate(rows[0][1:], start=1):
+            if not col.rstrip('"').endswith("Dedicated Usage"):
+                continue
+            inst = col.split("(")[-1].split(")")[0]
+            vals = []
+            for row in rows[1:]:
+                if len(row) > i:
+                    try:
+                        vals.append(float(row[i]))
+                    except ValueError:
+                        continue
+            if vals:
+                out[inst] = max(vals)
+        return out
+
+    d0 = dedicated_by_instance(rows_before)
+    d1 = dedicated_by_instance(rows_after)
+    moved = {k: d1.get(k, 0.0) - v for k, v in d0.items()}
+    if not moved:
+        return None
+    inst = max(moved, key=lambda k: moved[k])
+    if moved[inst] < probe_bytes * 0.5:
+        return None
+    logutil.event(log, "discrete adapter identified", instance=inst,
+                  moved_gb=round(moved[inst] / 1e9, 2))
+    return inst
+
+
+def _parse_rows(lines: list[str], instance: str | None = None) -> PagingReport:
+    """Reduce typeperf CSV lines to one adapter's readings.
+
+    ``instance`` pins which adapter is read. Without it the adapter with the largest
+    *dedicated* usage is chosen, which is right while a model is resident and wrong when the
+    card is idle: this box has three adapter instances, and with nothing allocated the
+    integrated GPU wins the comparison. Two samples taken moments apart then describe
+    different hardware, and idle readings of 1.25, 1.28, 1.68 and 2.33 GB are that instability
+    rather than drift. A known-positive test for sustained spill failed on exactly this --
+    floor read from the iGPU, held level from the discrete card, difference meaningless.
+    """
     rows = [r for r in csv.reader(lines) if r]
     if len(rows) < 2:
         return PagingReport(available=False)
@@ -257,6 +291,8 @@ def _parse_rows(lines: list[str]) -> PagingReport:
 
     best: PagingReport | None = None
     for inst, d_idx in dedicated_cols.items():
+        if instance is not None and inst != instance:
+            continue
         ded = series(d_idx)
         if not ded:
             continue
@@ -275,6 +311,7 @@ def _parse_rows(lines: list[str]) -> PagingReport:
             samples=len(sh),
             available=True,
             shared_series_bytes=[int(v) for v in sh],
+            instance=inst,
         )
         # The adapter under test is the one that actually held the model.
         if best is None or cand.dedicated_peak_bytes > best.dedicated_peak_bytes:

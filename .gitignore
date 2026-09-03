@@ -8,7 +8,7 @@ build/
 dist/
 .venv/
 venv/
-
+.env
 # Run artefacts. Big, regenerable, and manifests record how.
 runs/
 *.gguf
