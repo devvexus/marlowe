@@ -69,6 +69,7 @@ from marlowe.gpumem import (
     cap_process_memory,
     sampler_validation,
     validate_sampler,
+    wait_for_drain,
 )
 
 log = logutil.get("heal")
@@ -1061,6 +1062,10 @@ class ProbeResult:
     #: ``(step, allocated_gb, trapped_gb)`` samples, when the probe ran with ``log_every``.
     #: Empty for a short fit probe; populated for a soak.
     trace: list[tuple[int, float, float]] = field(default_factory=list)
+    #: Seconds waited for the load's host backing to drain before measuring.
+    #: None when the model was loaded inside the measurement window, in which
+    #: case the paging figure includes the drain and is not a training number.
+    drain_seconds: float | None = None
 
     def fragmentation_slope_gb_per_1k(self, skip: int = 50) -> float | None:
         """Growth in trapped bytes per 1000 steps, or None without enough samples.
@@ -1676,6 +1681,24 @@ def probe_training(
 
     # Before the model loads: the sampler's earliest readings are this process holding
     # nothing, which is the floor its paging verdict is measured against.
+    # Wait for the load's host backing to drain BEFORE opening the measurement window.
+    #
+    # After loading the 22B, driver shared usage sits at 9.07 GB and falls at ~0.6 GB/s to
+    # 0.09 GB over about fifteen seconds. A sampler started inside that window records the
+    # drain as a 7.5-9 GB spill, and that single artefact produced every confusing paging
+    # number in this project: rung 1 of the memory search read 7.51 GB and rungs 2-4 read
+    # 0.09-0.66 GB purely because rung 1 ran first, while standalone soaks of the same rung
+    # read 7.5-11.5 GB because each started fresh. Nothing was paging.
+    #
+    # Only meaningful when a base is passed in; otherwise the load happens below and the wait
+    # would measure the previous tenant's drain, not this one's.
+    drain_seconds: float | None = None
+    if base is not None:
+        _t = time.time()
+        wait_for_drain()
+        drain_seconds = round(time.time() - _t, 1)
+        logutil.event(log, "host backing drained", seconds=drain_seconds)
+
     sampler = PagingSampler()
     sampler.start()
     torch.cuda.empty_cache()
@@ -1807,6 +1830,7 @@ def probe_training(
         modules_trained_in_full=effective_lora_targets(cfg)[1],
         paging=paging,
         trace=trace,
+        drain_seconds=drain_seconds,
     )
     del optim
     if base is None:
