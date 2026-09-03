@@ -20,6 +20,8 @@ it is recorded in the manifest; it beats no teacher by a wide margin.
 from __future__ import annotations
 
 import json
+import os
+import time
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -153,6 +155,148 @@ def build_cache(
     from marlowe.arch import Layout, load_config
     from marlowe.score import _hidden_from, build_harness, load_4bit
 
+
+    def _load_with_retry(path: str, *, max_gpu_gb=None, attempts: int = 3):
+        """Load the teacher, retrying a hard crash.
+
+        Measured on this machine: three identical fresh-process loads of the 27B parent gave
+        one segfault at tensor 754 of 851 and two clean completions. The fault is in
+        transformers' _materialize_copy -- the mmap read of a safetensors slice -- and it
+        moves between runs, so it is environmental rather than a corrupt shard. A contributing
+        cause was found and removed (a background process leaking 4.9M handles, 93% of the
+        machine's total), but the load is not proven reliable, and a segfault at hour thirty
+        of a cache build is not something to discover without a retry in place.
+
+        Load-only. Once past it the forward path is stable.
+        """
+        import json as _json
+
+        # A checkpoint that is already NF4 on disk must be loaded WITHOUT handing
+        # from_pretrained another BitsAndBytesConfig. Passing one makes transformers treat it
+        # as on-the-fly quantisation again -- the exact path that segfaults reading a 45 GB
+        # bf16 mmap -- so the pre-quantisation would buy nothing while appearing to.
+        cfg_path = Path(path) / "config.json"
+        pre_quantized = False
+        if cfg_path.exists():
+            try:
+                pre_quantized = bool(
+                    _json.loads(cfg_path.read_text(encoding="utf-8")).get("quantization_config")
+                )
+            except (OSError, ValueError):
+                pre_quantized = False
+
+        def _embed_name() -> str | None:
+            """The embedding module path, taken from the model's own module tree.
+
+            Deriving it from tensor names is wrong: this checkpoint stores
+            ``model.language_model.embed_tokens.weight`` while the built module is
+            ``model.embed_tokens`` -- transformers strips the wrapper. A device_map key that
+            matches no submodule is not an error, it is a warning, so the offload silently
+            does not happen and the model loads entirely onto the card. Measured: 17.17 GB of
+            a 17.17 GB card, leaving nothing for the forward pass.
+
+            Built on the meta device, so this costs no memory and touches no GPU.
+            """
+            import torch as _torch
+            from transformers import AutoConfig, AutoModelForCausalLM
+
+            try:
+                cfg_ = AutoConfig.from_pretrained(path, trust_remote_code=True)
+                with _torch.device("meta"):
+                    skeleton = AutoModelForCausalLM.from_config(cfg_, trust_remote_code=True)
+                for name, _ in skeleton.named_modules():
+                    if name.endswith("embed_tokens"):
+                        return name
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not determine the embedding module name: %s", exc)
+            return None
+
+        def _load():
+            if not pre_quantized:
+                return load_4bit(path, max_gpu_gb=max_gpu_gb)
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            # The embedding is bf16 even in an NF4 checkpoint -- it is not a Linear, so
+            # nothing quantises it -- and at 248320 x 5120 that is 2.54 GB. Putting the whole
+            # checkpoint on the card OOMs; load_4bit has always offloaded this and the
+            # pre-quantized path has to as well.
+            embed = _embed_name()
+            device_map: dict[str, Any] = {"": 0}
+            if embed:
+                device_map[embed] = "cpu"
+            kw: dict[str, Any] = {"trust_remote_code": True, "device_map": device_map}
+            if max_gpu_gb:
+                kw["device_map"] = "auto"
+                kw["max_memory"] = {0: f"{max_gpu_gb:.1f}GiB", "cpu": "24GiB"}
+            logutil.event(log, "pre-quantized load", embed_offloaded=embed)
+            m = AutoModelForCausalLM.from_pretrained(path, **kw)
+
+            # Naming the embedding in device_map attaches accelerate's AlignDevicesHook, and
+            # that hook copies the WHOLE 2.54 GB table onto the device before every forward.
+            # The offload then saves nothing: the memory is paid anyway, as a per-forward
+            # transient. Measured on this teacher: 2.764 GB of driver spill above the idle
+            # floor, against a 2.543 GB table -- and ~0.21 s of PCIe per 1.60 s sequence,
+            # about 13% of throughput.
+            #
+            # CpuGatherEmbedding does the lookup on the host and moves only
+            # [batch, seq, hidden] -- 7.9 MB at seq 768 instead of 2540 MB. This fix was
+            # applied to heal.load_student this morning and not here, because this load path
+            # was written afterwards.
+            # OFF by default. The gather removes accelerate's 2.54 GB per-forward staging,
+            # which is real, but it also forces a GPU->CPU->GPU round trip at the start of
+            # every forward and measured 337.5 tok/s against the hook path's 479 -- a 30%
+            # loss. The staging is evidently overlapped with compute; the gather's sync is
+            # not. Set MARLOWE_TEACHER_CPU_GATHER=1 to re-enable.
+            if embed and os.environ.get("MARLOWE_TEACHER_CPU_GATHER", "0") == "1":
+                from marlowe.heal import use_cpu_gather_embedding
+
+                info = use_cpu_gather_embedding(m, embed)
+                logutil.event(log, "teacher cpu-gather embedding", **info)
+                # Imported here, not taken from the enclosing scope: the except block below
+                # does `import torch`, which makes `torch` a local of _load_with_retry, so a
+                # free-variable read from this nested function raises NameError before it is
+                # bound. That failed every first attempt and left the dead model on the card.
+                import torch as _t
+
+                _t.cuda.empty_cache()
+            return m, AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+        logutil.event(log, "teacher load", path=str(path), pre_quantized=pre_quantized)
+        # The failure is recorded as text, not as the exception object. A retained exception
+        # holds its __traceback__, which holds the frame of _load, which holds the partially
+        # loaded model -- so the next attempt runs with the previous attempt's teacher still
+        # resident. Measured: two teachers on a 16.4 GB card and 15.3 GB spilled to host.
+        last_msg: str | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                loaded = _load()
+                if attempt > 1:
+                    logutil.event(log, "teacher loaded after retry", attempt=attempt)
+                return loaded
+            except BaseException as exc:  # noqa: BLE001 - a hard crash is the case being handled
+                last_msg = f"{type(exc).__name__}: {exc}"
+                exc.__traceback__ = None  # drop the frame chain holding the failed model
+                del exc
+                log.warning(
+                    "teacher load attempt %d/%d failed: %s", attempt, attempts, last_msg,
+                )
+                import gc
+
+                gc.collect()
+                try:
+                    import torch
+
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(20)  # let driver host backing drain before trying again
+        raise RuntimeError(
+            f"teacher load failed {attempts} times. The last error was "
+            f"{last_msg}. A SIGSEGV kills the process outright and never "
+            f"reaches this handler -- if the run died silently, check the exit code (139) and "
+            f"see marlowe.supervisor, which retries at the process level."
+        )
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "index.json"
@@ -189,33 +333,50 @@ def build_cache(
 
     layout = Layout.from_config(load_config(teacher_path))
     with logutil.timed(log, "load 4-bit teacher", path=teacher_path):
-        model, tok = load_4bit(teacher_path, max_gpu_gb=max_gpu_gb)
+        model, tok = _load_with_retry(teacher_path, max_gpu_gb=max_gpu_gb)
     h = build_harness(model, layout.n_layers, cfg.seq_len)
 
     already = idx.n_tokens
     shard_seqs = max(1, cfg.shard_tokens // cfg.seq_len)
-    buf_ids: list[list[int]] = []
-    buf_topk: list[Any] = []
-    buf_lp: list[Any] = []
+    # Preallocated, in the ON-DISK dtypes. The previous version accumulated Python lists of
+    # int64 indices and float32 logprobs and cast them at flush() -- twice the width in
+    # memory, and then np.stack plus .astype each allocated another full copy while the
+    # lists were still live. Measured on a 5M-token shard: ~4 GB of buffers with a ~4 GB
+    # spike at the boundary, on a 31 GB machine that was already at 0.41 GB available.
+    #
+    # Writing straight into a preallocated array in the final dtype removes both: the
+    # footprint is constant, known before the run starts, and flush() is a slice.
+    buf_ids = np.empty((shard_seqs, cfg.seq_len), dtype=np.int32)
+    buf_topk = np.empty((shard_seqs, cfg.seq_len, cfg.top_k), dtype=np.uint32)
+    buf_lp = np.empty((shard_seqs, cfg.seq_len, cfg.top_k), dtype=np.float16)
+    n_buf = 0
     masses: list[float] = []
     shard_i = len(idx.shards)
+    logutil.event(
+        log,
+        "shard buffers preallocated",
+        shard_seqs=shard_seqs,
+        bytes=int(buf_ids.nbytes + buf_topk.nbytes + buf_lp.nbytes),
+        gb=round((buf_ids.nbytes + buf_topk.nbytes + buf_lp.nbytes) / 1e9, 3),
+    )
 
     def flush() -> None:
-        nonlocal shard_i, buf_ids, buf_topk, buf_lp, masses
-        if not buf_ids:
+        nonlocal shard_i, n_buf, masses
+        if n_buf == 0:
             return
         name = f"shard-{shard_i:05d}.npz"
+        # Slices of the preallocated arrays: no stack, no cast, no second copy.
         np.savez(
             out_dir / name,
-            input_ids=np.asarray(buf_ids, dtype=np.int32),
-            topk_idx=np.stack(buf_topk).astype(np.uint32),
-            topk_logprob=np.stack(buf_lp).astype(np.float16),
+            input_ids=buf_ids[:n_buf],
+            topk_idx=buf_topk[:n_buf],
+            topk_logprob=buf_lp[:n_buf],
         )
         meta = ShardMeta(
             index=shard_i,
             path=name,
-            n_sequences=len(buf_ids),
-            n_tokens=len(buf_ids) * cfg.seq_len,
+            n_sequences=n_buf,
+            n_tokens=n_buf * cfg.seq_len,
             seq_len=cfg.seq_len,
             top_k=cfg.top_k,
             mean_captured_mass=float(sum(masses) / max(len(masses), 1)),
@@ -226,16 +387,18 @@ def build_cache(
             log,
             "shard written",
             shard=shard_i,
-            seqs=len(buf_ids),
+            seqs=n_buf,
             tokens=meta.n_tokens,
             captured_mass=round(meta.mean_captured_mass, 4),
             total_tokens=idx.n_tokens,
         )
         shard_i += 1
-        buf_ids, buf_topk, buf_lp, masses = [], [], [], []
+        n_buf = 0
+        masses = []
 
     skip_tokens = already
     produced = already
+    _t_start = time.time()
     with logutil.timed(log, "teacher cache", target_tokens=cfg.tokens):
         for seq in iter_sequences(tok, cfg.corpus_path, cfg.seq_len, cfg.tokens):
             # Fast-forward past sequences already cached, without running the model.
@@ -249,13 +412,35 @@ def build_cache(
                 lp = torch.log_softmax(logits, dim=-1)[0]
                 top = torch.topk(lp, cfg.top_k, dim=-1)
                 masses.append(float(top.values.exp().sum(-1).mean().item()))
-                buf_ids.append(seq)
-                buf_topk.append(top.indices.cpu().numpy())
-                buf_lp.append(top.values.cpu().numpy())
+                # Cast on the GPU, before the transfer, straight into the preallocated row.
+                # int32 is safe: the vocabulary is 248,320, far under 2**31.
+                buf_ids[n_buf] = seq
+                buf_topk[n_buf] = top.indices.to(torch.int32).cpu().numpy()
+                buf_lp[n_buf] = top.values.to(torch.float16).cpu().numpy()
+                n_buf += 1
                 del hidden, logits, lp, top
 
             produced += cfg.seq_len
-            if len(buf_ids) >= shard_seqs:
+            # Progress every 256 sequences, not every shard. A shard is 5M tokens -- roughly
+            # half an hour -- so shard-granular logging leaves a multi-hour job with no
+            # observable rate until it is already committed, and no way to answer "will this
+            # finish in time" before it matters.
+            if (produced // cfg.seq_len) % 256 == 0:
+                el = max(time.time() - _t_start, 1e-9)
+                done = produced - already
+                rate = done / el
+                remaining = max(cfg.tokens - produced, 0)
+                logutil.event(
+                    log,
+                    "cache progress",
+                    tokens=produced,
+                    target=cfg.tokens,
+                    pct=round(100 * produced / max(cfg.tokens, 1), 2),
+                    tok_s=round(rate, 1),
+                    elapsed_h=round(el / 3600, 2),
+                    eta_h=round(remaining / rate / 3600, 2) if rate > 0 else None,
+                )
+            if n_buf >= shard_seqs:
                 flush()
             if produced >= cfg.tokens:
                 break

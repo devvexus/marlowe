@@ -1032,6 +1032,74 @@ time rising.
 
 ## 5c. Claims this document made that turned out to be wrong
 
+### The CPU-gather embedding fixes memory and costs 30% throughput
+
+`CpuGatherEmbedding` replaces accelerate's `AlignDevicesHook` on an offloaded embedding. The
+hook stages the whole 2.54 GB table onto the device before every forward; the gather does the
+lookup on the host and moves only `[batch, seq, hidden]` -- 7.9 MB at seq 768, about 320x
+less. That part is true and measured.
+
+**It is not an optimisation.** Measured on the teacher cache, same checkpoint, same corpus,
+same shard settings, changing only this:
+
+```
+hook path        479.0 tok/s      (and later 487.3 on the same config)
+gather path      337.5 tok/s      -30%
+```
+
+The hook's 2.54 GB copy is evidently overlapped with compute. The gather is not: it forces a
+GPU -> CPU -> GPU round trip at the head of every forward, and that serialises.
+
+So the two uses are different decisions:
+
+* **Teacher (`teacher.py`)**: the hook path fits, so the gather is pure loss. Off by default,
+  behind `MARLOWE_TEACHER_CPU_GATHER=1`.
+* **Student (`heal.load_student`)**: the hook path does not fit -- it OOM'd every rung of the
+  memory ladder, because the 2.54 GB transient landed on a card with 0.09 GB free. There the
+  gather is what makes the configuration exist at all, and the 30% is the price of fitting.
+  The soak's 190 tok/s at rank32-seq768 was measured **with** the gather, so the Stage 6
+  schedule already includes this cost.
+
+**The spill it was introduced to fix was never the problem.** Driver spill sits at ~2.9 GB
+with the gather off and the run at 487 tok/s, and sat at 2.6 GB with the gather on at 337
+tok/s. It is cold, it predates every change made on 2026-09-03, and it has no bearing on
+throughput. A number matching a mechanism's size is not evidence that the mechanism is the
+cause -- 2.54 GB of embedding matched 2.76 GB of spill, and the match was a coincidence.
+
+### A device_map key that matches no submodule is a warning, not an error
+
+`embedding_module_name()` derives the embedding's path from **tensor names in the
+checkpoint** -- `model.language_model.embed_tokens.weight` gives
+`model.language_model.embed_tokens`. transformers **strips the `language_model.` wrapper**
+when it builds the module tree, so the real module is `model.embed_tokens`.
+
+The device_map key therefore matched nothing. accelerate printed
+
+```
+UserWarning: The following device_map keys do not match any submodules in the model:
+['model.language_model.embed_tokens']
+```
+
+and continued. All 851 parameters loaded onto `cuda:0`: **17.17 GB of a 17.17 GB card, 0.00 GB
+free**. The load *succeeded*; the first forward had nowhere to go. `build_cache`'s three
+retries then compounded it, because the failed attempt's memory was not released between them.
+
+**Names in the file are not names in the model.** Derive the module path from the model's own
+module tree -- built on the meta device, so it costs no memory and touches no GPU:
+
+```python
+with torch.device("meta"):
+    skeleton = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+embed = next(n for n, _ in skeleton.named_modules() if n.endswith("embed_tokens"))
+```
+
+Two things made this expensive rather than obvious. The warning is buried in load progress
+output. And the offload not happening was *survivable* until now -- Stage 3 fit anyway,
+barely -- so it had been silently wrong for the whole project and only turned fatal when a
+slightly larger checkpoint left zero headroom. A no-op that is harmless until it is not.
+
+**Check the same pattern in `heal.load_student`**, which builds its device_map the same way.
+
 ### The paging sampler was correct in every reading. The interpretation was wrong
 
 Not a broken instrument. Every number it returned was the true value of

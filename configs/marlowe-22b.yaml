@@ -45,22 +45,33 @@ teacher:
   # and it is the cheapest transfer lever available (TRANSFER_PLAN lever 2).
   top_k: 64
   # Must match heal.seq_len: the cache is built at one fixed length and its
-  # distributions are position-aligned.
-  seq_len: 1024
+  # distributions are position-aligned. 768 because that is the rung the SOAK selected --
+  # rank32-seq768 -- not the rung the 8-step search nominated. A cache at any other length
+  # is unusable and the fact only surfaces at the start of Stage 6.
+  seq_len: 768
   batch_size: 4
-  corpus_path: data/heal_corpus.jsonl
-  shard_tokens: 5000000
+  # The merged Phase A corpus: documents subsampled to budget plus all traces.
+  # Pointing at heal_corpus.jsonl would cache the corpus WITHOUT the traces, which
+  # is the whole point of Phase A, and nothing downstream would notice.
+  corpus_path: data/heal_corpus_phase_a.jsonl
+  # 1M, not 5M. The shard is buffered in RAM before it is written, so shard_tokens is
+  # a memory setting as much as a file-size one. At 5M the preallocated buffers are
+  # 1.94 GB; at 1M they are 0.39 GB. On a 31 GB machine that ran to 0.41 GB available,
+  # that difference is the run surviving its own shard boundary. It also makes a
+  # crash cost at most 1M tokens of recompute instead of 5M.
+  shard_tokens: 1000000
 
 heal:
   # Sized to make the 18B rung reachable, not to maximise 22B on its own. 22B ships, but it
   # is the intermediate: a direct 27B -> 18B cut is outside the band where healing recovers,
   # and this rung exists to keep each step near 19%.
   tokens: 35000000
-  # 1024, not 2048. Every fit measurement in this project was taken at 1024, and the fit
-  # ended ~96 MiB short there -- so the 2048 rungs are unreachable by construction, and
-  # the 44.3 tok/s that built the published schedule is a rate for a config that cannot
-  # run. Verify long context at 128K before shipping; the anneal is the mitigation.
-  seq_len: 1024
+  # 768, from the soak. Every fit measurement was taken at 1024 and the fit ended ~96 MiB
+  # short there; the 2048 rungs are unreachable by construction. The memory search then
+  # nominated rank32-seq1024, which the driver counter showed spilling 7.51 GB while running
+  # fastest of all rungs -- an 8-step probe cannot see that. rank32-seq768 is what the soak
+  # confirmed. Verify long context at 128K before shipping; the anneal is the mitigation.
+  seq_len: 768
   lora_rank: 32
   lora_alpha: 64
   learning_rate: 0.0001
